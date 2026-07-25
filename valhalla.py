@@ -254,7 +254,7 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
 # 5. 웹 UI 구현 (Streamlit)
 # ==========================================
 st.set_page_config(page_title="무한매수 전술 관제소", layout="wide")
-st.title("🚀 타이탄의 안식 (Project Valhalla)")
+st.title("🚀 무한매수 전술 관제소 (Project Valhalla)")
 
 if supabase:
     st.sidebar.success("🟢 클라우드 DB (Supabase) 연결됨")
