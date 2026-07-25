@@ -244,7 +244,7 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
 # 4. 웹 UI 구현 (Streamlit)
 # ==========================================
 st.set_page_config(page_title="무한매수 전술 관제소", layout="wide")
-st.title("🚀 타이탄의 안식 (Project Valhalla)")
+st.title("🚀 무한매수 전술 관제소 (Project Valhalla)")
 
 tab1, tab4, tab2, tab3 = st.tabs(["📊 전술 관제", "⚔️ 발할라 실전 리그", "🧠 훈련소 (진화)", "🗄️ 매매 일지"])
 
