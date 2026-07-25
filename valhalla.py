@@ -285,7 +285,6 @@ if uploaded_files:
             df_combined = pd.concat([df_old, df_new])
             df_combined['Date'] = pd.to_datetime(df_combined['Date']).dt.strftime('%Y-%m-%d')
             
-            # 💡 수정된 부분: 에러 방지를 위해 astype(str) 일괄 적용
             df_combined['group_id'] = df_combined['Date'].astype(str) + "_" + df_combined['Account'].astype(str) + "_" + df_combined['Ticker'].astype(str) + "_" + df_combined['Action'].astype(str)
             
             groups_with_2row = df_combined[df_combined['Format'] == '2row']['group_id'].unique()
@@ -397,7 +396,7 @@ with tab4:
             st.write(f"- **{agent}** (고유 진화 가중치 탑재)")
     
     with col2:
-        st.info("🚨 **일일 가상 매매(Paper Trading) 시동**")
+        st.info("🚨 **일일 가상 매매(Paper Trading) 시 시동**")
         sim_ticker = st.selectbox("종목 선택", ["SOXL", "FNGU", "CURE"])
         
         if st.button(f"📅 오늘({datetime.date.today()})의 AI 가상 매매 실행"):
@@ -486,7 +485,7 @@ with tab2:
                 
                 overwrite_db("ai_ledger", pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]))
                 
-                st.success("🎯 유전자 조작 및 훈련 완료! 역대 최고 성능을 낸 3명의 요원이 실전 리그(발할라)에 새로 참전했습니다.")
+                st.success("🎯 유전자 조작 및 훈련 완료! 역대 최고 성능을 낸 3명을 실전 리그에 배치했습니다.")
                 st.rerun()
             else:
                 st.error("데이터를 불러오지 못해 훈련에 실패했습니다.")
@@ -517,15 +516,27 @@ with tab3:
                 
     st.markdown("---")
     
+    # 💡 데이터 에디터 기능 도입 (수정 및 삭제 가능)
+    st.markdown("#### 📝 매매 일지 직접 편집 (엑셀 방식)")
+    st.info("셀을 **더블클릭**하면 글자를 수정할 수 있습니다. 행을 선택하고 키보드의 **Delete** 키를 누르거나 휴지통 아이콘을 누르면 삭제됩니다. 편집 후에는 반드시 아래의 저장 버튼을 눌러주십시오.")
+    
     col_db1, col_db2 = st.columns([8, 2])
     with col_db1:
         df_display = read_db("trade_journal")
-        st.dataframe(df_display, use_container_width=True)
+        # num_rows="dynamic" 옵션으로 행 추가/삭제 기능 활성화
+        edited_df = st.data_editor(df_display, num_rows="dynamic", use_container_width=True, key="trade_editor")
+        
+        if st.button("💾 수동 편집 내용 덮어쓰기 (최종 저장)"):
+            overwrite_db("trade_journal", edited_df)
+            st.success("✅ 수정 및 삭제된 내용이 DB에 성공적으로 반영되었습니다!")
+            st.rerun()
+
     with col_db2:
-        if st.button("🗑️ 내 기록 초기화", key="reset_db"):
+        if st.button("🗑️ 전체 기록 초기화", key="reset_db"):
             overwrite_db("trade_journal", pd.DataFrame(columns=["Date", "Time", "Account", "Ticker", "Action", "Qty", "Price", "Format"]))
             st.rerun()
     
+    st.markdown("---")
     st.markdown("### 🗄️ AI 요원 가상 매매 장부 (Paper Trading)")
     
     col_ai1, col_ai2 = st.columns([8, 2])
