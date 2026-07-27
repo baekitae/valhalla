@@ -107,6 +107,35 @@ def append_db(table_name, df_append):
         file_name = DB_FILE if table_name == "trade_journal" else AI_LEDGER_FILE
         df_append.to_csv(file_name, mode='a', header=False, index=False)
 
+# 🚀 [신규 추가] AI 모델 Supabase 영구 저장/불러오기 모듈
+def load_ai_models():
+    if supabase:
+        try:
+            res = supabase.table("valhalla_ai_models").select("*").execute()
+            if res.data:
+                models = {}
+                for row in res.data:
+                    models[row['agent_name']] = json.loads(row['genes'])
+                return models
+        except: pass
+    
+    try:
+        with open(AI_MODELS_FILE, 'r') as f: return json.load(f)
+    except: return {}
+
+def save_ai_models(models_dict):
+    if supabase:
+        try:
+            supabase.table("valhalla_ai_models").delete().neq("agent_name", "dummy").execute() # 기존 요원 삭제
+            records = [{"agent_name": k, "genes": json.dumps(v)} for k, v in models_dict.items()]
+            supabase.table("valhalla_ai_models").insert(records).execute()
+            return True
+        except: return False
+    else:
+        with open(AI_MODELS_FILE, 'w') as f: json.dump(models_dict, f)
+        return True
+
+
 # ==========================================
 # 3. 실시간 차트 데이터 로더 & 파서
 # ==========================================
@@ -234,6 +263,7 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
             target_r = prediction['optimal_r']
             target_price = avg_price * (1 + (target_r / 100.0))
             
+            # 💡 [매매 로직의 핵심] 목표가 도달 시 매도, 그 외에는 무조건 매일 $100 고정 매수
             if current_qty > 0 and float(row['High']) >= target_price:
                 profit += (target_price - avg_price) * current_qty
                 current_qty, total_cost = 0.0, 0.0
@@ -384,16 +414,17 @@ with tab4:
     st.markdown("## ⚔️ 발할라 실전 리그 (Valhalla Live League)")
     st.write("사령관님과 상위 3명의 정예 AI 요원이 '오늘의 시장'에서 실시간으로 경쟁합니다. 매일 장 마감 후 시뮬레이터를 가동하세요!")
     
-    try:
-        with open(AI_MODELS_FILE, 'r') as f: ai_models = json.load(f)
-    except:
-        ai_models = {}
+    # 💡 파일 대신 DB에서 직접 모델을 불러옵니다.
+    ai_models = load_ai_models()
     
     col1, col2 = st.columns([1, 1])
     with col1:
         st.info("🧬 **현재 참전 중인 정예 AI 요원**")
-        for agent, weights in ai_models.items():
-            st.write(f"- **{agent}** (고유 진화 가중치 탑재)")
+        if ai_models:
+            for agent, weights in ai_models.items():
+                st.write(f"- **{agent}** (고유 진화 가중치 탑재)")
+        else:
+            st.write("아직 선발된 AI 요원이 없습니다. '훈련소'에서 진화를 시작하세요.")
     
     with col2:
         st.info("🚨 **일일 가상 매매(Paper Trading) 시 시동**")
@@ -427,6 +458,7 @@ with tab4:
                 
                 action, trade_qty, profit = "Hold", 0.0, 0.0
                 
+                # 💡 [매매 로직의 핵심] 실전 리그에서도 훈련과 동일하게 매일 무조건 매수 또는 목표가 도달 시 매도
                 if current_qty > 0 and current_price >= target_price:
                     action = "Sell"
                     trade_qty = round(current_qty, 4)
@@ -480,12 +512,13 @@ with tab2:
                     f"Agent_Rank_2 (누적 ${top_agents[1]['total_score']:.2f})": top_agents[1]['weights'],
                     f"Agent_Rank_3 (누적 ${top_agents[2]['total_score']:.2f})": top_agents[2]['weights']
                 }
-                with open(AI_MODELS_FILE, 'w') as f:
-                    json.dump(new_models, f)
                 
-                overwrite_db("ai_ledger", pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]))
-                
-                st.success("🎯 유전자 조작 및 훈련 완료! 역대 최고 성능을 낸 3명을 실전 리그에 배치했습니다.")
+                # 💡 DB에 진화된 모델 강제 덮어쓰기 저장
+                if save_ai_models(new_models):
+                    overwrite_db("ai_ledger", pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]))
+                    st.success("🎯 유전자 조작 및 훈련 완료! 역대 최고 성능을 낸 3명의 데이터가 클라우드 DB에 영구 저장되었습니다.")
+                else:
+                    st.error("훈련은 완료되었으나, DB 저장에 실패했습니다. Supabase 연결 상태를 확인하세요.")
                 st.rerun()
             else:
                 st.error("데이터를 불러오지 못해 훈련에 실패했습니다.")
@@ -493,6 +526,19 @@ with tab2:
 with tab3:
     st.markdown("### 🗄️ 사령관 매매 일지 DB 관리")
     
+    st.markdown("### 🧠 AI 요원 유전자 강제 리셋")
+    if st.button("🗑️ 훈련된 AI 요원 유전자 모두 삭제 (백지 상태로 되돌리기)"):
+        try:
+            if supabase:
+                supabase.table("valhalla_ai_models").delete().neq("agent_name", "dummy").execute()
+            else:
+                if os.path.exists(AI_MODELS_FILE): os.remove(AI_MODELS_FILE)
+            st.success("✅ 모든 AI 요원의 유전자가 성공적으로 삭제되었습니다. 훈련소에서 새롭게 진화시킬 수 있습니다.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"삭제 실패: {e}")
+            
+    st.markdown("---")
     with st.expander("✍️ 수동으로 매매 기록 추가하기", expanded=True):
         with st.form("main_trade_form", clear_on_submit=True):
             col1, col2, col3 = st.columns(3)
@@ -516,14 +562,12 @@ with tab3:
                 
     st.markdown("---")
     
-    # 💡 데이터 에디터 기능 도입 (수정 및 삭제 가능)
     st.markdown("#### 📝 매매 일지 직접 편집 (엑셀 방식)")
     st.info("셀을 **더블클릭**하면 글자를 수정할 수 있습니다. 행을 선택하고 키보드의 **Delete** 키를 누르거나 휴지통 아이콘을 누르면 삭제됩니다. 편집 후에는 반드시 아래의 저장 버튼을 눌러주십시오.")
     
     col_db1, col_db2 = st.columns([8, 2])
     with col_db1:
         df_display = read_db("trade_journal")
-        # num_rows="dynamic" 옵션으로 행 추가/삭제 기능 활성화
         edited_df = st.data_editor(df_display, num_rows="dynamic", use_container_width=True, key="trade_editor")
         
         if st.button("💾 수동 편집 내용 덮어쓰기 (최종 저장)"):
