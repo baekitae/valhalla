@@ -107,7 +107,7 @@ def append_db(table_name, df_append):
         file_name = DB_FILE if table_name == "trade_journal" else AI_LEDGER_FILE
         df_append.to_csv(file_name, mode='a', header=False, index=False)
 
-# 🚀 [신규 추가] AI 모델 Supabase 영구 저장/불러오기 모듈
+# 🚀 [신규 패치] AI 모델 Supabase 영구 저장/불러오기 모듈
 def load_ai_models():
     if supabase:
         try:
@@ -126,7 +126,8 @@ def load_ai_models():
 def save_ai_models(models_dict):
     if supabase:
         try:
-            supabase.table("valhalla_ai_models").delete().neq("agent_name", "dummy").execute() # 기존 요원 삭제
+            # 테이블 초기화 후 삽입
+            supabase.table("valhalla_ai_models").delete().neq("agent_name", "dummy").execute()
             records = [{"agent_name": k, "genes": json.dumps(v)} for k, v in models_dict.items()]
             supabase.table("valhalla_ai_models").insert(records).execute()
             return True
@@ -134,7 +135,6 @@ def save_ai_models(models_dict):
     else:
         with open(AI_MODELS_FILE, 'w') as f: json.dump(models_dict, f)
         return True
-
 
 # ==========================================
 # 3. 실시간 차트 데이터 로더 & 파서
@@ -263,7 +263,6 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
             target_r = prediction['optimal_r']
             target_price = avg_price * (1 + (target_r / 100.0))
             
-            # 💡 [매매 로직의 핵심] 목표가 도달 시 매도, 그 외에는 무조건 매일 $100 고정 매수
             if current_qty > 0 and float(row['High']) >= target_price:
                 profit += (target_price - avg_price) * current_qty
                 current_qty, total_cost = 0.0, 0.0
@@ -351,11 +350,13 @@ with tab1:
                 current_qty, total_cost, avg_price = 0.0, 0.0, 0.0
                 for _, row in trades.iterrows():
                     qty, price = float(row['Qty']), float(row['Price'])
-                    if row['Action'] == 'Buy': current_qty += qty; total_cost += qty * price; avg_price = total_cost / current_qty if current_qty > 0 else 0
+                    # 🚀 [오류 수정] 매도 시 무조건 사이클 완전 초기화!
+                    if row['Action'] == 'Buy': 
+                        current_qty += qty
+                        total_cost += qty * price
+                        avg_price = total_cost / current_qty if current_qty > 0 else 0
                     elif row['Action'] == 'Sell': 
-                        current_qty -= qty
-                        if current_qty <= 0.01: current_qty, total_cost, avg_price = 0.0, 0.0, 0.0
-                        else: total_cost = current_qty * avg_price
+                        current_qty, total_cost, avg_price = 0.0, 0.0, 0.0
                 
                 prediction = ai_engine.find_golden_ratio(state_vector)
                 ai_target_price = current_price * (1 + prediction['optimal_r'] / 100) if prediction else 0
@@ -414,7 +415,7 @@ with tab4:
     st.markdown("## ⚔️ 발할라 실전 리그 (Valhalla Live League)")
     st.write("사령관님과 상위 3명의 정예 AI 요원이 '오늘의 시장'에서 실시간으로 경쟁합니다. 매일 장 마감 후 시뮬레이터를 가동하세요!")
     
-    # 💡 파일 대신 DB에서 직접 모델을 불러옵니다.
+    # 💡 DB에서 영구 저장된 요원 모델 불러오기
     ai_models = load_ai_models()
     
     col1, col2 = st.columns([1, 1])
@@ -444,9 +445,8 @@ with tab4:
                     if row['Action'] == 'Buy':
                         current_qty += qty; total_cost += qty * price
                     elif row['Action'] == 'Sell':
-                        current_qty -= qty
-                        if current_qty <= 0.01: current_qty, total_cost = 0.0, 0.0
-                        else: total_cost = current_qty * (total_cost / (current_qty + qty))
+                        # 🚀 [오류 수정] AI의 페이퍼 트레이딩 장부도 매도 시 완전 초기화 적용
+                        current_qty, total_cost = 0.0, 0.0
                 
                 avg_price = total_cost / current_qty if current_qty > 0 else 0
                 
@@ -458,7 +458,6 @@ with tab4:
                 
                 action, trade_qty, profit = "Hold", 0.0, 0.0
                 
-                # 💡 [매매 로직의 핵심] 실전 리그에서도 훈련과 동일하게 매일 무조건 매수 또는 목표가 도달 시 매도
                 if current_qty > 0 and current_price >= target_price:
                     action = "Sell"
                     trade_qty = round(current_qty, 4)
@@ -513,7 +512,7 @@ with tab2:
                     f"Agent_Rank_3 (누적 ${top_agents[2]['total_score']:.2f})": top_agents[2]['weights']
                 }
                 
-                # 💡 DB에 진화된 모델 강제 덮어쓰기 저장
+                # 💡 DB에 진화된 모델 저장
                 if save_ai_models(new_models):
                     overwrite_db("ai_ledger", pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]))
                     st.success("🎯 유전자 조작 및 훈련 완료! 역대 최고 성능을 낸 3명의 데이터가 클라우드 DB에 영구 저장되었습니다.")
