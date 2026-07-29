@@ -38,8 +38,6 @@ class TitanRestExitOptimizer:
             'est_days': round(est_days, 1)
         }
 
-ai_engine = TitanRestExitOptimizer()
-
 # ==========================================
 # 2. 하이브리드 DB 통신 모듈 (CSV + Supabase)
 # ==========================================
@@ -91,7 +89,7 @@ def read_db(table_name):
 
 def overwrite_db(table_name, df_new):
     if supabase:
-        supabase.table(table_name).delete().neq('id', 0).execute() # 전체 삭제
+        supabase.table(table_name).delete().neq('id', 0).execute() 
         if not df_new.empty:
             records = df_new.to_dict(orient='records')
             supabase.table(table_name).insert(records).execute()
@@ -107,7 +105,6 @@ def append_db(table_name, df_append):
         file_name = DB_FILE if table_name == "trade_journal" else AI_LEDGER_FILE
         df_append.to_csv(file_name, mode='a', header=False, index=False)
 
-# 🚀 [신규 패치] AI 모델 Supabase 영구 저장/불러오기 모듈
 def load_ai_models():
     if supabase:
         try:
@@ -118,7 +115,6 @@ def load_ai_models():
                     models[row['agent_name']] = json.loads(row['genes'])
                 return models
         except: pass
-    
     try:
         with open(AI_MODELS_FILE, 'r') as f: return json.load(f)
     except: return {}
@@ -126,7 +122,6 @@ def load_ai_models():
 def save_ai_models(models_dict):
     if supabase:
         try:
-            # 테이블 초기화 후 삽입
             supabase.table("valhalla_ai_models").delete().neq("agent_name", "dummy").execute()
             records = [{"agent_name": k, "genes": json.dumps(v)} for k, v in models_dict.items()]
             supabase.table("valhalla_ai_models").insert(records).execute()
@@ -137,7 +132,7 @@ def save_ai_models(models_dict):
         return True
 
 # ==========================================
-# 3. 실시간 차트 데이터 로더 & 파서
+# 3. 실시간 차트 & SOXL 뉴스 센티먼트 로더
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_realtime_data(ticker):
@@ -162,6 +157,45 @@ def get_realtime_data(ticker):
     vol = close.pct_change().rolling(window=20).std().iloc[-1] * 100.0
     
     return df, [round(x1, 2), round(x2, 2), round(x3, 2), round(vol, 2)], round(current_price, 2)
+
+def analyze_sentiment(text):
+    pos_words = ['surge', 'beat', 'up', 'buy', 'rally', 'strong', 'growth', 'gain', 'jump', 'upgrade', 'record', 'high', 'boost']
+    neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay']
+    text = text.lower()
+    score = sum(1 for w in pos_words if w in text) - sum(1 for w in neg_words if w in text)
+    
+    if score > 0: return "🟢 호재 (상승 기대)"
+    elif score < 0: return "🔴 악재 (하락 경계)"
+    else: return "⚪ 관망 (중립)"
+
+@st.cache_data(ttl=1800)
+def get_soxl_radar():
+    tickers = ['NVDA', 'AMD', 'AVGO', 'TSM', 'QCOM', 'INTC', 'ASML', 'TXN', 'AMAT', 'MU']
+    data = []
+    for t in tickers:
+        stock = yf.Ticker(t)
+        hist = stock.history(period="2d")
+        if len(hist) < 2: continue
+        prev_close, curr_price = hist['Close'].iloc[0], hist['Close'].iloc[1]
+        change = (curr_price - prev_close) / prev_close * 100
+        
+        try:
+            news = stock.news
+            news_titles = [n['title'] for n in news[:3]] if news else []
+            combined_text = " ".join(news_titles)
+            sentiment = analyze_sentiment(combined_text)
+            top_headline = news_titles[0] if news_titles else "최근 뉴스 없음"
+        except:
+            sentiment, top_headline = "⚪ 분석 불가", "데이터 로드 실패"
+            
+        data.append({
+            "종목명": t,
+            "현재가": f"${curr_price:.2f}",
+            "변동률": f"{change:+.2f}%",
+            "뉴스 센티먼트 (예측)": sentiment,
+            "최신 글로벌 헤드라인": top_headline
+        })
+    return pd.DataFrame(data)
 
 def parse_kiwoom_csv_to_db(file_obj):
     filename = file_obj.name
@@ -212,9 +246,6 @@ def parse_kiwoom_csv_to_db(file_obj):
             if qty > 0: trades.append({"Date": date_str, "Time": time_str, "Account": account_tag, "Ticker": ticker, "Action": action, "Qty": qty, "Price": price, "Format": "3row"})
     return pd.DataFrame(trades)
 
-# ==========================================
-# 4. 유전 알고리즘 (동점자 방지 로직 적용)
-# ==========================================
 def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back=365):
     end_date = datetime.date.today()
     start_date = end_date - datetime.timedelta(days=days_back)
@@ -278,22 +309,19 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
     ranked_agents = sorted(agents, key=lambda x: x['total_score'], reverse=True)
     return ranked_agents[:3]
 
-
 # ==========================================
 # 5. 웹 UI 구현 (Streamlit)
 # ==========================================
 st.set_page_config(page_title="무한매수 전술 관제소", layout="wide")
 st.title("🚀 무한매수 전술 관제소 (Project Valhalla)")
 
-if supabase:
-    st.sidebar.success("🟢 클라우드 DB (Supabase) 연결됨")
-else:
-    st.sidebar.warning("🟡 로컬 DB (CSV) 사용 중")
+if supabase: st.sidebar.success("🟢 클라우드 DB 연결됨")
+else: st.sidebar.warning("🟡 로컬 DB 사용 중")
 
-tab1, tab4, tab2, tab3 = st.tabs(["📊 전술 관제", "⚔️ 발할라 실전 리그", "🧠 훈련소 (진화)", "🗄️ 매매 일지"])
+tab1, tab5, tab4, tab2, tab3 = st.tabs(["📊 전술 관제", "📡 SOXL 생태계", "⚔️ 발할라 실전 리그", "🧠 훈련소 (진화)", "🗄️ 매매 일지"])
 
 # ------------------------------------------
-# 사이드바 (대량 매매 일지 동기화)
+# 사이드바
 # ------------------------------------------
 st.sidebar.header("📂 대량 매매 일지 동기화")
 uploaded_files = st.sidebar.file_uploader("키움증권 CSV 파일을 드롭하세요", accept_multiple_files=True, type=['csv'])
@@ -326,7 +354,7 @@ if uploaded_files:
             st.sidebar.success(f"✅ 동기화 완료! 클라우드에 저장되었습니다.")
 
 # ------------------------------------------
-# TAB 1: 전술 관제
+# TAB 1: 전술 관제 
 # ------------------------------------------
 with tab1:
     view_ticker = st.text_input("🔍 관제할 티커를 입력하세요", "SOXL").upper()
@@ -335,56 +363,74 @@ with tab1:
         if not df_journal.empty:
             if 'Time' not in df_journal.columns: df_journal.insert(1, 'Time', "00:00:00")
             if 'Account' not in df_journal.columns: df_journal.insert(2, 'Account', "Default")
+            
+            # 🚀 [기능 복구] 다중 계좌 확장성을 위한 계좌 필터링 기능 부활
             available_accounts = df_journal[df_journal['Ticker'] == view_ticker]['Account'].unique().tolist()
             
             col_opt1, col_opt2 = st.columns(2)
-            with col_opt1: cycle_start = st.date_input(f"📅 사이클 시작일", value=datetime.date(2026, 4, 20))
-            with col_opt2: selected_accounts = st.multiselect(f"🏷️ 추적 계좌", options=available_accounts, default=available_accounts)
+            with col_opt1: 
+                cycle_start = st.date_input(f"📅 사이클 시작일", value=datetime.date(2026, 4, 20))
+            with col_opt2: 
+                selected_accounts = st.multiselect(f"🏷️ 추적 계좌", options=available_accounts, default=available_accounts)
                 
             df_chart, state_vector, current_price = get_realtime_data(view_ticker)
             
             if df_chart is not None:
                 col_chart, col_ai = st.columns([7, 3])
-                trades = df_journal[(df_journal['Ticker'] == view_ticker) & (df_journal['Date'] >= cycle_start.strftime("%Y-%m-%d")) & (df_journal['Account'].isin(selected_accounts))].sort_values(["Date", "Time"])
+                
+                trades = df_journal[(df_journal['Ticker'] == view_ticker) & 
+                                    (df_journal['Date'] >= cycle_start.strftime("%Y-%m-%d")) & 
+                                    (df_journal['Account'].isin(selected_accounts))].sort_values(["Date", "Time"])
                 
                 current_qty, total_cost, avg_price = 0.0, 0.0, 0.0
                 for _, row in trades.iterrows():
                     qty, price = float(row['Qty']), float(row['Price'])
-                    # 🚀 [오류 수정] 매도 시 무조건 사이클 완전 초기화!
                     if row['Action'] == 'Buy': 
                         current_qty += qty
                         total_cost += qty * price
                         avg_price = total_cost / current_qty if current_qty > 0 else 0
                     elif row['Action'] == 'Sell': 
+                        # 🚀 매도시 무조건 0으로 강제 초기화하여 평단가 오류 방지
                         current_qty, total_cost, avg_price = 0.0, 0.0, 0.0
-                
-                prediction = ai_engine.find_golden_ratio(state_vector)
-                ai_target_price = current_price * (1 + prediction['optimal_r'] / 100) if prediction else 0
                 
                 with col_ai:
                     st.markdown(f"### 🛡️ 사령관의 포지션")
-                    st.info(f"**수량:** {int(current_qty)} 주")
+                    st.info(f"**총 보유 수량:** {int(current_qty)} 주")
                     user_target_pct = st.slider("🎯 목표 수익률 조절 (%)", 1.0, 50.0, 13.0, 0.5)
                     user_target_price = avg_price * (1 + user_target_pct / 100) if avg_price > 0 else 0
+                    
                     if current_qty > 0:
-                        st.metric("💰 나의 평단가", f"${avg_price:,.4f}"); st.metric(f"🎯 나의 목표가 (+{user_target_pct}%)", f"${user_target_price:,.2f}")
+                        st.metric("💰 나의 정확한 평단가", f"${avg_price:,.4f}")
+                        st.metric(f"🎯 나의 목표가 (+{user_target_pct}%)", f"${user_target_price:,.2f}")
                     else:
-                        st.write("현재 진행 중인 사이클(잔고)이 없습니다.")
+                        st.write("현재 진행 중인 매수 사이클이 없습니다.")
                     
                     st.markdown("---")
-                    st.markdown(f"### 🧠 AI 전술 분석")
+                    st.markdown(f"### 🧠 정예 요원별 매도 전술")
                     st.info(f"현재가: ${current_price:,.2f}")
-                    if prediction:
-                        st.metric("🤖 AI 최적 매도 목표가", f"+{prediction['optimal_r']}%", f"${ai_target_price:,.2f}")
-                        st.metric("승률 (Probability)", f"{prediction['success_probability']}%")
-                        st.metric("예상 보유 기간", f"약 {prediction['est_days']}일")
+                    
+                    ai_models = load_ai_models()
+                    if ai_models:
+                        # 🚀 나의 평단가 기반 AI 개별 목표가 제시
+                        for agent_name, weights in ai_models.items():
+                            agent_engine = TitanRestExitOptimizer(params=weights)
+                            prediction = agent_engine.find_golden_ratio(state_vector)
+                            
+                            # 보유 물량이 있으면 평단가 기준, 없으면 현재가 기준으로 제시
+                            base_price = avg_price if current_qty > 0 else current_price
+                            agent_target = base_price * (1 + prediction['optimal_r'] / 100)
+                            
+                            with st.expander(f"🤖 {agent_name}의 전술", expanded=True):
+                                st.metric(f"목표가 (+{prediction['optimal_r']}%)", f"${agent_target:,.2f}")
+                                st.write(f"**승률 예측:** {prediction['success_probability']}%")
+                                st.write(f"**예상 도달:** 약 {prediction['est_days']}일")
+                    else:
+                        st.warning("훈련소에서 요원을 먼저 훈련시켜주세요.")
                 
                 with col_chart:
                     time_correction = st.checkbox("🇺🇸 미국 주식 시차 보정 (-1일 적용)", value=True)
-                    
                     fig = go.Figure(data=[go.Candlestick(x=df_chart.index, open=df_chart['Open'], high=df_chart['High'], low=df_chart['Low'], close=df_chart['Close'], name="Candle")])
                     
-                    if prediction: fig.add_hline(y=ai_target_price, line_dash="dash", line_color="cyan", annotation_text=f"AI 목표가 (${ai_target_price:.2f})", annotation_position="top left")
                     if current_qty > 0: 
                         fig.add_hline(y=avg_price, line_dash="dot", line_color="yellow", annotation_text=f"나의 평단가 (${avg_price:.4f})", annotation_position="bottom right")
                         fig.add_hline(y=user_target_price, line_dash="solid", line_color="magenta", annotation_text=f"나의 목표가 (+{user_target_pct}%, ${user_target_price:.2f})", annotation_position="top right")
@@ -406,16 +452,30 @@ with tab1:
                     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])]); fig.update_layout(title=f"{view_ticker} 차트 및 전술 오버레이", yaxis_title="Price (USD)", template="plotly_dark", height=600)
                     st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("현재 기록된 매매 일지가 없습니다. 사이드바에서 CSV를 업로드하거나 일지를 수동으로 추가하세요.")
+            st.info("기록된 매매 일지가 없습니다. 사이드바에서 업로드하세요.")
+
+# ------------------------------------------
+# TAB 5: 📡 SOXL 생태계 레이더 (뉴스 센티먼트)
+# ------------------------------------------
+with tab5:
+    st.markdown("## 📡 SOXL 생태계 레이더 (Semiconductor Top 10)")
+    st.write("SOXL을 견인하는 핵심 10대 반도체 기업의 주가 흐름과 **미국 현지 뉴스 헤드라인의 긍/부정 키워드를 AI가 스캔하여 호재와 악재를 예측**합니다.")
+    
+    if st.button("🔄 실시간 생태계 스캔 가동"):
+        with st.spinner("글로벌 뉴스 데이터 및 주가를 수집 중입니다..."):
+            df_radar = get_soxl_radar()
+            if not df_radar.empty:
+                st.dataframe(df_radar, use_container_width=True)
+            else:
+                st.error("데이터를 불러오지 못했습니다.")
 
 # ------------------------------------------
 # TAB 4: ⚔️ 발할라 실전 리그
 # ------------------------------------------
 with tab4:
     st.markdown("## ⚔️ 발할라 실전 리그 (Valhalla Live League)")
-    st.write("사령관님과 상위 3명의 정예 AI 요원이 '오늘의 시장'에서 실시간으로 경쟁합니다. 매일 장 마감 후 시뮬레이터를 가동하세요!")
+    st.write("사령관님과 상위 3명의 정예 AI 요원이 '오늘의 시장'에서 실시간으로 경쟁합니다.")
     
-    # 💡 DB에서 영구 저장된 요원 모델 불러오기
     ai_models = load_ai_models()
     
     col1, col2 = st.columns([1, 1])
@@ -425,10 +485,10 @@ with tab4:
             for agent, weights in ai_models.items():
                 st.write(f"- **{agent}** (고유 진화 가중치 탑재)")
         else:
-            st.write("아직 선발된 AI 요원이 없습니다. '훈련소'에서 진화를 시작하세요.")
+            st.write("아직 선발된 AI 요원이 없습니다.")
     
     with col2:
-        st.info("🚨 **일일 가상 매매(Paper Trading) 시 시동**")
+        st.info("🚨 **일일 가상 매매(Paper Trading) 시동**")
         sim_ticker = st.selectbox("종목 선택", ["SOXL", "FNGU", "CURE"])
         
         if st.button(f"📅 오늘({datetime.date.today()})의 AI 가상 매매 실행"):
@@ -445,7 +505,6 @@ with tab4:
                     if row['Action'] == 'Buy':
                         current_qty += qty; total_cost += qty * price
                     elif row['Action'] == 'Sell':
-                        # 🚀 [오류 수정] AI의 페이퍼 트레이딩 장부도 매도 시 완전 초기화 적용
                         current_qty, total_cost = 0.0, 0.0
                 
                 avg_price = total_cost / current_qty if current_qty > 0 else 0
@@ -501,8 +560,8 @@ with tab2:
     st.markdown("### 🧠 훈련소 (Bootcamp): 유전 알고리즘(GA) 실시간 연산")
     st.write("100명의 랜덤 유전자를 가진 AI를 생성하여 최근 1년 데이터로 시뮬레이션(적자생존)을 진행하고, 살아남은 상위 3명을 실전 리그로 승격시킵니다.")
     
-    if st.button("⚔️ 100명 AI 트레이더 대규모 훈련 가동 (연산에 10~30초 소요됩니다)"):
-        with st.spinner("서버 코어가 유전자 조합 및 과거 데이터 백테스팅을 수행 중입니다... 대기하십시오."):
+    if st.button("⚔️ 100명 AI 트레이더 대규모 훈련 가동"):
+        with st.spinner("서버 코어가 유전자 조합 및 백테스팅을 수행 중입니다..."):
             top_agents = run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back=365)
             
             if top_agents:
@@ -512,30 +571,25 @@ with tab2:
                     f"Agent_Rank_3 (누적 ${top_agents[2]['total_score']:.2f})": top_agents[2]['weights']
                 }
                 
-                # 💡 DB에 진화된 모델 저장
                 if save_ai_models(new_models):
                     overwrite_db("ai_ledger", pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]))
-                    st.success("🎯 유전자 조작 및 훈련 완료! 역대 최고 성능을 낸 3명의 데이터가 클라우드 DB에 영구 저장되었습니다.")
+                    st.success("🎯 훈련 완료! 역대 최고 성능을 낸 3명의 데이터가 클라우드 DB에 영구 저장되었습니다.")
                 else:
-                    st.error("훈련은 완료되었으나, DB 저장에 실패했습니다. Supabase 연결 상태를 확인하세요.")
+                    st.error("DB 저장에 실패했습니다.")
                 st.rerun()
-            else:
-                st.error("데이터를 불러오지 못해 훈련에 실패했습니다.")
 
 with tab3:
     st.markdown("### 🗄️ 사령관 매매 일지 DB 관리")
     
     st.markdown("### 🧠 AI 요원 유전자 강제 리셋")
-    if st.button("🗑️ 훈련된 AI 요원 유전자 모두 삭제 (백지 상태로 되돌리기)"):
+    if st.button("🗑️ 훈련된 AI 요원 유전자 모두 삭제"):
         try:
-            if supabase:
-                supabase.table("valhalla_ai_models").delete().neq("agent_name", "dummy").execute()
+            if supabase: supabase.table("valhalla_ai_models").delete().neq("agent_name", "dummy").execute()
             else:
                 if os.path.exists(AI_MODELS_FILE): os.remove(AI_MODELS_FILE)
-            st.success("✅ 모든 AI 요원의 유전자가 성공적으로 삭제되었습니다. 훈련소에서 새롭게 진화시킬 수 있습니다.")
+            st.success("✅ 삭제 완료!")
             st.rerun()
-        except Exception as e:
-            st.error(f"삭제 실패: {e}")
+        except Exception as e: st.error(f"삭제 실패: {e}")
             
     st.markdown("---")
     with st.expander("✍️ 수동으로 매매 기록 추가하기", expanded=True):
@@ -552,26 +606,22 @@ with tab3:
                 t_price = st.number_input("체결 단가 ($)", min_value=0.0, format="%.4f")
                 t_qty = st.number_input("수량 (주)", min_value=1, step=1)
             
-            submitted = st.form_submit_button("💾 일지 DB에 저장")
-            if submitted:
+            if st.form_submit_button("💾 일지 DB에 저장"):
                 action_val = "Buy" if "매수" in t_action else "Sell"
                 new_record = pd.DataFrame({"Date": [t_date.strftime("%Y-%m-%d")], "Time": [t_time], "Account": [t_account], "Ticker": [t_ticker], "Action": [action_val], "Qty": [t_qty], "Price": [t_price], "Format": ["manual"]})
                 append_db("trade_journal", new_record)
-                st.success(f"✅ 성공적으로 클라우드 DB에 저장되었습니다!"); st.rerun() 
+                st.success(f"✅ 저장 완료!"); st.rerun() 
                 
     st.markdown("---")
     
-    st.markdown("#### 📝 매매 일지 직접 편집 (엑셀 방식)")
-    st.info("셀을 **더블클릭**하면 글자를 수정할 수 있습니다. 행을 선택하고 키보드의 **Delete** 키를 누르거나 휴지통 아이콘을 누르면 삭제됩니다. 편집 후에는 반드시 아래의 저장 버튼을 눌러주십시오.")
-    
+    st.markdown("#### 📝 매매 일지 직접 편집")
     col_db1, col_db2 = st.columns([8, 2])
     with col_db1:
         df_display = read_db("trade_journal")
-        edited_df = st.data_editor(df_display, num_rows="dynamic", use_container_width=True, key="trade_editor")
-        
-        if st.button("💾 수동 편집 내용 덮어쓰기 (최종 저장)"):
+        edited_df = st.data_editor(df_display, num_rows="dynamic", use_container_width=True)
+        if st.button("💾 수동 편집 내용 덮어쓰기"):
             overwrite_db("trade_journal", edited_df)
-            st.success("✅ 수정 및 삭제된 내용이 DB에 성공적으로 반영되었습니다!")
+            st.success("✅ 수정 내용 DB 반영 완료!")
             st.rerun()
 
     with col_db2:
@@ -580,14 +630,12 @@ with tab3:
             st.rerun()
     
     st.markdown("---")
-    st.markdown("### 🗄️ AI 요원 가상 매매 장부 (Paper Trading)")
-    
+    st.markdown("### 🗄️ AI 요원 가상 매매 장부")
     col_ai1, col_ai2 = st.columns([8, 2])
     with col_ai1:
         df_ai_disp = read_db("ai_ledger")
         if not df_ai_disp.empty: st.dataframe(df_ai_disp, use_container_width=True)
-        else: st.write("기록이 없습니다.")
     with col_ai2:
-        if st.button("🗑️ AI 장부 초기화", key="reset_ai"):
+        if st.button("🗑️ AI 장부 초기화"):
             overwrite_db("ai_ledger", pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]))
             st.rerun()
