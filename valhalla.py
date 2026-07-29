@@ -172,29 +172,50 @@ def analyze_sentiment(text):
 def get_soxl_radar():
     tickers = ['NVDA', 'AMD', 'AVGO', 'TSM', 'QCOM', 'INTC', 'ASML', 'TXN', 'AMAT', 'MU']
     data = []
+    
+    try:
+        # 트래픽 차단 우회: 10개 종목 주가 일괄 다운로드
+        df_prices = yf.download(tickers, period="5d", progress=False)
+        if isinstance(df_prices.columns, pd.MultiIndex):
+            closes = df_prices['Close']
+        else:
+            closes = df_prices
+    except Exception as e:
+        return pd.DataFrame() 
+
     for t in tickers:
-        stock = yf.Ticker(t)
-        hist = stock.history(period="2d")
-        if len(hist) < 2: continue
-        prev_close, curr_price = hist['Close'].iloc[0], hist['Close'].iloc[1]
-        change = (curr_price - prev_close) / prev_close * 100
-        
         try:
-            news = stock.news
-            news_titles = [n['title'] for n in news[:3]] if news else []
-            combined_text = " ".join(news_titles)
-            sentiment = analyze_sentiment(combined_text)
-            top_headline = news_titles[0] if news_titles else "최근 뉴스 없음"
-        except:
-            sentiment, top_headline = "⚪ 분석 불가", "데이터 로드 실패"
+            if t not in closes.columns: continue
+            valid_closes = closes[t].dropna()
+            if len(valid_closes) < 2: continue
             
-        data.append({
-            "종목명": t,
-            "현재가": f"${curr_price:.2f}",
-            "변동률": f"{change:+.2f}%",
-            "뉴스 센티먼트 (예측)": sentiment,
-            "최신 글로벌 헤드라인": top_headline
-        })
+            prev_close = float(valid_closes.iloc[-2])
+            curr_price = float(valid_closes.iloc[-1])
+            change = (curr_price - prev_close) / prev_close * 100
+            
+            try:
+                stock = yf.Ticker(t)
+                news = stock.news
+                if news:
+                    news_titles = [n.get('title', '') for n in news[:3] if isinstance(n, dict)]
+                    combined_text = " ".join(news_titles)
+                    sentiment = analyze_sentiment(combined_text)
+                    top_headline = news_titles[0] if news_titles else "최근 뉴스 없음"
+                else:
+                    sentiment, top_headline = "⚪ 뉴스 없음", "관련 기사가 없습니다."
+            except:
+                sentiment, top_headline = "⚪ 분석 불가", "뉴스 서버 응답 지연"
+                
+            data.append({
+                "종목명": t,
+                "현재가": f"${curr_price:.2f}",
+                "변동률": f"{change:+.2f}%",
+                "뉴스 센티먼트 (예측)": sentiment,
+                "최신 글로벌 헤드라인": top_headline
+            })
+        except Exception as e:
+            continue
+            
     return pd.DataFrame(data)
 
 def parse_kiwoom_csv_to_db(file_obj):
@@ -364,7 +385,6 @@ with tab1:
             if 'Time' not in df_journal.columns: df_journal.insert(1, 'Time', "00:00:00")
             if 'Account' not in df_journal.columns: df_journal.insert(2, 'Account', "Default")
             
-            # 🚀 [기능 복구] 다중 계좌 확장성을 위한 계좌 필터링 기능 부활
             available_accounts = df_journal[df_journal['Ticker'] == view_ticker]['Account'].unique().tolist()
             
             col_opt1, col_opt2 = st.columns(2)
@@ -390,7 +410,6 @@ with tab1:
                         total_cost += qty * price
                         avg_price = total_cost / current_qty if current_qty > 0 else 0
                     elif row['Action'] == 'Sell': 
-                        # 🚀 매도시 무조건 0으로 강제 초기화하여 평단가 오류 방지
                         current_qty, total_cost, avg_price = 0.0, 0.0, 0.0
                 
                 with col_ai:
@@ -411,19 +430,30 @@ with tab1:
                     
                     ai_models = load_ai_models()
                     if ai_models:
-                        # 🚀 나의 평단가 기반 AI 개별 목표가 제시
                         for agent_name, weights in ai_models.items():
                             agent_engine = TitanRestExitOptimizer(params=weights)
                             prediction = agent_engine.find_golden_ratio(state_vector)
                             
-                            # 보유 물량이 있으면 평단가 기준, 없으면 현재가 기준으로 제시
                             base_price = avg_price if current_qty > 0 else current_price
                             agent_target = base_price * (1 + prediction['optimal_r'] / 100)
                             
                             with st.expander(f"🤖 {agent_name}의 전술", expanded=True):
                                 st.metric(f"목표가 (+{prediction['optimal_r']}%)", f"${agent_target:,.2f}")
                                 st.write(f"**승률 예측:** {prediction['success_probability']}%")
-                                st.write(f"**예상 도달:** 약 {prediction['est_days']}일")
+                                st.write(f"**예상 도달:** 약 {prediction['est_days']}일 (오늘 기준 영업일)")
+                                
+                                w_base, w_ma, w_rsi, w_vol, w_risk = weights
+                                st.markdown(f"""
+                                <div style="font-size: 0.9em; padding: 10px; background-color: #1e1e1e; border-radius: 5px; margin-top: 10px;">
+                                💡 <b>AI 산출 알고리즘 해설</b><br>
+                                현재 시장 상태(RSI: <b>{state_vector[1]:.1f}</b>, 20일선 이격도: <b>{state_vector[0]:+.1f}%</b>)를 바탕으로 이 요원의 고유 유전자(가중치)를 곱해 산출했습니다.<br>
+                                • <b>기본 탐욕 지수:</b> {w_base:+.2f}%<br>
+                                • <b>추세 반응성 (MA):</b> {w_ma:+.2f}<br>
+                                • <b>과매수/매도 보정 (RSI):</b> {w_rsi:+.2f}<br>
+                                • <b>시장 변동성 적응력:</b> {w_vol:+.2f}<br>
+                                • <b>리스크 회피 성향:</b> {w_risk:+.2f} (수치가 높을수록 목표가를 낮춰 승률을 방어합니다)
+                                </div>
+                                """, unsafe_allow_html=True)
                     else:
                         st.warning("훈련소에서 요원을 먼저 훈련시켜주세요.")
                 
@@ -467,7 +497,7 @@ with tab5:
             if not df_radar.empty:
                 st.dataframe(df_radar, use_container_width=True)
             else:
-                st.error("데이터를 불러오지 못했습니다.")
+                st.error("데이터를 불러오지 못했습니다. 야후 파이낸스 서버 접속이 지연되고 있습니다.")
 
 # ------------------------------------------
 # TAB 4: ⚔️ 발할라 실전 리그
