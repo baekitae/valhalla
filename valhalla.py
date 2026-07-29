@@ -174,7 +174,6 @@ def get_soxl_radar():
     data = []
     
     try:
-        # 트래픽 차단 우회: 10개 종목 주가 일괄 다운로드
         df_prices = yf.download(tickers, period="5d", progress=False)
         if isinstance(df_prices.columns, pd.MultiIndex):
             closes = df_prices['Close']
@@ -440,20 +439,27 @@ with tab1:
                             with st.expander(f"🤖 {agent_name}의 전술", expanded=True):
                                 st.metric(f"목표가 (+{prediction['optimal_r']}%)", f"${agent_target:,.2f}")
                                 st.write(f"**승률 예측:** {prediction['success_probability']}%")
-                                st.write(f"**예상 도달:** 약 {prediction['est_days']}일 (오늘 기준 영업일)")
+                                
+                                # 💡 영업일 환산 후 직관적인 날짜 텍스트 제공 (주말 제외)
+                                est_days_int = int(round(prediction['est_days']))
+                                target_date = datetime.date.today() + pd.tseries.offsets.BusinessDay(n=est_days_int)
+                                target_date_str = target_date.strftime('%m월 %d일')
+                                
+                                st.write(f"**예상 도달:** 약 {prediction['est_days']} 영업일 (약 **{target_date_str}** 쯤 예상)")
                                 
                                 w_base, w_ma, w_rsi, w_vol, w_risk = weights
-                                st.markdown(f"""
-                                <div style="font-size: 0.9em; padding: 10px; background-color: #1e1e1e; border-radius: 5px; margin-top: 10px;">
-                                💡 <b>AI 산출 알고리즘 해설</b><br>
-                                현재 시장 상태(RSI: <b>{state_vector[1]:.1f}</b>, 20일선 이격도: <b>{state_vector[0]:+.1f}%</b>)를 바탕으로 이 요원의 고유 유전자(가중치)를 곱해 산출했습니다.<br>
-                                • <b>기본 탐욕 지수:</b> {w_base:+.2f}%<br>
-                                • <b>추세 반응성 (MA):</b> {w_ma:+.2f}<br>
-                                • <b>과매수/매도 보정 (RSI):</b> {w_rsi:+.2f}<br>
-                                • <b>시장 변동성 적응력:</b> {w_vol:+.2f}<br>
-                                • <b>리스크 회피 성향:</b> {w_risk:+.2f} (수치가 높을수록 목표가를 낮춰 승률을 방어합니다)
-                                </div>
-                                """, unsafe_allow_html=True)
+                                
+                                # 💡 가독성을 높인 토글(Expander)형 알고리즘 해설 (배경색 제거)
+                                with st.expander("💡 AI 산출 알고리즘 해설 보기"):
+                                    st.markdown(f"""
+                                    현재 시장 상태(RSI: **{state_vector[1]:.1f}**, 20일선 이격도: **{state_vector[0]:+.1f}%**)를 바탕으로 이 요원의 고유 유전자(가중치)를 곱해 산출했습니다.
+                                    
+                                    * **기본 탐욕 지수:** {w_base:+.2f}%
+                                    * **추세 반응성 (MA):** {w_ma:+.2f}
+                                    * **과매수/매도 보정 (RSI):** {w_rsi:+.2f}
+                                    * **시장 변동성 적응력:** {w_vol:+.2f}
+                                    * **리스크 회피 성향:** {w_risk:+.2f} (수치가 높을수록 목표가를 낮춰 승률을 방어합니다)
+                                    """)
                     else:
                         st.warning("훈련소에서 요원을 먼저 훈련시켜주세요.")
                 
