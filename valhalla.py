@@ -12,6 +12,7 @@ import warnings
 import re
 import json
 import random
+from googletrans import Translator
 
 warnings.filterwarnings('ignore')
 
@@ -158,21 +159,59 @@ def get_realtime_data(ticker):
     
     return df, [round(x1, 2), round(x2, 2), round(x3, 2), round(vol, 2)], round(current_price, 2)
 
-def analyze_sentiment(text):
-    pos_words = ['surge', 'beat', 'up', 'buy', 'rally', 'strong', 'growth', 'gain', 'jump', 'upgrade', 'record', 'high', 'boost']
-    neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay']
-    text = text.lower()
-    score = sum(1 for w in pos_words if w in text) - sum(1 for w in neg_words if w in text)
+# 💡 감성 분석 함수 (단어 매칭)
+def analyze_sentiment_with_reason(text):
+    pos_words = ['surge', 'beat', 'up', 'buy', 'rally', 'strong', 'growth', 'gain', 'jump', 'upgrade', 'record', 'high', 'boost', 'bullish']
+    neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay', 'sink', 'unwind']
     
-    if score > 0: return "🟢 호재 (상승 기대)"
-    elif score < 0: return "🔴 악재 (하락 경계)"
-    else: return "⚪ 관망 (중립)"
+    text_lower = text.lower()
+    
+    # 정규식을 이용해 단어 단위로 정확히 매칭
+    found_pos = []
+    for w in pos_words:
+        if re.search(rf'\b{w}\b', text_lower): found_pos.append(w)
+        
+    found_neg = []
+    for w in neg_words:
+        if re.search(rf'\b{w}\b', text_lower): found_neg.append(w)
+    
+    score = len(found_pos) - len(found_neg)
+    
+    reason = []
+    if found_pos: reason.append(f"🟢 호재: {', '.join(found_pos)}")
+    if found_neg: reason.append(f"🔴 악재: {', '.join(found_neg)}")
+    reason_str = " | ".join(reason) if reason else "매칭된 특이 키워드 없음 (중립)"
+    
+    if score > 0: return "🟢 호재 (상승 기대)", reason_str
+    elif score < 0: return "🔴 악재 (하락 경계)", reason_str
+    else: return "⚪ 관망 (중립)", reason_str
+
+# 💡 HTML 형광펜 하이라이트 함수
+def highlight_keywords(text):
+    pos_words = ['surge', 'beat', 'up', 'buy', 'rally', 'strong', 'growth', 'gain', 'jump', 'upgrade', 'record', 'high', 'boost', 'bullish']
+    neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay', 'sink', 'unwind']
+    
+    highlighted = text
+    # 긍정 단어 초록색 마킹
+    for w in pos_words:
+        highlighted = re.sub(rf'\b({w})\b', r'<span style="background-color: #a8f0c6; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
+    # 부정 단어 빨간색 마킹
+    for w in neg_words:
+        highlighted = re.sub(rf'\b({w})\b', r'<span style="background-color: #ffb3b3; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
+        
+    return highlighted
+
+def translate_to_korean(text):
+    try:
+        translator = Translator()
+        result = translator.translate(text, src='en', dest='ko')
+        return result.text
+    except Exception as e:
+        return "번역 서버 응답 지연 (영문 원본 참조)"
 
 @st.cache_data(ttl=1800)
 def get_soxl_radar():
     tickers = ['NVDA', 'AMD', 'AVGO', 'TSM', 'QCOM', 'INTC', 'ASML', 'TXN', 'AMAT', 'MU']
-    
-    # 💡 SOXL 추종 지수(ICE Semiconductor Index) 기준 최근 편입 비중 추정치 (%)
     weight_map = {
         'NVDA': 11.5, 'AVGO': 8.5, 'AMD': 7.5, 'QCOM': 6.0, 
         'TSM': 5.0, 'AMAT': 4.5, 'MU': 4.5, 'INTC': 4.0, 
@@ -180,7 +219,6 @@ def get_soxl_radar():
     }
     
     data = []
-    
     try:
         df_prices = yf.download(tickers, period="5d", progress=False)
         if isinstance(df_prices.columns, pd.MultiIndex):
@@ -188,7 +226,7 @@ def get_soxl_radar():
         else:
             closes = df_prices
     except Exception as e:
-        return pd.DataFrame() 
+        return []
 
     for t in tickers:
         try:
@@ -210,20 +248,22 @@ def get_soxl_radar():
                             title = n.get('title')
                             if not title and isinstance(n.get('content'), dict):
                                 title = n['content'].get('title', '')
-                            
                             if title:
                                 news_titles.append(title)
                                 
                     if news_titles:
+                        # 💡 핵심: 3개의 뉴스를 모두 합쳐서 종합 평가를 내림 (정보량 최대화)
                         combined_text = " ".join(news_titles)
-                        sentiment = analyze_sentiment(combined_text)
+                        sentiment, reason_str = analyze_sentiment_with_reason(combined_text)
+                        
+                        # 표에 보여줄 대표 헤드라인은 첫 번째 것만 사용
                         top_headline = news_titles[0]
                     else:
-                        sentiment, top_headline = "⚪ 뉴스 없음", "기사 제목을 불러올 수 없습니다."
+                        sentiment, top_headline, reason_str, news_titles = "⚪ 뉴스 없음", "기사 제목을 불러올 수 없습니다.", "", []
                 else:
-                    sentiment, top_headline = "⚪ 뉴스 없음", "관련 기사가 없습니다."
+                    sentiment, top_headline, reason_str, news_titles = "⚪ 뉴스 없음", "관련 기사가 없습니다.", "", []
             except:
-                sentiment, top_headline = "⚪ 분석 불가", "뉴스 서버 응답 지연"
+                sentiment, top_headline, reason_str, news_titles = "⚪ 분석 불가", "뉴스 서버 응답 지연", "", []
                 
             data.append({
                 "종목명": t,
@@ -231,12 +271,14 @@ def get_soxl_radar():
                 "현재가": f"${curr_price:.2f}",
                 "변동률": f"{change:+.2f}%",
                 "뉴스 센티먼트 (예측)": sentiment,
-                "최신 글로벌 헤드라인": top_headline
+                "최신 글로벌 헤드라인": top_headline, # 테이블 노출용
+                "모든헤드라인": news_titles, # 딥 스캔 토글 노출용 리스트
+                "판단근거": reason_str
             })
         except Exception as e:
             continue
             
-    return pd.DataFrame(data)
+    return data
 
 def parse_kiwoom_csv_to_db(file_obj):
     filename = file_obj.name
@@ -514,13 +556,39 @@ with tab1:
 # ------------------------------------------
 with tab5:
     st.markdown("## 📡 SOXL 생태계 레이더 (Semiconductor Top 10)")
-    st.write("SOXL을 견인하는 핵심 10대 반도체 기업의 **ETF 내 편입 비중(추정치)**과 주가 흐름, 그리고 미국 현지 뉴스 헤드라인의 긍/부정 키워드를 AI가 스캔하여 호재와 악재를 예측합니다.")
+    st.write("SOXL을 견인하는 핵심 10대 반도체 기업의 ETF 내 편입 비중과 주가 흐름, 그리고 미국 현지 뉴스 헤드라인의 긍/부정 키워드를 AI가 스캔하여 호재와 악재를 예측합니다.")
     
     if st.button("🔄 실시간 생태계 스캔 가동"):
-        with st.spinner("글로벌 뉴스 데이터 및 주가를 수집 중입니다..."):
-            df_radar = get_soxl_radar()
-            if not df_radar.empty:
-                st.dataframe(df_radar, use_container_width=True)
+        with st.spinner("글로벌 뉴스 데이터 수집 및 딥 스캔 알고리즘 작동 중... (약 10~20초 소요)"):
+            radar_data = get_soxl_radar()
+            
+            if radar_data:
+                # 1. 요약 테이블 렌더링 (지저분한 데이터 열 숨김 처리)
+                df_radar = pd.DataFrame(radar_data)
+                df_display = df_radar.drop(columns=["판단근거", "모든헤드라인"])
+                st.dataframe(df_display, use_container_width=True)
+                
+                st.markdown("---")
+                st.markdown("### 🧠 AI 뉴스 정밀 분석 (Deep Scan)")
+                
+                # 2. 토글키(Expander) 방식: 3개 기사 모두 표출 및 HTML 형광펜 마킹
+                for item in radar_data:
+                    if "뉴스 없음" in item["뉴스 센티먼트 (예측)"] or "분석 불가" in item["뉴스 센티먼트 (예측)"]:
+                        continue
+                        
+                    with st.expander(f"{item['뉴스 센티먼트 (예측)']} | {item['종목명']} ({item['변동률']}) - 딥 스캔 리포트"):
+                        st.markdown(f"**💡 전체 종합 판단 근거:** `{item['판단근거']}`")
+                        st.markdown("---")
+                        
+                        # 수집된 기사(최대 3개)를 순회하며 형광펜 및 번역 적용
+                        for idx, title in enumerate(item['모든헤드라인']):
+                            # 1. 영문 원문에 HTML 형광펜 적용
+                            highlighted_title = highlight_keywords(title)
+                            st.markdown(f"**📰 기사 {idx+1} (AI 스캔 원문):** {highlighted_title}", unsafe_allow_html=True)
+                            
+                            # 2. 깨끗한 한글 번역본 제공
+                            translated_text = translate_to_korean(title)
+                            st.info(f"**🇰🇷 기사 {idx+1} (한글 번역):** {translated_text}")
             else:
                 st.error("데이터를 불러오지 못했습니다. 야후 파이낸스 서버 접속이 지연되고 있습니다.")
 
