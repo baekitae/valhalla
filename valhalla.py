@@ -12,7 +12,7 @@ import warnings
 import re
 import json
 import random
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 
 warnings.filterwarnings('ignore')
 
@@ -203,9 +203,7 @@ def highlight_keywords(text):
 
 def translate_to_korean(text):
     try:
-        translator = Translator()
-        result = translator.translate(text, src='en', dest='ko')
-        return result.text
+        return GoogleTranslator(source='en', target='ko').translate(text)
     except Exception as e:
         return "번역 서버 응답 지연 (영문 원본 참조)"
 
