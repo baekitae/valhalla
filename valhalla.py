@@ -16,9 +16,6 @@ from deep_translator import GoogleTranslator
 
 warnings.filterwarnings('ignore')
 
-# 💡 [핵심 수정] Streamlit 페이지 기본 설정은 무조건 최상단에 배치해야 합니다!
-st.set_page_config(page_title="무한매수 전술 관제소", layout="wide")
-
 # ==========================================
 # 1. 인공지능 퀀트 엔진 (Dynamic Linear Perceptron 적용)
 # ==========================================
@@ -396,6 +393,7 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
 # ==========================================
 # 5. 웹 UI 구현 (Streamlit)
 # ==========================================
+st.set_page_config(page_title="무한매수 전술 관제소", layout="wide")
 st.title("🚀 무한매수 전술 관제소 (Project Valhalla)")
 
 if supabase: st.sidebar.success("🟢 클라우드 DB 연결됨")
@@ -511,7 +509,7 @@ with tab1:
                                 
                                 w_base, w_ma, w_rsi, w_vol, w_risk = weights
                                 
-                                with st.expander("💡 AI 산출 알고리즘 해설 보기"):
+                                with st.popover("💡 AI 산출 알고리즘 해설 보기"):
                                     st.markdown(f"""
                                     현재 시장 상태(RSI: **{state_vector[1]:.1f}**, 20일선 이격도: **{state_vector[0]:+.1f}%**)를 바탕으로 이 요원의 고유 유전자(가중치)를 곱해 산출했습니다.
                                     
