@@ -171,6 +171,14 @@ def analyze_sentiment(text):
 @st.cache_data(ttl=1800)
 def get_soxl_radar():
     tickers = ['NVDA', 'AMD', 'AVGO', 'TSM', 'QCOM', 'INTC', 'ASML', 'TXN', 'AMAT', 'MU']
+    
+    # 💡 SOXL 추종 지수(ICE Semiconductor Index) 기준 최근 편입 비중 추정치 (%)
+    weight_map = {
+        'NVDA': 11.5, 'AVGO': 8.5, 'AMD': 7.5, 'QCOM': 6.0, 
+        'TSM': 5.0, 'AMAT': 4.5, 'MU': 4.5, 'INTC': 4.0, 
+        'TXN': 4.0, 'ASML': 4.0
+    }
+    
     data = []
     
     try:
@@ -199,7 +207,6 @@ def get_soxl_radar():
                     news_titles = []
                     for n in news[:3]:
                         if isinstance(n, dict):
-                            # 🚀 야후 API 업데이트 대응: title이 없으면 content 내부를 다시 스캔
                             title = n.get('title')
                             if not title and isinstance(n.get('content'), dict):
                                 title = n['content'].get('title', '')
@@ -220,6 +227,7 @@ def get_soxl_radar():
                 
             data.append({
                 "종목명": t,
+                "비중(추정)": f"{weight_map.get(t, 0.0)}%",
                 "현재가": f"${curr_price:.2f}",
                 "변동률": f"{change:+.2f}%",
                 "뉴스 센티먼트 (예측)": sentiment,
@@ -453,7 +461,6 @@ with tab1:
                                 st.metric(f"목표가 (+{prediction['optimal_r']}%)", f"${agent_target:,.2f}")
                                 st.write(f"**승률 예측:** {prediction['success_probability']}%")
                                 
-                                # 영업일 환산 후 직관적인 날짜 텍스트 제공 (주말 제외)
                                 est_days_int = int(round(prediction['est_days']))
                                 target_date = datetime.date.today() + pd.tseries.offsets.BusinessDay(n=est_days_int)
                                 target_date_str = target_date.strftime('%m월 %d일')
@@ -462,7 +469,6 @@ with tab1:
                                 
                                 w_base, w_ma, w_rsi, w_vol, w_risk = weights
                                 
-                                # 가독성을 높인 토글(Expander)형 알고리즘 해설 (배경색 제거)
                                 with st.expander("💡 AI 산출 알고리즘 해설 보기"):
                                     st.markdown(f"""
                                     현재 시장 상태(RSI: **{state_vector[1]:.1f}**, 20일선 이격도: **{state_vector[0]:+.1f}%**)를 바탕으로 이 요원의 고유 유전자(가중치)를 곱해 산출했습니다.
@@ -508,7 +514,7 @@ with tab1:
 # ------------------------------------------
 with tab5:
     st.markdown("## 📡 SOXL 생태계 레이더 (Semiconductor Top 10)")
-    st.write("SOXL을 견인하는 핵심 10대 반도체 기업의 주가 흐름과 **미국 현지 뉴스 헤드라인의 긍/부정 키워드를 AI가 스캔하여 호재와 악재를 예측**합니다.")
+    st.write("SOXL을 견인하는 핵심 10대 반도체 기업의 **ETF 내 편입 비중(추정치)**과 주가 흐름, 그리고 미국 현지 뉴스 헤드라인의 긍/부정 키워드를 AI가 스캔하여 호재와 악재를 예측합니다.")
     
     if st.button("🔄 실시간 생태계 스캔 가동"):
         with st.spinner("글로벌 뉴스 데이터 및 주가를 수집 중입니다..."):
