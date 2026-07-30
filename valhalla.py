@@ -196,10 +196,23 @@ def get_soxl_radar():
                 stock = yf.Ticker(t)
                 news = stock.news
                 if news:
-                    news_titles = [n.get('title', '') for n in news[:3] if isinstance(n, dict)]
-                    combined_text = " ".join(news_titles)
-                    sentiment = analyze_sentiment(combined_text)
-                    top_headline = news_titles[0] if news_titles else "최근 뉴스 없음"
+                    news_titles = []
+                    for n in news[:3]:
+                        if isinstance(n, dict):
+                            # 🚀 야후 API 업데이트 대응: title이 없으면 content 내부를 다시 스캔
+                            title = n.get('title')
+                            if not title and isinstance(n.get('content'), dict):
+                                title = n['content'].get('title', '')
+                            
+                            if title:
+                                news_titles.append(title)
+                                
+                    if news_titles:
+                        combined_text = " ".join(news_titles)
+                        sentiment = analyze_sentiment(combined_text)
+                        top_headline = news_titles[0]
+                    else:
+                        sentiment, top_headline = "⚪ 뉴스 없음", "기사 제목을 불러올 수 없습니다."
                 else:
                     sentiment, top_headline = "⚪ 뉴스 없음", "관련 기사가 없습니다."
             except:
@@ -440,7 +453,7 @@ with tab1:
                                 st.metric(f"목표가 (+{prediction['optimal_r']}%)", f"${agent_target:,.2f}")
                                 st.write(f"**승률 예측:** {prediction['success_probability']}%")
                                 
-                                # 💡 영업일 환산 후 직관적인 날짜 텍스트 제공 (주말 제외)
+                                # 영업일 환산 후 직관적인 날짜 텍스트 제공 (주말 제외)
                                 est_days_int = int(round(prediction['est_days']))
                                 target_date = datetime.date.today() + pd.tseries.offsets.BusinessDay(n=est_days_int)
                                 target_date_str = target_date.strftime('%m월 %d일')
@@ -449,7 +462,7 @@ with tab1:
                                 
                                 w_base, w_ma, w_rsi, w_vol, w_risk = weights
                                 
-                                # 💡 가독성을 높인 토글(Expander)형 알고리즘 해설 (배경색 제거)
+                                # 가독성을 높인 토글(Expander)형 알고리즘 해설 (배경색 제거)
                                 with st.expander("💡 AI 산출 알고리즘 해설 보기"):
                                     st.markdown(f"""
                                     현재 시장 상태(RSI: **{state_vector[1]:.1f}**, 20일선 이격도: **{state_vector[0]:+.1f}%**)를 바탕으로 이 요원의 고유 유전자(가중치)를 곱해 산출했습니다.
