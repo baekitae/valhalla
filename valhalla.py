@@ -16,6 +16,9 @@ from deep_translator import GoogleTranslator
 
 warnings.filterwarnings('ignore')
 
+# 🚨 스트림릿 절대 규칙: 페이지 설정은 무조건 최상단에 위치해야 합니다.
+st.set_page_config(page_title="무한매수 전술 관제소", layout="wide")
+
 # ==========================================
 # 1. 인공지능 퀀트 엔진 (Dynamic Linear Perceptron 적용)
 # ==========================================
@@ -393,7 +396,6 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
 # ==========================================
 # 5. 웹 UI 구현 (Streamlit)
 # ==========================================
-st.set_page_config(page_title="무한매수 전술 관제소", layout="wide")
 st.title("🚀 무한매수 전술 관제소 (Project Valhalla)")
 
 if supabase: st.sidebar.success("🟢 클라우드 DB 연결됨")
@@ -517,7 +519,7 @@ with tab1:
                                     * **추세 반응성 (MA):** {w_ma:+.2f}
                                     * **과매수/매도 보정 (RSI):** {w_rsi:+.2f}
                                     * **시장 변동성 적응력:** {w_vol:+.2f}
-                                    * **리스크 회피 성향:** {w_risk:+.2f} (수치가 높을수록 목표가를 낮춰 승률을 방어합니다)
+                                    * **리스크 회피 성향:** {w_risk:+.2f} (수치가 높을수록 목표가를 낮춰 승률 방어를 시도합니다)
                                     """)
                     else:
                         st.warning("훈련소에서 요원을 먼저 훈련시켜주세요.")
