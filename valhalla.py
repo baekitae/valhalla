@@ -525,7 +525,7 @@ with tab1:
                         st.warning("훈련소에서 요원을 먼저 훈련시켜주세요.")
                 
                 with col_chart:
-                    time_correction = st.checkbox("🇺🇸 미국 주식 시차 보정 (-1일 적용)", value=True)
+                    time_correction = st.checkbox("🇺🇸 미국 주식 시차 보정 (한국 새벽 거래만 -1일 자동 적용)", value=True)
                     fig = go.Figure(data=[go.Candlestick(x=df_chart.index, open=df_chart['Open'], high=df_chart['High'], low=df_chart['Low'], close=df_chart['Close'], name="Candle")])
                     
                     if current_qty > 0: 
@@ -534,14 +534,22 @@ with tab1:
                     
                     buys = trades[trades['Action'] == 'Buy'].copy()
                     if not buys.empty:
-                        buys['Plot_Date'] = pd.to_datetime(buys['Date']) - (pd.Timedelta(days=1) if time_correction else pd.Timedelta(days=0))
+                        if time_correction:
+                            is_dawn = pd.to_datetime(buys['Time'], format='%H:%M:%S', errors='coerce').dt.hour < 9
+                            buys['Plot_Date'] = pd.to_datetime(buys['Date']) - pd.to_timedelta(is_dawn.fillna(False).astype(int), unit='d')
+                        else:
+                            buys['Plot_Date'] = pd.to_datetime(buys['Date'])
                         fig.add_trace(go.Scatter(x=buys['Plot_Date'], y=buys['Price'], mode='markers', name='나의 매수',
                                                  marker=dict(symbol='triangle-up', color='lime', size=14, line=dict(width=1, color='black')),
                                                  text=buys['Qty'].astype(str) + "주 매수", hoverinfo="text+y+x"))
 
                     sells = trades[trades['Action'] == 'Sell'].copy()
                     if not sells.empty:
-                        sells['Plot_Date'] = pd.to_datetime(sells['Date']) - (pd.Timedelta(days=1) if time_correction else pd.Timedelta(days=0))
+                        if time_correction:
+                            is_dawn = pd.to_datetime(sells['Time'], format='%H:%M:%S', errors='coerce').dt.hour < 9
+                            sells['Plot_Date'] = pd.to_datetime(sells['Date']) - pd.to_timedelta(is_dawn.fillna(False).astype(int), unit='d')
+                        else:
+                            sells['Plot_Date'] = pd.to_datetime(sells['Date'])
                         fig.add_trace(go.Scatter(x=sells['Plot_Date'], y=sells['Price'], mode='markers', name='나의 매도',
                                                  marker=dict(symbol='triangle-down', color='red', size=14, line=dict(width=1, color='black')),
                                                  text=sells['Qty'].astype(str) + "주 매도", hoverinfo="text+y+x"))
@@ -741,6 +749,8 @@ with tab3:
     col_db1, col_db2 = st.columns([8, 2])
     with col_db1:
         df_display = read_db("trade_journal")
+        if not df_display.empty:
+            df_display = df_display.sort_values(["Date", "Time"]).reset_index(drop=True)
         edited_df = st.data_editor(df_display, num_rows="dynamic", use_container_width=True)
         if st.button("💾 수동 편집 내용 덮어쓰기"):
             overwrite_db("trade_journal", edited_df)
