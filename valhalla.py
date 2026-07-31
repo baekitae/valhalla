@@ -720,7 +720,7 @@ with tab3:
             col1, col2, col3 = st.columns(3)
             with col1:
                 t_date = st.date_input("거래 일자", datetime.date.today())
-                t_time = st.text_input("거래 시간 (HH:MM:SS)", datetime.datetime.now().strftime("%H:%M:%S"))
+                t_time = st.text_input("체결 시간", datetime.datetime.now().strftime("%H:%M:%S"))
                 t_account = st.text_input("계좌명", "Manual")
             with col2:
                 t_ticker = st.text_input("종목 티커", "SOXL").upper()
