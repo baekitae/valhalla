@@ -16,46 +16,32 @@ from deep_translator import GoogleTranslator
 warnings.filterwarnings('ignore')
 
 # 🚨 스트림릿 절대 규칙: 페이지 설정은 무조건 최상단에 위치해야 합니다.
-st.set_page_config(page_title="무한매수 전술 관제소 V3.0", layout="wide")
+st.set_page_config(page_title="무한매수 전술 관제소 V3.1", layout="wide")
 
 # ==========================================
 # 1. 인공지능 퀀트 엔진 V3.0 (매수/매도 자율 진화형)
 # ==========================================
 class TitanRestV3Optimizer:
     def __init__(self, params=None):
-        # params: [w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, w_split]
-        # V3.0 핵심: 8개의 유전자 가중치를 탑재
         self.params = np.array(params) if params is not None else np.array([10.0, 2.0, -3.0, 1.5, 5.0, 1.0, 1.0, 40.0])
-        # 💡 인간의 절대 가드레일: 예산은 무조건 20~40분할 내에서만 쪼갠다.
         self.w_split = max(20.0, min(40.0, self.params[7])) 
 
     def get_action_params(self, X):
         w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, _ = self.params
         
-        # 시장 상태 정규화
         ma_norm = np.clip(X[0] / 10.0, -1.0, 1.0)
         rsi_norm = (X[1] - 50.0) / 50.0
         vol_norm = np.clip(X[3] / 5.0, 0.0, 2.0)
         
-        # -----------------------------------
-        # [1] AI 매도 전술 (목표가 산출)
-        # -----------------------------------
+        # [1] AI 매도 전술
         target_r = w_base + (w_ma * ma_norm) + (w_rsi * rsi_norm) + (w_vol * vol_norm) - (w_risk * 0.5)
         target_r = np.clip(target_r, 3.0, 30.0)
         prob = np.clip(95.0 - (target_r * 1.2) + w_risk, 10.0, 99.9)
         est_days = max(1.0, target_r * 1.1 - (w_risk * 0.1))
         
-        # -----------------------------------
-        # [2] AI 매수 전술 (수량 및 단가 자율 조절)
-        # -----------------------------------
-        # 공포 지수 산출 (RSI가 낮고 이격도가 마이너스일수록 치솟음)
+        # [2] AI 매수 전술
         fear_index = (-rsi_norm) + (-ma_norm) 
-        
-        # 매수 배수 자율 결정 (최소 0배 ~ 최대 무제한)
-        buy_multiplier = 1.0 + (fear_index * w_buy_mul)
-        buy_multiplier = max(0.0, buy_multiplier) 
-        
-        # 매수 단가 자율 결정 (현재가 대비 몇 % 밑에 지정가를 걸 것인가)
+        buy_multiplier = max(0.0, 1.0 + (fear_index * w_buy_mul))
         buy_discount_pct = max(0.0, w_buy_dist * (1.0 + vol_norm))
         
         return {
@@ -94,13 +80,11 @@ def init_local_files():
             "Agent_Beta (초기화)": [5.0, 0.5, -1.0, 0.5, 2.0, 1.0, 0.5, 30.0],
             "Agent_Gamma (초기화)": [10.0, 1.0, -2.0, 1.5, 5.0, 3.0, 2.0, 20.0]
         }
-        with open(AI_MODELS_FILE, 'w') as f:
-            json.dump(initial_models, f)
+        with open(AI_MODELS_FILE, 'w') as f: json.dump(initial_models, f)
     if not os.path.exists(AI_LEDGER_FILE):
         pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]).to_csv(AI_LEDGER_FILE, index=False)
 
-if not supabase:
-    init_local_files()
+if not supabase: init_local_files()
 
 def read_db(table_name):
     if supabase:
@@ -140,8 +124,7 @@ def load_ai_models():
             res = supabase.table("valhalla_ai_models").select("*").execute()
             if res.data:
                 models = {}
-                for row in res.data:
-                    models[row['agent_name']] = json.loads(row['genes'])
+                for row in res.data: models[row['agent_name']] = json.loads(row['genes'])
                 return models
         except: pass
     try:
@@ -161,8 +144,17 @@ def save_ai_models(models_dict):
         return True
 
 # ==========================================
-# 3. 실시간 차트 & 데이터 로더
+# 3. 실시간 차트 & 환율 & 데이터 로더
 # ==========================================
+@st.cache_data(ttl=3600)
+def get_exchange_rate():
+    try:
+        df = yf.download("USDKRW=X", period="1d", progress=False)
+        if not df.empty: return float(df['Close'].iloc[-1])
+        return 1350.0 
+    except:
+        return 1350.0 
+
 @st.cache_data(ttl=3600)
 def get_realtime_data(ticker):
     end_date = datetime.date.today() + datetime.timedelta(days=1)
@@ -234,7 +226,6 @@ def get_soxl_radar():
             if t not in closes.columns: continue
             valid_closes = closes[t].dropna()
             if len(valid_closes) < 2: continue
-            
             curr_price = float(valid_closes.iloc[-1])
             change = (curr_price - float(valid_closes.iloc[-2])) / float(valid_closes.iloc[-2]) * 100
             
@@ -271,7 +262,6 @@ def get_macro_radar():
             if t not in closes.columns: continue
             valid_closes = closes[t].dropna()
             if len(valid_closes) < 2: continue
-            
             curr_price = float(valid_closes.iloc[-1])
             change = (curr_price - float(valid_closes.iloc[-2])) / float(valid_closes.iloc[-2]) * 100
             
@@ -366,22 +356,21 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=1000, days_bac
     df.dropna(inplace=True)
     
     agents = []
-    # 💡 1,000명의 개체군 생성 (매수/매도 유전자 탑재)
     for i in range(population_size):
         w_base = random.uniform(5.0, 20.0)
         w_ma = random.uniform(-5.0, 5.0)
         w_rsi = random.uniform(-5.0, 5.0)
         w_vol = random.uniform(-5.0, 5.0)
         w_risk = random.uniform(0.0, 10.0)
-        w_buy_dist = random.uniform(0.0, 5.0)  # 할인율 0~5%
-        w_buy_mul = random.uniform(-2.0, 5.0)  # 매수 배수 조정력
-        w_split = random.uniform(20.0, 40.0)   # 20~40분할 가드레일
+        w_buy_dist = random.uniform(0.0, 5.0) 
+        w_buy_mul = random.uniform(-2.0, 5.0) 
+        w_split = random.uniform(20.0, 40.0)  
         weights = [w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, w_split]
         agents.append({"id": f"Agent_Gen_{i}", "weights": weights, "total_score": 0.0})
     
     for agent in agents:
         engine = TitanRestV3Optimizer(params=agent['weights'])
-        total_capital = 10000.0 # 훈련용 가상 시드
+        total_capital = 10000.0 
         remaining_capital = total_capital
         base_buy_amount = total_capital / engine.w_split
         
@@ -397,26 +386,22 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=1000, days_bac
             avg_price = total_cost / current_qty if current_qty > 0 else 0
             pred = engine.get_action_params(X)
             
-            # 1. 매도 우선 체크
             target_price = avg_price * (1 + (pred['optimal_r'] / 100.0))
             if current_qty > 0 and p_high >= target_price:
                 profit += (target_price - avg_price) * current_qty
                 remaining_capital += target_price * current_qty
                 current_qty, total_cost = 0.0, 0.0
             else:
-                # 2. 매수 로직 (AI 자율 할인율 및 가중치 적용)
                 buy_target_price = p_close * (1 - (pred['buy_discount_pct'] / 100.0))
                 if p_low <= buy_target_price and remaining_capital > 0:
                     attempt_amount = base_buy_amount * pred['buy_multiplier']
-                    actual_amount = min(attempt_amount, remaining_capital) # 예산 가드레일 방어
-                    
+                    actual_amount = min(attempt_amount, remaining_capital)
                     if actual_amount > 0:
                         trade_qty = actual_amount / buy_target_price
                         current_qty += trade_qty
                         total_cost += actual_amount
                         remaining_capital -= actual_amount
         
-        # 마지막 날 장부 가치 정산
         unrealized_profit = (current_qty * float(df['Close'].iloc[-1])) - total_cost
         agent['total_score'] = profit + unrealized_profit
 
@@ -426,10 +411,13 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=1000, days_bac
 # ==========================================
 # 5. 웹 UI 구현 (Streamlit)
 # ==========================================
-st.title("🚀 무한매수 전술 관제소 (Project Valhalla V3.0)")
+st.title("🚀 무한매수 전술 관제소 (Project Valhalla V3.1)")
 
 if supabase: st.sidebar.success("🟢 클라우드 DB 연결됨")
 else: st.sidebar.warning("🟡 로컬 DB 사용 중")
+
+krw_rate = get_exchange_rate()
+st.sidebar.info(f"💱 **실시간 환율:** 1 USD = {krw_rate:,.2f} KRW")
 
 tab1, tab5, tab4, tab2, tab3 = st.tabs(["📊 전술 관제", "📡 SOXL 생태계", "⚔️ 발할라 실전 리그", "🧠 훈련소 (진화)", "🗄️ 매매 일지"])
 
@@ -464,7 +452,7 @@ if uploaded_files:
             st.sidebar.success(f"✅ 동기화 완료! 클라우드에 저장되었습니다.")
 
 # ------------------------------------------
-# TAB 1: 전술 관제 (V3.0 매수/매도 표시)
+# TAB 1: 전술 관제 
 # ------------------------------------------
 with tab1:
     view_ticker = st.text_input("🔍 관제할 티커를 입력하세요", "SOXL").upper()
@@ -511,13 +499,27 @@ with tab1:
                         st.markdown("---")
                         st.markdown("### 🧮 작전 수익 시뮬레이터")
                         expected_profit = (user_target_price - avg_price) * current_qty
-                        st.success(f"**현재 설정(+{user_target_pct}%) 매도 시:**\n\n예상 수익금 **${expected_profit:,.2f}**")
+                        expected_profit_krw = expected_profit * krw_rate
+                        st.success(f"**현재 설정(+{user_target_pct}%) 매도 시:**\n\n예상 수익금 **${expected_profit:,.2f}**\n\n(약 **₩{expected_profit_krw:,.0f}**)")
                         
                         st.markdown("👇 **역산 계산기 (원하는 수익금 입력)**")
-                        desired_profit = st.number_input("목표 수익금 ($)", min_value=1.0, value=100.0, step=10.0)
-                        req_price = avg_price + (desired_profit / current_qty)
-                        req_pct = ((req_price / avg_price) - 1.0) * 100.0
-                        st.info(f"**${desired_profit:,.2f}** 벌려면 ➔ **+{req_pct:.2f}%** 에 매도\n\n(목표가 ${req_price:.2f})")
+                        currency_choice = st.radio("입력 통화 기준", ["미국 달러 (USD)", "대한민국 원 (KRW)"], horizontal=True)
+                        
+                        if "KRW" in currency_choice:
+                            desired_profit_input = st.number_input("목표 수익금 (₩)", min_value=1000, value=100000, step=10000)
+                            desired_profit_usd = desired_profit_input / krw_rate
+                        else:
+                            desired_profit_input = st.number_input("목표 수익금 ($)", min_value=1.0, value=100.0, step=10.0)
+                            desired_profit_usd = desired_profit_input
+                            
+                        req_price = avg_price + (desired_profit_usd / current_qty) if current_qty > 0 else 0
+                        req_pct = ((req_price / avg_price) - 1.0) * 100.0 if avg_price > 0 else 0
+                        
+                        if "KRW" in currency_choice:
+                            st.info(f"**₩{desired_profit_input:,.0f}** (약 ${desired_profit_usd:,.2f}) 벌려면\n\n➔ **+{req_pct:.2f}%** 에 매도 (목표가 ${req_price:.2f})")
+                        else:
+                            desired_profit_krw = desired_profit_usd * krw_rate
+                            st.info(f"**${desired_profit_input:,.2f}** (약 ₩{desired_profit_krw:,.0f}) 벌려면\n\n➔ **+{req_pct:.2f}%** 에 매도 (목표가 ${req_price:.2f})")
                     else:
                         st.write("현재 진행 중인 매수 사이클이 없습니다.")
                     
@@ -528,7 +530,7 @@ with tab1:
                     ai_models = load_ai_models()
                     if ai_models:
                         for agent_name, weights in ai_models.items():
-                            if len(weights) < 8: weights = weights + [1.0, 1.0, 40.0] # 구버전 호환용 방어코드
+                            if len(weights) < 8: weights = weights + [1.0, 1.0, 40.0] 
                             agent_engine = TitanRestV3Optimizer(params=weights)
                             prediction = agent_engine.get_action_params(state_vector)
                             
@@ -549,9 +551,9 @@ with tab1:
                                     w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, w_split = weights
                                     st.markdown(f"""
                                     * **기본 탐욕 지수:** {w_base:+.2f}%
-                                    * **리스크 회피 성향:** {w_risk:+.2f} (수치가 높을수록 목표가를 낮춰 승률 방어)
-                                    * **매수 배수 가중치:** {w_buy_mul:+.2f} (시장 공포시 수량 증폭력)
-                                    * **매수 할인율 가중치:** {w_buy_dist:+.2f} (더 싼 가격에 잡으려는 의지)
+                                    * **리스크 회피 성향:** {w_risk:+.2f}
+                                    * **매수 배수 가중치:** {w_buy_mul:+.2f}
+                                    * **매수 할인율 가중치:** {w_buy_dist:+.2f}
                                     * **예산 가드레일:** {int(w_split)}분할 통제중
                                     """)
                     else:
@@ -674,7 +676,6 @@ with tab4:
                 if current_qty > 0 and current_price >= target_price:
                     action, trade_qty, profit = "Sell", round(current_qty, 4), (current_price - avg_price) * current_qty
                 else:
-                    # 일일 가상 매수 로직 (V3.0 배수 적용)
                     base_budget = 10000 / prediction['split_ratio']
                     buy_budget = base_budget * prediction['buy_multiplier']
                     if buy_budget > 0:
