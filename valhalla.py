@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from scipy.optimize import minimize
 from supabase import create_client
 import os
 import datetime
@@ -17,29 +16,55 @@ from deep_translator import GoogleTranslator
 warnings.filterwarnings('ignore')
 
 # 🚨 스트림릿 절대 규칙: 페이지 설정은 무조건 최상단에 위치해야 합니다.
-st.set_page_config(page_title="무한매수 전술 관제소", layout="wide")
+st.set_page_config(page_title="무한매수 전술 관제소 V3.0", layout="wide")
 
 # ==========================================
-# 1. 인공지능 퀀트 엔진 (Dynamic Linear Perceptron 적용)
+# 1. 인공지능 퀀트 엔진 V3.0 (매수/매도 자율 진화형)
 # ==========================================
-class TitanRestExitOptimizer:
+class TitanRestV3Optimizer:
     def __init__(self, params=None):
-        self.params = np.array(params) if params is not None else np.array([10.0, 2.0, -3.0, 1.5, 5.0])
+        # params: [w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, w_split]
+        # V3.0 핵심: 8개의 유전자 가중치를 탑재
+        self.params = np.array(params) if params is not None else np.array([10.0, 2.0, -3.0, 1.5, 5.0, 1.0, 1.0, 40.0])
+        # 💡 인간의 절대 가드레일: 예산은 무조건 20~40분할 내에서만 쪼갠다.
+        self.w_split = max(20.0, min(40.0, self.params[7])) 
 
-    def find_golden_ratio(self, X):
-        w_base, w_ma, w_rsi, w_vol, w_risk = self.params
+    def get_action_params(self, X):
+        w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, _ = self.params
+        
+        # 시장 상태 정규화
         ma_norm = np.clip(X[0] / 10.0, -1.0, 1.0)
         rsi_norm = (X[1] - 50.0) / 50.0
         vol_norm = np.clip(X[3] / 5.0, 0.0, 2.0)
-        target_r = w_base + (w_ma * ma_norm) + (w_rsi * rsi_norm) + (w_vol * vol_norm)
+        
+        # -----------------------------------
+        # [1] AI 매도 전술 (목표가 산출)
+        # -----------------------------------
+        target_r = w_base + (w_ma * ma_norm) + (w_rsi * rsi_norm) + (w_vol * vol_norm) - (w_risk * 0.5)
         target_r = np.clip(target_r, 3.0, 30.0)
         prob = np.clip(95.0 - (target_r * 1.2) + w_risk, 10.0, 99.9)
         est_days = max(1.0, target_r * 1.1 - (w_risk * 0.1))
         
+        # -----------------------------------
+        # [2] AI 매수 전술 (수량 및 단가 자율 조절)
+        # -----------------------------------
+        # 공포 지수 산출 (RSI가 낮고 이격도가 마이너스일수록 치솟음)
+        fear_index = (-rsi_norm) + (-ma_norm) 
+        
+        # 매수 배수 자율 결정 (최소 0배 ~ 최대 무제한)
+        buy_multiplier = 1.0 + (fear_index * w_buy_mul)
+        buy_multiplier = max(0.0, buy_multiplier) 
+        
+        # 매수 단가 자율 결정 (현재가 대비 몇 % 밑에 지정가를 걸 것인가)
+        buy_discount_pct = max(0.0, w_buy_dist * (1.0 + vol_norm))
+        
         return {
             'optimal_r': round(target_r, 2),
             'success_probability': round(prob, 1),
-            'est_days': round(est_days, 1)
+            'est_days': round(est_days, 1),
+            'buy_multiplier': round(buy_multiplier, 2),
+            'buy_discount_pct': round(buy_discount_pct, 2),
+            'split_ratio': int(self.w_split)
         }
 
 # ==========================================
@@ -65,9 +90,9 @@ def init_local_files():
         pd.DataFrame(columns=["Date", "Time", "Account", "Ticker", "Action", "Qty", "Price", "Format"]).to_csv(DB_FILE, index=False)
     if not os.path.exists(AI_MODELS_FILE):
         initial_models = {
-            "Agent_Alpha (초기화)": [15.0, 2.0, -3.0, 1.0, 8.0],
-            "Agent_Beta (초기화)": [5.0, 0.5, -1.0, 0.5, 2.0],
-            "Agent_Gamma (초기화)": [10.0, 1.0, -2.0, 1.5, 5.0]
+            "Agent_Alpha (초기화)": [15.0, 2.0, -3.0, 1.0, 8.0, 2.0, 1.5, 40.0],
+            "Agent_Beta (초기화)": [5.0, 0.5, -1.0, 0.5, 2.0, 1.0, 0.5, 30.0],
+            "Agent_Gamma (초기화)": [10.0, 1.0, -2.0, 1.5, 5.0, 3.0, 2.0, 20.0]
         }
         with open(AI_MODELS_FILE, 'w') as f:
             json.dump(initial_models, f)
@@ -136,7 +161,7 @@ def save_ai_models(models_dict):
         return True
 
 # ==========================================
-# 3. 실시간 차트 & SOXL 뉴스 센티먼트 로더
+# 3. 실시간 차트 & 데이터 로더
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_realtime_data(ticker):
@@ -162,24 +187,15 @@ def get_realtime_data(ticker):
     
     return df, [round(x1, 2), round(x2, 2), round(x3, 2), round(vol, 2)], round(current_price, 2)
 
-# 💡 감성 분석 함수 (단어 매칭)
 def analyze_sentiment_with_reason(text):
     pos_words = ['surge', 'beat', 'up', 'buy', 'rally', 'strong', 'growth', 'gain', 'jump', 'upgrade', 'record', 'high', 'boost', 'bullish']
     neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay', 'sink', 'unwind']
-    
     text_lower = text.lower()
     
-    # 정규식을 이용해 단어 단위로 정확히 매칭
-    found_pos = []
-    for w in pos_words:
-        if re.search(rf'\b{w}\b', text_lower): found_pos.append(w)
-        
-    found_neg = []
-    for w in neg_words:
-        if re.search(rf'\b{w}\b', text_lower): found_neg.append(w)
+    found_pos = [w for w in pos_words if re.search(rf'\b{w}\b', text_lower)]
+    found_neg = [w for w in neg_words if re.search(rf'\b{w}\b', text_lower)]
     
     score = len(found_pos) - len(found_neg)
-    
     reason = []
     if found_pos: reason.append(f"🟢 호재: {', '.join(found_pos)}")
     if found_neg: reason.append(f"🔴 악재: {', '.join(found_neg)}")
@@ -189,45 +205,29 @@ def analyze_sentiment_with_reason(text):
     elif score < 0: return "🔴 악재 (하락 경계)", reason_str
     else: return "⚪ 관망 (중립)", reason_str
 
-# 💡 HTML 형광펜 하이라이트 함수
 def highlight_keywords(text):
     pos_words = ['surge', 'beat', 'up', 'buy', 'rally', 'strong', 'growth', 'gain', 'jump', 'upgrade', 'record', 'high', 'boost', 'bullish']
     neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay', 'sink', 'unwind']
-    
     highlighted = text
-    # 긍정 단어 초록색 마킹
     for w in pos_words:
         highlighted = re.sub(rf'\b({w})\b', r'<span style="background-color: #a8f0c6; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
-    # 부정 단어 빨간색 마킹
     for w in neg_words:
         highlighted = re.sub(rf'\b({w})\b', r'<span style="background-color: #ffb3b3; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
-        
     return highlighted
 
 def translate_to_korean(text):
-    try:
-        return GoogleTranslator(source='en', target='ko').translate(text)
-    except Exception as e:
-        return "번역 서버 응답 지연 (영문 원본 참조)"
+    try: return GoogleTranslator(source='en', target='ko').translate(text)
+    except: return "번역 서버 응답 지연 (영문 원본 참조)"
 
 @st.cache_data(ttl=1800)
 def get_soxl_radar():
     tickers = ['NVDA', 'AMD', 'AVGO', 'TSM', 'QCOM', 'INTC', 'ASML', 'TXN', 'AMAT', 'MU']
-    weight_map = {
-        'NVDA': 11.5, 'AVGO': 8.5, 'AMD': 7.5, 'QCOM': 6.0, 
-        'TSM': 5.0, 'AMAT': 4.5, 'MU': 4.5, 'INTC': 4.0, 
-        'TXN': 4.0, 'ASML': 4.0
-    }
-    
+    weight_map = {'NVDA': 11.5, 'AVGO': 8.5, 'AMD': 7.5, 'QCOM': 6.0, 'TSM': 5.0, 'AMAT': 4.5, 'MU': 4.5, 'INTC': 4.0, 'TXN': 4.0, 'ASML': 4.0}
     data = []
     try:
         df_prices = yf.download(tickers, period="5d", progress=False)
-        if isinstance(df_prices.columns, pd.MultiIndex):
-            closes = df_prices['Close']
-        else:
-            closes = df_prices
-    except Exception as e:
-        return []
+        closes = df_prices['Close'] if isinstance(df_prices.columns, pd.MultiIndex) else df_prices
+    except: return []
 
     for t in tickers:
         try:
@@ -235,50 +235,63 @@ def get_soxl_radar():
             valid_closes = closes[t].dropna()
             if len(valid_closes) < 2: continue
             
-            prev_close = float(valid_closes.iloc[-2])
             curr_price = float(valid_closes.iloc[-1])
-            change = (curr_price - prev_close) / prev_close * 100
+            change = (curr_price - float(valid_closes.iloc[-2])) / float(valid_closes.iloc[-2]) * 100
             
-            try:
-                stock = yf.Ticker(t)
-                news = stock.news
-                if news:
-                    news_titles = []
-                    for n in news[:3]:
-                        if isinstance(n, dict):
-                            title = n.get('title')
-                            if not title and isinstance(n.get('content'), dict):
-                                title = n['content'].get('title', '')
-                            if title:
-                                news_titles.append(title)
-                                
-                    if news_titles:
-                        # 💡 핵심: 3개의 뉴스를 모두 합쳐서 종합 평가를 내림 (정보량 최대화)
-                        combined_text = " ".join(news_titles)
-                        sentiment, reason_str = analyze_sentiment_with_reason(combined_text)
-                        
-                        # 표에 보여줄 대표 헤드라인은 첫 번째 것만 사용
-                        top_headline = news_titles[0]
-                    else:
-                        sentiment, top_headline, reason_str, news_titles = "⚪ 뉴스 없음", "기사 제목을 불러올 수 없습니다.", "", []
-                else:
-                    sentiment, top_headline, reason_str, news_titles = "⚪ 뉴스 없음", "관련 기사가 없습니다.", "", []
-            except:
-                sentiment, top_headline, reason_str, news_titles = "⚪ 분석 불가", "뉴스 서버 응답 지연", "", []
+            stock = yf.Ticker(t)
+            news = stock.news
+            news_titles = []
+            if news:
+                for n in news[:3]:
+                    if isinstance(n, dict):
+                        title = n.get('title') or (n.get('content', {}).get('title', '') if isinstance(n.get('content'), dict) else '')
+                        if title: news_titles.append(title)
+            if news_titles:
+                sentiment, reason_str = analyze_sentiment_with_reason(" ".join(news_titles))
+                top_headline = news_titles[0]
+            else:
+                sentiment, top_headline, reason_str = "⚪ 뉴스 없음", "관련 기사가 없습니다.", ""
                 
-            data.append({
-                "종목명": t,
-                "비중(추정)": f"{weight_map.get(t, 0.0)}%",
-                "현재가": f"${curr_price:.2f}",
-                "변동률": f"{change:+.2f}%",
-                "뉴스 센티먼트 (예측)": sentiment,
-                "최신 글로벌 헤드라인": top_headline, # 테이블 노출용
-                "모든헤드라인": news_titles, # 딥 스캔 토글 노출용 리스트
-                "판단근거": reason_str
-            })
-        except Exception as e:
-            continue
+            data.append({"종목명": t, "비중(추정)": f"{weight_map.get(t, 0.0)}%", "현재가": f"${curr_price:.2f}", "변동률": f"{change:+.2f}%",
+                         "뉴스 센티먼트 (예측)": sentiment, "최신 글로벌 헤드라인": top_headline, "모든헤드라인": news_titles, "판단근거": reason_str})
+        except: continue
+    return data
+
+@st.cache_data(ttl=1800)
+def get_macro_radar():
+    macro_map = {'SPY': 'S&P 500 (글로벌 증시 전반)', 'TLT': '미국 장기채 ETF (금리 동향)', 'USO': '원유 ETF (유가 및 지정학 리스크)'}
+    data = []
+    try:
+        df_prices = yf.download(list(macro_map.keys()), period="5d", progress=False)
+        closes = df_prices['Close'] if isinstance(df_prices.columns, pd.MultiIndex) else df_prices
+    except: return []
+
+    for t, desc in macro_map.items():
+        try:
+            if t not in closes.columns: continue
+            valid_closes = closes[t].dropna()
+            if len(valid_closes) < 2: continue
             
+            curr_price = float(valid_closes.iloc[-1])
+            change = (curr_price - float(valid_closes.iloc[-2])) / float(valid_closes.iloc[-2]) * 100
+            
+            stock = yf.Ticker(t)
+            news = stock.news
+            news_titles = []
+            if news:
+                for n in news[:3]:
+                    if isinstance(n, dict):
+                        title = n.get('title') or (n.get('content', {}).get('title', '') if isinstance(n.get('content'), dict) else '')
+                        if title: news_titles.append(title)
+            if news_titles:
+                sentiment, reason_str = analyze_sentiment_with_reason(" ".join(news_titles))
+                top_headline = news_titles[0]
+            else:
+                sentiment, top_headline, reason_str = "⚪ 뉴스 없음", "관련 기사가 없습니다.", ""
+                
+            data.append({"거시경제 지표": desc, "현재가": f"${curr_price:.2f}", "변동률": f"{change:+.2f}%",
+                         "매크로 센티먼트": sentiment, "핵심 글로벌 헤드라인": top_headline, "모든헤드라인": news_titles, "판단근거": reason_str})
+        except: continue
     return data
 
 def parse_kiwoom_csv_to_db(file_obj):
@@ -330,7 +343,10 @@ def parse_kiwoom_csv_to_db(file_obj):
             if qty > 0: trades.append({"Date": date_str, "Time": time_str, "Account": account_tag, "Ticker": ticker, "Action": action, "Qty": qty, "Price": price, "Format": "3row"})
     return pd.DataFrame(trades)
 
-def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back=365):
+# ------------------------------------------
+# 4. 유전 알고리즘 훈련소 (V3.0 확장판)
+# ------------------------------------------
+def run_genetic_algorithm_training(ticker="SOXL", population_size=1000, days_back=365):
     end_date = datetime.date.today()
     start_date = end_date - datetime.timedelta(days=days_back)
     df = yf.download(ticker, start=start_date, end=end_date, progress=False)
@@ -339,6 +355,7 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
     
     df['MA20'] = df['Close'].rolling(window=20).mean()
+    df['MA20_diff'] = ((df['Close'] - df['MA20']) / df['MA20']) * 100
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -349,45 +366,58 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
     df.dropna(inplace=True)
     
     agents = []
+    # 💡 1,000명의 개체군 생성 (매수/매도 유전자 탑재)
     for i in range(population_size):
         w_base = random.uniform(5.0, 20.0)
         w_ma = random.uniform(-5.0, 5.0)
         w_rsi = random.uniform(-5.0, 5.0)
         w_vol = random.uniform(-5.0, 5.0)
         w_risk = random.uniform(0.0, 10.0)
-        weights = [w_base, w_ma, w_rsi, w_vol, w_risk]
-        agents.append({"id": f"Agent_Gen_{i}", "weights": weights, "realized_profit": 0.0, "total_score": 0.0})
+        w_buy_dist = random.uniform(0.0, 5.0)  # 할인율 0~5%
+        w_buy_mul = random.uniform(-2.0, 5.0)  # 매수 배수 조정력
+        w_split = random.uniform(20.0, 40.0)   # 20~40분할 가드레일
+        weights = [w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, w_split]
+        agents.append({"id": f"Agent_Gen_{i}", "weights": weights, "total_score": 0.0})
     
     for agent in agents:
-        agent_engine = TitanRestExitOptimizer(params=agent['weights'])
+        engine = TitanRestV3Optimizer(params=agent['weights'])
+        total_capital = 10000.0 # 훈련용 가상 시드
+        remaining_capital = total_capital
+        base_buy_amount = total_capital / engine.w_split
+        
         current_qty = 0.0
         total_cost = 0.0
         profit = 0.0
         
         for i in range(len(df)):
             row = df.iloc[i]
-            p_close = float(row['Close'])
-            x1 = ((p_close - float(row['MA20'])) / float(row['MA20'])) * 100.0
-            x2 = float(row['RSI'])
-            x3 = float(row['Vol_Ratio'])
-            vol = float(row['Volatility'])
-            X = [x1, x2, x3, vol]
+            p_close, p_high, p_low = float(row['Close']), float(row['High']), float(row['Low'])
+            X = [float(row['MA20_diff']), float(row['RSI']), float(row['Vol_Ratio']), float(row['Volatility'])]
             
             avg_price = total_cost / current_qty if current_qty > 0 else 0
-            prediction = agent_engine.find_golden_ratio(X)
-            target_r = prediction['optimal_r']
-            target_price = avg_price * (1 + (target_r / 100.0))
+            pred = engine.get_action_params(X)
             
-            if current_qty > 0 and float(row['High']) >= target_price:
+            # 1. 매도 우선 체크
+            target_price = avg_price * (1 + (pred['optimal_r'] / 100.0))
+            if current_qty > 0 and p_high >= target_price:
                 profit += (target_price - avg_price) * current_qty
+                remaining_capital += target_price * current_qty
                 current_qty, total_cost = 0.0, 0.0
             else:
-                trade_qty = 100.0 / p_close
-                current_qty += trade_qty
-                total_cost += 100.0
+                # 2. 매수 로직 (AI 자율 할인율 및 가중치 적용)
+                buy_target_price = p_close * (1 - (pred['buy_discount_pct'] / 100.0))
+                if p_low <= buy_target_price and remaining_capital > 0:
+                    attempt_amount = base_buy_amount * pred['buy_multiplier']
+                    actual_amount = min(attempt_amount, remaining_capital) # 예산 가드레일 방어
+                    
+                    if actual_amount > 0:
+                        trade_qty = actual_amount / buy_target_price
+                        current_qty += trade_qty
+                        total_cost += actual_amount
+                        remaining_capital -= actual_amount
         
+        # 마지막 날 장부 가치 정산
         unrealized_profit = (current_qty * float(df['Close'].iloc[-1])) - total_cost
-        agent['realized_profit'] = profit
         agent['total_score'] = profit + unrealized_profit
 
     ranked_agents = sorted(agents, key=lambda x: x['total_score'], reverse=True)
@@ -396,7 +426,7 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back
 # ==========================================
 # 5. 웹 UI 구현 (Streamlit)
 # ==========================================
-st.title("🚀 무한매수 전술 관제소 (Project Valhalla)")
+st.title("🚀 무한매수 전술 관제소 (Project Valhalla V3.0)")
 
 if supabase: st.sidebar.success("🟢 클라우드 DB 연결됨")
 else: st.sidebar.warning("🟡 로컬 DB 사용 중")
@@ -417,27 +447,24 @@ if uploaded_files:
         if parsed_dfs:
             df_new = pd.concat(parsed_dfs)
             df_old = read_db("trade_journal")
-            
             if 'Time' not in df_old.columns: df_old.insert(1, 'Time', "00:00:00")
             if 'Account' not in df_old.columns: df_old.insert(2, 'Account', "Default")
             if 'Format' not in df_old.columns: df_old['Format'] = "unknown"
             
             df_combined = pd.concat([df_old, df_new])
             df_combined['Date'] = pd.to_datetime(df_combined['Date']).dt.strftime('%Y-%m-%d')
-            
             df_combined['group_id'] = df_combined['Date'].astype(str) + "_" + df_combined['Account'].astype(str) + "_" + df_combined['Ticker'].astype(str) + "_" + df_combined['Action'].astype(str)
             
             groups_with_2row = df_combined[df_combined['Format'] == '2row']['group_id'].unique()
             mask = ~((df_combined['group_id'].isin(groups_with_2row)) & (df_combined['Format'] == '3row'))
             df_resolved = df_combined[mask].drop(columns=['group_id'])
-            df_final = df_resolved.drop_duplicates(subset=["Date", "Time", "Account", "Ticker", "Action", "Qty", "Price"])
-            df_final = df_final.sort_values(["Date", "Time"])
+            df_final = df_resolved.drop_duplicates(subset=["Date", "Time", "Account", "Ticker", "Action", "Qty", "Price"]).sort_values(["Date", "Time"])
             
             overwrite_db("trade_journal", df_final)
             st.sidebar.success(f"✅ 동기화 완료! 클라우드에 저장되었습니다.")
 
 # ------------------------------------------
-# TAB 1: 전술 관제 
+# TAB 1: 전술 관제 (V3.0 매수/매도 표시)
 # ------------------------------------------
 with tab1:
     view_ticker = st.text_input("🔍 관제할 티커를 입력하세요", "SOXL").upper()
@@ -448,12 +475,9 @@ with tab1:
             if 'Account' not in df_journal.columns: df_journal.insert(2, 'Account', "Default")
             
             available_accounts = df_journal[df_journal['Ticker'] == view_ticker]['Account'].unique().tolist()
-            
             col_opt1, col_opt2 = st.columns(2)
-            with col_opt1: 
-                cycle_start = st.date_input(f"📅 사이클 시작일", value=datetime.date(2026, 4, 20))
-            with col_opt2: 
-                selected_accounts = st.multiselect(f"🏷️ 추적 계좌", options=available_accounts, default=available_accounts)
+            with col_opt1: cycle_start = st.date_input(f"📅 사이클 시작일", value=datetime.date(2026, 4, 20))
+            with col_opt2: selected_accounts = st.multiselect(f"🏷️ 추적 계좌", options=available_accounts, default=available_accounts)
                 
             df_chart, state_vector, current_price = get_realtime_data(view_ticker)
             
@@ -483,43 +507,52 @@ with tab1:
                     if current_qty > 0:
                         st.metric("💰 나의 정확한 평단가", f"${avg_price:,.4f}")
                         st.metric(f"🎯 나의 목표가 (+{user_target_pct}%)", f"${user_target_price:,.2f}")
+                        
+                        st.markdown("---")
+                        st.markdown("### 🧮 작전 수익 시뮬레이터")
+                        expected_profit = (user_target_price - avg_price) * current_qty
+                        st.success(f"**현재 설정(+{user_target_pct}%) 매도 시:**\n\n예상 수익금 **${expected_profit:,.2f}**")
+                        
+                        st.markdown("👇 **역산 계산기 (원하는 수익금 입력)**")
+                        desired_profit = st.number_input("목표 수익금 ($)", min_value=1.0, value=100.0, step=10.0)
+                        req_price = avg_price + (desired_profit / current_qty)
+                        req_pct = ((req_price / avg_price) - 1.0) * 100.0
+                        st.info(f"**${desired_profit:,.2f}** 벌려면 ➔ **+{req_pct:.2f}%** 에 매도\n\n(목표가 ${req_price:.2f})")
                     else:
                         st.write("현재 진행 중인 매수 사이클이 없습니다.")
                     
                     st.markdown("---")
-                    st.markdown(f"### 🧠 정예 요원별 매도 전술")
+                    st.markdown(f"### 🧠 정예 요원별 V3.0 진단")
                     st.info(f"현재가: ${current_price:,.2f}")
                     
                     ai_models = load_ai_models()
                     if ai_models:
                         for agent_name, weights in ai_models.items():
-                            agent_engine = TitanRestExitOptimizer(params=weights)
-                            prediction = agent_engine.find_golden_ratio(state_vector)
+                            if len(weights) < 8: weights = weights + [1.0, 1.0, 40.0] # 구버전 호환용 방어코드
+                            agent_engine = TitanRestV3Optimizer(params=weights)
+                            prediction = agent_engine.get_action_params(state_vector)
                             
                             base_price = avg_price if current_qty > 0 else current_price
                             agent_target = base_price * (1 + prediction['optimal_r'] / 100)
                             
                             with st.expander(f"🤖 {agent_name}의 전술", expanded=True):
-                                st.metric(f"목표가 (+{prediction['optimal_r']}%)", f"${agent_target:,.2f}")
+                                st.markdown("##### 🚀 [매도 플랜]")
+                                st.write(f"**목표가 (+{prediction['optimal_r']}%):** ${agent_target:,.2f}")
                                 st.write(f"**승률 예측:** {prediction['success_probability']}%")
                                 
-                                est_days_int = int(round(prediction['est_days']))
-                                target_date = datetime.date.today() + pd.tseries.offsets.BusinessDay(n=est_days_int)
-                                target_date_str = target_date.strftime('%m월 %d일')
+                                st.markdown("##### 🛒 [매수 플랜]")
+                                st.write(f"**가드레일 분할:** {prediction['split_ratio']}분할 셋팅")
+                                st.write(f"**금일 매수량:** 1회차 예산의 **{prediction['buy_multiplier']}배** 투입")
+                                st.write(f"**권장 진입가:** 현재가 대비 **-{prediction['buy_discount_pct']}%** (${current_price * (1 - prediction['buy_discount_pct']/100):.2f})")
                                 
-                                st.write(f"**예상 도달:** 약 {prediction['est_days']} 영업일 (약 **{target_date_str}** 쯤 예상)")
-                                
-                                w_base, w_ma, w_rsi, w_vol, w_risk = weights
-                                
-                                with st.popover("💡 AI 산출 알고리즘 해설 보기"):
+                                with st.popover(f"💡 {agent_name} 알고리즘 해설 보기"):
+                                    w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, w_split = weights
                                     st.markdown(f"""
-                                    현재 시장 상태(RSI: **{state_vector[1]:.1f}**, 20일선 이격도: **{state_vector[0]:+.1f}%**)를 바탕으로 이 요원의 고유 유전자(가중치)를 곱해 산출했습니다.
-                                    
                                     * **기본 탐욕 지수:** {w_base:+.2f}%
-                                    * **추세 반응성 (MA):** {w_ma:+.2f}
-                                    * **과매수/매도 보정 (RSI):** {w_rsi:+.2f}
-                                    * **시장 변동성 적응력:** {w_vol:+.2f}
-                                    * **리스크 회피 성향:** {w_risk:+.2f} (수치가 높을수록 목표가를 낮춰 승률 방어를 시도합니다)
+                                    * **리스크 회피 성향:** {w_risk:+.2f} (수치가 높을수록 목표가를 낮춰 승률 방어)
+                                    * **매수 배수 가중치:** {w_buy_mul:+.2f} (시장 공포시 수량 증폭력)
+                                    * **매수 할인율 가중치:** {w_buy_dist:+.2f} (더 싼 가격에 잡으려는 의지)
+                                    * **예산 가드레일:** {int(w_split)}분할 통제중
                                     """)
                     else:
                         st.warning("훈련소에서 요원을 먼저 훈련시켜주세요.")
@@ -556,78 +589,71 @@ with tab1:
                     
                     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])]); fig.update_layout(title=f"{view_ticker} 차트 및 전술 오버레이", yaxis_title="Price (USD)", template="plotly_dark", height=600)
                     st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("기록된 매매 일지가 없습니다. 사이드바에서 업로드하세요.")
 
 # ------------------------------------------
-# TAB 5: 📡 SOXL 생태계 레이더 (뉴스 센티먼트)
+# TAB 5: 📡 SOXL 생태계 및 매크로 레이더
 # ------------------------------------------
 with tab5:
     st.markdown("## 📡 SOXL 생태계 레이더 (Semiconductor Top 10)")
-    st.write("SOXL을 견인하는 핵심 10대 반도체 기업의 ETF 내 편입 비중과 주가 흐름, 그리고 미국 현지 뉴스 헤드라인의 긍/부정 키워드를 AI가 스캔하여 호재와 악재를 예측합니다.")
+    st.write("SOXL을 견인하는 핵심 10대 기업과 거시 경제(SPY, TLT, USO)의 글로벌 뉴스를 AI가 스캔하여 호재와 악재를 예측합니다.")
     
-    if st.button("🔄 실시간 생태계 스캔 가동"):
-        with st.spinner("글로벌 뉴스 데이터 수집 및 딥 스캔 알고리즘 작동 중... (약 10~20초 소요)"):
+    if st.button("🔄 실시간 생태계 및 매크로 스캔 가동"):
+        with st.spinner("글로벌 뉴스 수집 및 AI 딥 스캔 작동 중... (약 10~20초 소요)"):
             radar_data = get_soxl_radar()
+            macro_data = get_macro_radar()
             
             if radar_data:
-                # 1. 요약 테이블 렌더링 (지저분한 데이터 열 숨김 처리)
                 df_radar = pd.DataFrame(radar_data)
-                df_display = df_radar.drop(columns=["판단근거", "모든헤드라인"])
-                st.dataframe(df_display, use_container_width=True)
-                
-                st.markdown("---")
-                st.markdown("### 🧠 AI 뉴스 정밀 분석 (Deep Scan)")
-                
-                # 2. 토글키(Expander) 방식: 3개 기사 모두 표출 및 HTML 형광펜 마킹
+                st.dataframe(df_radar.drop(columns=["판단근거", "모든헤드라인"]), use_container_width=True)
+                st.markdown("### 🧠 AI 반도체 뉴스 정밀 분석 (Deep Scan)")
                 for item in radar_data:
-                    if "뉴스 없음" in item["뉴스 센티먼트 (예측)"] or "분석 불가" in item["뉴스 센티먼트 (예측)"]:
-                        continue
-                        
-                    with st.expander(f"{item['뉴스 센티먼트 (예측)']} | {item['종목명']} ({item['변동률']}) - 딥 스캔 리포트"):
+                    if "뉴스 없음" in item["뉴스 센티먼트 (예측)"] or "분석 불가" in item["뉴스 센티먼트 (예측)"]: continue
+                    with st.expander(f"{item['뉴스 센티먼트 (예측)']} | {item['종목명']} ({item['변동률']})"):
                         st.markdown(f"**💡 전체 종합 판단 근거:** `{item['판단근거']}`")
                         st.markdown("---")
-                        
-                        # 수집된 기사(최대 3개)를 순회하며 형광펜 및 번역 적용
                         for idx, title in enumerate(item['모든헤드라인']):
-                            # 1. 영문 원문에 HTML 형광펜 적용
-                            highlighted_title = highlight_keywords(title)
-                            st.markdown(f"**📰 기사 {idx+1} (AI 스캔 원문):** {highlighted_title}", unsafe_allow_html=True)
-                            
-                            # 2. 깨끗한 한글 번역본 제공
-                            translated_text = translate_to_korean(title)
-                            st.info(f"**🇰🇷 기사 {idx+1} (한글 번역):** {translated_text}")
-            else:
-                st.error("데이터를 불러오지 못했습니다. 야후 파이낸스 서버 접속이 지연되고 있습니다.")
+                            st.markdown(f"**📰 원문:** {highlight_keywords(title)}", unsafe_allow_html=True)
+                            st.info(f"**🇰🇷 번역:** {translate_to_korean(title)}")
+            
+            st.markdown("---")
+            st.markdown("## 🌎 글로벌 매크로 환경 레이더")
+            if macro_data:
+                df_macro = pd.DataFrame(macro_data)
+                st.dataframe(df_macro.drop(columns=["판단근거", "모든헤드라인"]), use_container_width=True)
+                st.markdown("### 🧠 AI 매크로 뉴스 정밀 분석 (Deep Scan)")
+                for item in macro_data:
+                    if "뉴스 없음" in item["매크로 센티먼트"] or "분석 불가" in item["매크로 센티먼트"]: continue
+                    with st.expander(f"{item['매크로 센티먼트']} | {item['거시경제 지표']} ({item['변동률']})"):
+                        st.markdown(f"**💡 전체 종합 판단 근거:** `{item['판단근거']}`")
+                        st.markdown("---")
+                        for idx, title in enumerate(item['모든헤드라인']):
+                            st.markdown(f"**📰 원문:** {highlight_keywords(title)}", unsafe_allow_html=True)
+                            st.info(f"**🇰🇷 번역:** {translate_to_korean(title)}")
 
 # ------------------------------------------
 # TAB 4: ⚔️ 발할라 실전 리그
 # ------------------------------------------
 with tab4:
     st.markdown("## ⚔️ 발할라 실전 리그 (Valhalla Live League)")
-    st.write("사령관님과 상위 3명의 정예 AI 요원이 '오늘의 시장'에서 실시간으로 경쟁합니다.")
-    
     ai_models = load_ai_models()
     
     col1, col2 = st.columns([1, 1])
     with col1:
         st.info("🧬 **현재 참전 중인 정예 AI 요원**")
         if ai_models:
-            for agent, weights in ai_models.items():
-                st.write(f"- **{agent}** (고유 진화 가중치 탑재)")
-        else:
-            st.write("아직 선발된 AI 요원이 없습니다.")
+            for agent in ai_models.keys(): st.write(f"- **{agent}** (V3.0 탑재 완료)")
+        else: st.write("아직 선발된 AI 요원이 없습니다.")
     
     with col2:
         st.info("🚨 **일일 가상 매매(Paper Trading) 시동**")
         sim_ticker = st.selectbox("종목 선택", ["SOXL", "FNGU", "CURE"])
-        
         if st.button(f"📅 오늘({datetime.date.today()})의 AI 가상 매매 실행"):
             df_chart, state_vector, current_price = get_realtime_data(sim_ticker)
             df_ai = read_db("ai_ledger")
-            
             new_records = []
+            
             for agent, weights in ai_models.items():
+                if len(weights) < 8: weights = weights + [1.0, 1.0, 40.0]
                 agent_trades = df_ai[(df_ai['Agent'] == agent) & (df_ai['Ticker'] == sim_ticker)] if not df_ai.empty else pd.DataFrame()
                 current_qty, total_cost = 0.0, 0.0
                 
@@ -639,61 +665,52 @@ with tab4:
                         current_qty, total_cost = 0.0, 0.0
                 
                 avg_price = total_cost / current_qty if current_qty > 0 else 0
+                agent_engine = TitanRestV3Optimizer(params=weights)
+                prediction = agent_engine.get_action_params(state_vector)
                 
-                agent_engine = TitanRestExitOptimizer(params=weights)
-                prediction = agent_engine.find_golden_ratio(state_vector)
-                
-                target_r = prediction['optimal_r'] if prediction else 10.0
-                target_price = avg_price * (1 + (target_r / 100.0))
-                
+                target_price = avg_price * (1 + (prediction['optimal_r'] / 100.0))
                 action, trade_qty, profit = "Hold", 0.0, 0.0
                 
                 if current_qty > 0 and current_price >= target_price:
-                    action = "Sell"
-                    trade_qty = round(current_qty, 4)
-                    profit = (current_price - avg_price) * trade_qty
+                    action, trade_qty, profit = "Sell", round(current_qty, 4), (current_price - avg_price) * current_qty
                 else:
-                    action = "Buy"
-                    trade_qty = round(100.0 / current_price, 4)
-                    profit = 0.0
+                    # 일일 가상 매수 로직 (V3.0 배수 적용)
+                    base_budget = 10000 / prediction['split_ratio']
+                    buy_budget = base_budget * prediction['buy_multiplier']
+                    if buy_budget > 0:
+                        action, trade_qty, profit = "Buy", round(buy_budget / current_price, 4), 0.0
                 
                 if action != "Hold":
                     new_records.append({"Date": datetime.date.today().strftime("%Y-%m-%d"), "Agent": agent, "Ticker": sim_ticker, "Action": action, "Qty": trade_qty, "Price": current_price, "Capital": 10000, "Profit": round(profit, 2)})
             
             if new_records:
                 append_db("ai_ledger", pd.DataFrame(new_records))
-                st.toast("요원들이 오늘의 실제 종가를 확인하고 매매를 완료했습니다!")
-                st.success("데이터가 AI 장부에 성공적으로 동기화되었습니다.")
+                st.toast("요원들이 오늘의 V3.0 매매를 완료했습니다!")
                 st.rerun()
 
     st.markdown("---")
     st.markdown("### 🏆 실시간 리더보드 (누적 수익 경쟁)")
-    
     try: user_profit = 2491.59 
     except: user_profit = 0.0
-
     df_ai = read_db("ai_ledger")
-    if not df_ai.empty: ai_profits = df_ai.groupby('Agent')['Profit'].sum().to_dict()
-    else: ai_profits = {agent: 0 for agent in ai_models.keys()}
+    ai_profits = df_ai.groupby('Agent')['Profit'].sum().to_dict() if not df_ai.empty else {agent: 0 for agent in ai_models.keys()}
     
     leaderboard = [{"Rank": 1, "Name": "👑 사령관님 (Commander)", "Total Profit": f"${user_profit:,.2f}"}]
     for agent, prof in ai_profits.items(): leaderboard.append({"Rank": 2, "Name": f"🤖 {agent}", "Total Profit": f"${prof:,.2f}"})
-    
     leaderboard = sorted(leaderboard, key=lambda x: float(x["Total Profit"].replace('$','').replace(',','')), reverse=True)
     for i, l in enumerate(leaderboard): l["Rank"] = i + 1
-    
     st.dataframe(pd.DataFrame(leaderboard), use_container_width=True)
 
 # ------------------------------------------
 # TAB 2 & 3: 훈련소 & 매매 일지 
 # ------------------------------------------
 with tab2:
-    st.markdown("### 🧠 훈련소 (Bootcamp): 유전 알고리즘(GA) 실시간 연산")
-    st.write("100명의 랜덤 유전자를 가진 AI를 생성하여 최근 1년 데이터로 시뮬레이션(적자생존)을 진행하고, 살아남은 상위 3명을 실전 리그로 승격시킵니다.")
+    st.markdown("### 🧠 훈련소 (Bootcamp): V3.0 유전 알고리즘 대규모 연산")
+    st.write("💡 **[인간의 가드레일 + AI의 자율성]** 1,000명의 AI가 20~40분할 예산 통제 속에서 매수 배수와 할인율, 매도 목표가를 무한 변주하며 적자생존 경쟁을 벌입니다.")
     
-    if st.button("⚔️ 100명 AI 트레이더 대규모 훈련 가동"):
-        with st.spinner("서버 코어가 유전자 조합 및 백테스팅을 수행 중입니다..."):
-            top_agents = run_genetic_algorithm_training(ticker="SOXL", population_size=100, days_back=365)
+    if st.button("⚔️ 1,000명 V3.0 AI 트레이더 대규모 훈련 가동"):
+        with st.spinner("⚠️ 대규모 컴퓨팅 가동 중! 1,000개의 유전자가 1년치 차트에서 진화하고 있습니다... (약 20~40초 소요)"):
+            top_agents = run_genetic_algorithm_training(ticker="SOXL", population_size=1000, days_back=365)
             
             if top_agents:
                 new_models = {
@@ -704,22 +721,18 @@ with tab2:
                 
                 if save_ai_models(new_models):
                     overwrite_db("ai_ledger", pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]))
-                    st.success("🎯 훈련 완료! 역대 최고 성능을 낸 3명의 데이터가 클라우드 DB에 영구 저장되었습니다.")
-                else:
-                    st.error("DB 저장에 실패했습니다.")
+                    st.success("🎯 1,000명 대규모 훈련 완료! 압도적 1~3위 요원이 실전 리그로 배정되었습니다.")
+                else: st.error("DB 저장에 실패했습니다.")
                 st.rerun()
 
 with tab3:
     st.markdown("### 🗄️ 사령관 매매 일지 DB 관리")
-    
-    st.markdown("### 🧠 AI 요원 유전자 강제 리셋")
     if st.button("🗑️ 훈련된 AI 요원 유전자 모두 삭제"):
         try:
             if supabase: supabase.table("valhalla_ai_models").delete().neq("agent_name", "dummy").execute()
             else:
                 if os.path.exists(AI_MODELS_FILE): os.remove(AI_MODELS_FILE)
-            st.success("✅ 삭제 완료!")
-            st.rerun()
+            st.success("✅ 삭제 완료!"); st.rerun()
         except Exception as e: st.error(f"삭제 실패: {e}")
             
     st.markdown("---")
@@ -744,24 +757,20 @@ with tab3:
                 st.success(f"✅ 저장 완료!"); st.rerun() 
                 
     st.markdown("---")
-    
     st.markdown("#### 📝 매매 일지 직접 편집")
     col_db1, col_db2 = st.columns([8, 2])
     with col_db1:
         df_display = read_db("trade_journal")
-        if not df_display.empty:
-            df_display = df_display.sort_values(["Date", "Time"]).reset_index(drop=True)
+        if not df_display.empty: df_display = df_display.sort_values(["Date", "Time"]).reset_index(drop=True)
         edited_df = st.data_editor(df_display, num_rows="dynamic", use_container_width=True)
         if st.button("💾 수동 편집 내용 덮어쓰기"):
             overwrite_db("trade_journal", edited_df)
-            st.success("✅ 수정 내용 DB 반영 완료!")
-            st.rerun()
-
+            st.success("✅ 수정 내용 DB 반영 완료!"); st.rerun()
     with col_db2:
         if st.button("🗑️ 전체 기록 초기화", key="reset_db"):
             overwrite_db("trade_journal", pd.DataFrame(columns=["Date", "Time", "Account", "Ticker", "Action", "Qty", "Price", "Format"]))
             st.rerun()
-    
+            
     st.markdown("---")
     st.markdown("### 🗄️ AI 요원 가상 매매 장부")
     col_ai1, col_ai2 = st.columns([8, 2])
