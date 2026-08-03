@@ -146,7 +146,7 @@ def save_ai_models(models_dict):
 # ==========================================
 # 3. 실시간 차트 & 환율 & 데이터 로더
 # ==========================================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=60)
 def get_exchange_rate():
     try:
         df = yf.download("USDKRW=X", period="1d", progress=False)
@@ -155,7 +155,7 @@ def get_exchange_rate():
     except:
         return 1350.0 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=60)
 def get_realtime_data(ticker):
     end_date = datetime.date.today() + datetime.timedelta(days=1)
     start_date = end_date - datetime.timedelta(days=365)
