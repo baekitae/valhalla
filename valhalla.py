@@ -177,7 +177,6 @@ def get_realtime_data(ticker):
     x3 = (volume.iloc[-1] / volume.rolling(window=20).mean().iloc[-1]) if not pd.isna(volume.rolling(window=20).mean().iloc[-1]) else 1.0
     vol = close.pct_change().rolling(window=20).std().iloc[-1] * 100.0 if not pd.isna(close.pct_change().rolling(window=20).std().iloc[-1]) else 2.0
     
-    # 💡 NaN 에러 방지 안전장치
     state_vals = [round(x1, 2), round(x2, 2), round(x3, 2), round(vol, 2)]
     clean_state = [0.0 if pd.isna(v) or np.isinf(v) else v for v in state_vals]
     
@@ -188,8 +187,8 @@ def analyze_sentiment_with_reason(text):
     neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay', 'sink', 'unwind']
     text_lower = text.lower()
     
-    found_pos = [w for w in pos_words if re.search(rf(r'\b{w}\b'), text_lower)]
-    found_neg = [w for w in neg_words if re.search(rf(r'\b{w}\b'), text_lower)]
+    found_pos = [w for w in pos_words if re.search(rf'\b{w}\b', text_lower)]
+    found_neg = [w for w in neg_words if re.search(rf'\b{w}\b', text_lower)]
     
     score = len(found_pos) - len(found_neg)
     reason = []
@@ -206,9 +205,9 @@ def highlight_keywords(text):
     neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay', 'sink', 'unwind']
     highlighted = text
     for w in pos_words:
-        highlighted = re.sub(rf(r'\b({w})\b'), r'<span style="background-color: #a8f0c6; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
+        highlighted = re.sub(rf'\b({w})\b', r'<span style="background-color: #a8f0c6; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
     for w in neg_words:
-        highlighted = re.sub(rf(r'\b({w})\b'), r'<span style="background-color: #ffb3b3; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
+        highlighted = re.sub(rf'\b({w})\b', r'<span style="background-color: #ffb3b3; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
     return highlighted
 
 def translate_to_korean(text):
@@ -415,7 +414,6 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=1000, days_bac
             avg_price = total_cost / current_qty if current_qty > 0 else 0
             pred = engine.get_action_params(X)
             
-            # NaN 발생 시 기본값 방어
             opt_r = pred['optimal_r']
             if pd.isna(opt_r): opt_r = 10.0
             
@@ -496,9 +494,14 @@ with tab1:
             if 'Account' not in df_journal.columns: df_journal.insert(2, 'Account', "Default")
             
             available_accounts = df_journal[df_journal['Ticker'] == view_ticker]['Account'].unique().tolist()
-            col_opt1, col_opt2 = st.columns(2)
+            
+            # 💡 [패치] 총 작전 예산(한화) 입력 및 달러 변환
+            col_opt1, col_opt2, col_opt3 = st.columns(3)
             with col_opt1: cycle_start = st.date_input(f"📅 사이클 시작일", value=datetime.date(2026, 4, 20))
             with col_opt2: selected_accounts = st.multiselect(f"🏷️ 추적 계좌", options=available_accounts, default=available_accounts)
+            with col_opt3: 
+                total_capital_krw = st.number_input("💰 총 작전 예산 (₩)", min_value=1000000.0, value=10000000.0, step=1000000.0, help="한화 1,000만 원 기본 세팅입니다.")
+                total_capital = total_capital_krw / krw_rate
                 
             df_chart, state_vector, current_price = get_realtime_data(view_ticker)
             
@@ -509,19 +512,22 @@ with tab1:
                                     (df_journal['Date'] >= cycle_start.strftime("%Y-%m-%d")) & 
                                     (df_journal['Account'].isin(selected_accounts))].sort_values(["Date", "Time"])
                 
-                current_qty, total_cost, avg_price = 0.0, 0.0, 0.0
+                # 💡 [패치] 매도 즉시 0회차 리셋 후 다음 매수부터 1회차 카운트
+                current_qty, total_cost, avg_price, buy_count = 0.0, 0.0, 0.0, 0
                 for _, row in trades.iterrows():
                     qty, price = float(row['Qty']), float(row['Price'])
                     if row['Action'] == 'Buy': 
                         current_qty += qty
                         total_cost += qty * price
                         avg_price = total_cost / current_qty if current_qty > 0 else 0
+                        buy_count += 1
                     elif row['Action'] == 'Sell': 
-                        current_qty, total_cost, avg_price = 0.0, 0.0, 0.0
+                        # 매도 발생 시 모든 사이클 기록을 리셋하여 다음 매수를 1회차로 대비
+                        current_qty, total_cost, avg_price, buy_count = 0.0, 0.0, 0.0, 0
                 
                 with col_ai:
                     st.markdown(f"### 🛡️ 사령관의 포지션")
-                    st.info(f"**총 보유 수량:** {int(current_qty)} 주")
+                    st.info(f"**총 보유 수량:** {int(current_qty)} 주\n\n**현재 진행 회차:** {buy_count} 회차")
                     user_target_pct = st.slider("🎯 목표 수익률 조절 (%)", 1.0, 50.0, 13.0, 0.5)
                     user_target_price = avg_price * (1 + user_target_pct / 100) if avg_price > 0 else 0
                     
@@ -557,8 +563,8 @@ with tab1:
                         st.write("현재 진행 중인 매수 사이클이 없습니다.")
                     
                     st.markdown("---")
-                    st.markdown(f"### 🧠 정예 요원별 V3.0 진단")
-                    st.info(f"현재가: ${current_price:,.2f}")
+                    st.markdown(f"### 🧠 정예 요원별 V3.1 진단")
+                    st.info(f"현재가: ${current_price:,.2f} (초기 예산: ${total_capital:,.2f})")
                     
                     ai_models = load_ai_models()
                     if ai_models:
@@ -567,22 +573,46 @@ with tab1:
                             agent_engine = TitanRestV3Optimizer(params=weights)
                             prediction = agent_engine.get_action_params(state_vector)
                             
-                            # 💡 nan 방어 장치 적용
                             opt_r = prediction['optimal_r']
                             if pd.isna(opt_r): opt_r = 10.0
                             
                             base_price = avg_price if current_qty > 0 else current_price
                             agent_target = base_price * (1 + opt_r / 100)
                             
+                            # 💡 [핵심 패치] 계좌 상황 연동 현실성 체크 및 가드레일 제어
+                            remaining_capital = max(0.0, total_capital - total_cost)
+                            base_budget = total_capital / prediction['split_ratio']
+                            theoretical_attempt = base_budget * prediction['buy_multiplier']
+                            
+                            # 가드레일 한계 도달 혹은 예수금 0원 이하 방어 로직
+                            if buy_count >= prediction['split_ratio']:
+                                actual_amount = 0.0
+                                actual_multi = 0.0
+                                status_badge = "🚨 분할 매수 횟수 초과 (매수 중지)"
+                            elif remaining_capital <= 0:
+                                actual_amount = 0.0
+                                actual_multi = 0.0
+                                status_badge = "🚨 잔여 예수금 소진 (매수 중지)"
+                            else:
+                                actual_amount = min(theoretical_attempt, remaining_capital)
+                                actual_multi = actual_amount / base_budget
+                                status_badge = f"🟢 정상 투입 (잔여 예수금: ${remaining_capital:,.2f})"
+
                             with st.expander(f"🤖 {agent_name}의 전술", expanded=True):
                                 st.markdown("##### 🚀 [매도 플랜]")
                                 st.write(f"**목표가 (+{opt_r}%):** ${agent_target:,.2f}")
                                 st.write(f"**승률 예측:** {prediction['success_probability']}%")
                                 
                                 st.markdown("##### 🛒 [매수 플랜]")
-                                st.write(f"**가드레일 분할:** {prediction['split_ratio']}분할 셋팅")
-                                st.write(f"**금일 매수량:** 1회차 예산의 **{prediction['buy_multiplier']}배** 투입")
-                                st.write(f"**권장 진입가:** 현재가 대비 **-{prediction['buy_discount_pct']}%** (${current_price * (1 - prediction['buy_discount_pct']/100):.2f})")
+                                st.write(f"**진행 상태:** {buy_count}회차 진행 중 / 총 {prediction['split_ratio']}분할 셋팅")
+                                st.write(f"**상황 진단:** {status_badge}")
+                                
+                                if actual_amount > 0:
+                                    st.write(f"**금일 현실 매수량:** 1회차 예산의 **{actual_multi:.2f}배** 투입 (**${actual_amount:,.2f}**)")
+                                    st.write(f"**권장 진입가:** 현재가 대비 **-{prediction['buy_discount_pct']}%** (${current_price * (1 - prediction['buy_discount_pct']/100):.2f})")
+                                else:
+                                    st.write(f"**금일 현실 매수량:** **투입 보류 ($0.00)**")
+                                    st.write(f"**권장 진입가:** **매수 중지**")
                                 
                                 with st.popover(f"💡 {agent_name} 알고리즘 해설 보기"):
                                     w_base, w_ma, w_rsi, w_vol, w_risk, w_buy_dist, w_buy_mul, w_split = weights
