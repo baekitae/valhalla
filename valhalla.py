@@ -439,6 +439,87 @@ def run_genetic_algorithm_training(ticker="SOXL", population_size=1000, days_bac
     ranked_agents = sorted(agents, key=lambda x: x['total_score'], reverse=True)
     return ranked_agents[:3]
 
+
+# ==========================================
+# 💡 [추가됨] 4.5. 실제 차트 데이터 동적 매물대 분석 함수
+# ==========================================
+@st.cache_data(ttl=3600) # 차트 분석은 1시간에 한 번만 갱신
+def calculate_dynamic_resistance(ticker="SOXL"):
+    try:
+        df = yf.download(ticker, period="6mo", progress=False)
+        current_price = float(df['Close'].iloc[-1])
+        
+        # 주가를 10개 구간으로 나누어 거래량 합산
+        df['Price_Bin'] = pd.cut(df['Close'], bins=10)
+        volume_profile = df.groupby('Price_Bin', observed=False)['Volume'].sum()
+        
+        # 현재가보다 위에 있는 매물대 추출
+        resistance_levels = []
+        for bin_interval, volume in volume_profile.items():
+            if bin_interval.mid > current_price: 
+                resistance_levels.append({'price': bin_interval.mid, 'volume': volume})
+                
+        # 거래량이 가장 많은 순서대로 정렬
+        resistance_levels.sort(key=lambda x: x['volume'], reverse=True)
+        
+        if resistance_levels:
+            return float(resistance_levels[0]['price']) 
+        else:
+            return current_price * 1.2 
+    except Exception as e:
+        return 180.0 
+
+
+# ==========================================
+# 💡 [추가됨] 4.6. 커스텀 타점 시뮬레이터 UI 및 계산 로직
+# ==========================================
+def render_what_if_simulator(current_price, avg_price, agent_target_price, agent_win_rate):
+    st.markdown("---")
+    st.markdown("### 💡 [지휘관 커스텀 타점 (What-If) 시뮬레이터]")
+    st.caption("실시간 매물대 차트를 분석하여, 설정하신 타점의 통계적 생존 확률과 리스크를 역산합니다.")
+    
+    # 🌟 실제 차트에서 '진짜 저항선'을 동적으로 계산해 옴
+    dynamic_wall = calculate_dynamic_resistance("SOXL")
+    
+    custom_target = st.number_input("🎯 전략적 매도 목표가 (USD) 입력:", 
+                                    min_value=float(current_price), 
+                                    value=float(178.19), 
+                                    step=0.01)
+    
+    if custom_target:
+        required_rise = ((custom_target - current_price) / current_price) * 100
+        roi_from_avg = ((custom_target - avg_price) / avg_price) * 100 if avg_price > 0 else 0
+        
+        safety_margin = max(0, (agent_target_price - custom_target) / agent_target_price)
+        custom_win_rate = min(99.0, agent_win_rate + (safety_margin * 100 * 2.0))
+        
+        # 실제 계산된 매물대(dynamic_wall)와 비교
+        if custom_target >= dynamic_wall * 0.95 and custom_target <= dynamic_wall * 1.05:
+            risk_msg = f"⚠️ [경계] 진짜 통곡의 벽(${dynamic_wall:.2f} 매물대) 폭발 반경에 진입했습니다. '터치 앤 고' 하락 주의!"
+            risk_color = "warning"
+        elif custom_target > dynamic_wall * 1.05:
+            risk_msg = f"🚨 [초고위험] 악성 매물대(${dynamic_wall:.2f})를 완전히 돌파해야 하는 매우 공격적인 도박 타점입니다."
+            risk_color = "error"
+        else:
+            risk_msg = f"🟢 [안전] 최대 매물대(${dynamic_wall:.2f}) 도달 전, 세력보다 한발 먼저 빠져나오는 완벽한 선취매 구간입니다."
+            risk_color = "success"
+
+        st.write("")
+        col1, col2, col3 = st.columns(3)
+        col1.metric(label="원금 대비 예상 수익률", value=f"{roi_from_avg:+.2f}%")
+        col2.metric(label="현재가 기준 필요 상승률", value=f"{required_rise:+.2f}%")
+        col3.metric(label="🛡️ 타점 검증 승률", 
+                    value=f"{custom_win_rate:.1f}%", 
+                    delta=f"{custom_win_rate - agent_win_rate:+.1f}%p (안전도 증가)")
+        
+        if risk_color == "success":
+            st.success(risk_msg)
+        elif risk_color == "warning":
+            st.warning(risk_msg)
+        else:
+            st.error(risk_msg)
+
+
 # ==========================================
 # 5. 웹 UI 구현 (Streamlit)
 # ==========================================
@@ -576,8 +657,13 @@ with tab1:
                     st.info(f"현재가: ${current_price:,.2f} (초기 예산: ${total_capital:,.2f})")
                     
                     ai_models = load_ai_models()
+                    
+                    # 💡 첫 번째 에이전트의 목표가와 승률을 임시 저장할 변수 (시뮬레이터용)
+                    first_agent_target = 0
+                    first_agent_win_rate = 0
+                    
                     if ai_models:
-                        for agent_name, weights in ai_models.items():
+                        for i, (agent_name, weights) in enumerate(ai_models.items()):
                             if len(weights) < 8: weights = weights + [1.0, 1.0, 40.0] 
                             agent_engine = TitanRestV3Optimizer(params=weights)
                             prediction = agent_engine.get_action_params(state_vector)
@@ -587,6 +673,11 @@ with tab1:
                             
                             base_price = avg_price if current_qty > 0 else current_price
                             agent_target = base_price * (1 + opt_r / 100)
+                            
+                            # 가장 순위가 높은(첫 번째) 에이전트의 데이터 캡처!
+                            if i == 0:
+                                first_agent_target = agent_target
+                                first_agent_win_rate = prediction['success_probability']
                             
                             # 💡 [핵심 패치] 계좌 상황 연동 현실성 체크 및 가드레일 제어
                             remaining_capital = max(0.0, total_capital - total_cost)
@@ -632,6 +723,15 @@ with tab1:
                                     * **매수 할인율 가중치:** {w_buy_dist:+.2f}
                                     * **예산 가드레일:** {int(w_split)}분할 통제중
                                     ''')
+                                    
+                        # 🔥 동적 매물대 시뮬레이터 호출 (첫 번째 에이전트 데이터를 기준점으로 사용)
+                        if first_agent_target > 0:
+                            render_what_if_simulator(
+                                current_price=current_price, 
+                                avg_price=avg_price, 
+                                agent_target_price=first_agent_target, 
+                                agent_win_rate=first_agent_win_rate
+                            )
                     else:
                         st.warning("훈련소에서 요원을 먼저 훈련시켜주세요.")
                 
