@@ -495,7 +495,6 @@ with tab1:
             
             available_accounts = df_journal[df_journal['Ticker'] == view_ticker]['Account'].unique().tolist()
             
-            # 💡 [패치] 총 작전 예산(한화) 입력 및 달러 변환
             col_opt1, col_opt2, col_opt3 = st.columns(3)
             with col_opt1: cycle_start = st.date_input(f"📅 사이클 시작일", value=datetime.date(2026, 4, 20))
             with col_opt2: selected_accounts = st.multiselect(f"🏷️ 추적 계좌", options=available_accounts, default=available_accounts)
@@ -512,18 +511,28 @@ with tab1:
                                     (df_journal['Date'] >= cycle_start.strftime("%Y-%m-%d")) & 
                                     (df_journal['Account'].isin(selected_accounts))].sort_values(["Date", "Time"])
                 
-                # 💡 [패치] 매도 즉시 0회차 리셋 후 다음 매수부터 1회차 카운트
+                # 💡 [패치] 매도 즉시 0회차 리셋 + 같은 날짜 분할 매수는 1회차로 병합 처리
                 current_qty, total_cost, avg_price, buy_count = 0.0, 0.0, 0.0, 0
+                last_buy_date = None
+                
                 for _, row in trades.iterrows():
                     qty, price = float(row['Qty']), float(row['Price'])
+                    trade_date = row['Date']
+                    
                     if row['Action'] == 'Buy': 
                         current_qty += qty
                         total_cost += qty * price
                         avg_price = total_cost / current_qty if current_qty > 0 else 0
-                        buy_count += 1
+                        
+                        # 이전 매수와 다른 날짜일 때만 진행 회차를 1 올림
+                        if trade_date != last_buy_date:
+                            buy_count += 1
+                            last_buy_date = trade_date
+                            
                     elif row['Action'] == 'Sell': 
-                        # 매도 발생 시 모든 사이클 기록을 리셋하여 다음 매수를 1회차로 대비
+                        # 매도 발생 시 모든 사이클 기록과 날짜 추적기 초기화
                         current_qty, total_cost, avg_price, buy_count = 0.0, 0.0, 0.0, 0
+                        last_buy_date = None
                 
                 with col_ai:
                     st.markdown(f"### 🛡️ 사령관의 포지션")
