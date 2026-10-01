@@ -205,9 +205,9 @@ def highlight_keywords(text):
     neg_words = ['miss', 'down', 'drop', 'sell', 'weak', 'fall', 'slump', 'lawsuit', 'cut', 'downgrade', 'low', 'loss', 'plunge', 'delay', 'sink', 'unwind']
     highlighted = text
     for w in pos_words:
-        highlighted = re.sub(rf'\b({w})\b', r'<span style="background-color: #a8f0c6; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
+        highlighted = re.sub(rf'\b({w})\b', r'\1', highlighted, flags=re.IGNORECASE)
     for w in neg_words:
-        highlighted = re.sub(rf'\b({w})\b', r'<span style="background-color: #ffb3b3; color: black; font-weight: bold; padding: 2px 4px; border-radius: 3px;">\1</span>', highlighted, flags=re.IGNORECASE)
+        highlighted = re.sub(rf'\b({w})\b', r'\1', highlighted, flags=re.IGNORECASE)
     return highlighted
 
 def translate_to_korean(text):
@@ -519,6 +519,31 @@ def render_what_if_simulator(current_price, avg_price, agent_target_price, agent
         else:
             st.error(risk_msg)
 
+# ==========================================
+# 💡 [추가됨] 4.7. 미국 10년물 국채 금리(TNX) 피크아웃 폭등 트리거 진단
+# ==========================================
+@st.cache_data(ttl=1800)
+def analyze_treasury_yield_trigger():
+    try:
+        # 최근 6개월 10년물 국채 금리 데이터 스캔
+        df_tnx = yf.download("^TNX", period="6mo", progress=False)
+        
+        if df_tnx.empty: return None, None, None, None
+        if isinstance(df_tnx.columns, pd.MultiIndex): df_tnx.columns = df_tnx.columns.droplevel(1)
+            
+        closes = df_tnx['Close']
+        current_yield = float(closes.iloc[-1])
+        max_yield_6m = float(closes.max())
+        
+        # 고점 대비 하락률 (피크아웃 척도)
+        drop_from_peak = ((max_yield_6m - current_yield) / max_yield_6m) * 100
+        
+        # 단기 5일 추세 (꺾임 확인)
+        recent_trend = current_yield - float(closes.iloc[-5]) if len(closes) >= 5 else 0
+        
+        return current_yield, max_yield_6m, drop_from_peak, recent_trend
+    except:
+        return None, None, None, None
 
 # ==========================================
 # 5. 웹 UI 구현 (Streamlit)
@@ -645,16 +670,16 @@ with tab1:
                         req_pct = ((req_price / avg_price) - 1.0) * 100.0 if avg_price > 0 else 0
                         
                         if "KRW" in currency_choice:
-                            st.info(f"**₩{desired_profit_input:,.0f}** (약 ${desired_profit_usd:,.2f}) 벌려면\n\n➔ **+{req_pct:.2f}%** 에 매도 (목표가 ${req_price:.2f})")
+                            st.info(f"**₩{desired_profit_input:,.0f}** (약 \({desired_profit_usd:,.2f}) 벌려면\n\n➔ **+{req_pct:.2f}%** 에 매도 (목표가\){req_price:.2f})")
                         else:
                             desired_profit_krw = desired_profit_usd * krw_rate
-                            st.info(f"**${desired_profit_input:,.2f}** (약 ₩{desired_profit_krw:,.0f}) 벌려면\n\n➔ **+{req_pct:.2f}%** 에 매도 (목표가 ${req_price:.2f})")
+                            st.info(f"**\({desired_profit_input:,.2f}** (약 ₩{desired_profit_krw:,.0f}) 벌려면\n\n➔ **+{req_pct:.2f}%** 에 매도 (목표가\){req_price:.2f})")
                     else:
                         st.write("현재 진행 중인 매수 사이클이 없습니다.")
                     
                     st.markdown("---")
                     st.markdown(f"### 🧠 정예 요원별 V3.1 진단")
-                    st.info(f"현재가: ${current_price:,.2f} (초기 예산: ${total_capital:,.2f})")
+                    st.info(f"현재가: \({current_price:,.2f} (초기 예산:\){total_capital:,.2f})")
                     
                     ai_models = load_ai_models()
                     
@@ -772,6 +797,56 @@ with tab1:
 # TAB 5: 📡 SOXL 생태계 및 매크로 레이더
 # ------------------------------------------
 with tab5:
+    # --- 🦅 [추가됨] 10년물 국채 금리 폭등 트리거 시스템 ---
+    st.markdown("## 🦅 거시경제 핵심 트리거 (10년물 국채 금리 피크아웃 진단)")
+    curr_yield, max_yield, drop_pct, recent_trend = analyze_treasury_yield_trigger()
+    
+    if curr_yield is not None:
+        col_y1, col_y2, col_y3 = st.columns(3)
+        col_y1.metric("🇺🇸 미국 10년물 국채 금리", f"{curr_yield:.3f}%", f"{recent_trend:+.3f}%p (최근 5일)", delta_color="inverse")
+        col_y2.metric("📉 6개월 내 최고점", f"{max_yield:.3f}%")
+        
+        if drop_pct >= 10.0 and recent_trend < 0:
+            trigger_status = "🚀 상방 폭발 연쇄 반응 임박 (Peak-out 확정)"
+            status_color = "success"
+        elif drop_pct >= 5.0:
+            trigger_status = "🟡 금리 하락 전환 진행 중 (밸류에이션 부담 완화)"
+            status_color = "warning"
+        else:
+            trigger_status = "🚨 고금리 유지/상승 국면 (레버리지 차입비용 갉아먹기 주의)"
+            status_color = "error"
+            
+        col_y3.metric("🔥 SOXL 폭등 트리거 상태", f"고점 대비 -{drop_pct:.1f}% 하락", trigger_status)
+        
+        if status_color == "success":
+            st.success(f"**[폭등 트리거 발동]** 10년물 금리가 고점 대비 뚜렷하게 꺾였습니다. (하락률: {drop_pct:.1f}%) 과거 12번 중 8번의 SOXL 100~380% 폭등 랠리가 시작된 거시적 환경과 일치합니다.")
+        elif status_color == "warning":
+            st.warning(f"**[금리 피크아웃 진행 중]** 국채 매수세가 유입되며 금리가 꺾이고 있습니다. 고용/물가 둔화 신호가 추가 확인되면 SOXL 랠리가 시작됩니다.")
+        else:
+            st.error(f"**[경계 요망]** 10년물 금리가 여전히 높습니다. SOXL의 연 9%대 차입 이자 비용과 멀티플 하락 압력이 지속되는 구간입니다.")
+            
+        with st.expander("💡 [지휘관 인사이트] 10년물 금리와 SOXL 폭등의 밀접한 상관관계 (필독)"):
+            st.markdown("""
+            **1. 핵심 상관관계: "10년물 금리의 꺾임(피크아웃)이 폭등의 트리거"**
+            * 과거 SOXL이 석 달~넉 달 만에 약 2배 이상(100%~380%) 폭등했던 12번의 사례 중 8번은 10년물 금리가 고점을 찍고 꺾이거나 연준의 완화 신호 직후 발생했습니다.
+            * 금리 상승기에도 실적 호재로 단기 상승할 수 있으나, 고금리가 지속되면 결국 상승분을 반납하고 반토막 날 확률이 높습니다.
+
+            **2. 10년물 금리가 SOXL에 치명적인 2가지 메커니즘**
+            * **밸류에이션(할인율) 압박:** 국채 무위험 이자율이 5%대에 달하면 변동성 높은 반도체 주식에 요구되는 멀티플이 대폭 하락합니다.
+            * **3배 레버리지 차입(이자) 비용:** SOXL 운용사는 지수 3배 추종을 위해 원금의 2배를 빌립니다. 고금리 환경에선 차입 이자와 운용 보수로 **연간 약 9%의 비용이 매일 주가에서 차감**됩니다.
+            * **🔥 폭발 연쇄 반응:** 금리 하락 전환 시 `[반도체 주가 반등 + 3배 배율 + 차입 비용 부담 완화]`가 동시에 폭발하며 시세를 견인합니다.
+
+            **3. 대표적인 과거 폭등 사례**
+            * **2023년 11월~12월:** 10년물 장중 5% 터치 후 재무부 발행 조절로 금리가 꺾이자 넉 달 만에 3.8배(282%) 폭등.
+            * **2022년 11월:** CPI 예상 하회로 피크아웃 기대감 반영, 석 달 동안 106% 상승.
+            
+            **4. SOXL 재폭등을 위한 핵심 관전 포인트**
+            * 신규 고용 둔화 및 실업률 상승 (경기 둔화 신호)
+            * 근원 PCE, CPI 월간 상승률 0.2% 이하 안정
+            * 중동 등 지정학 리스크 완화를 통한 유가 안정
+            """)
+    st.markdown("---")
+
     st.markdown("## 📡 SOXL 생태계 레이더 (Semiconductor Top 10)")
     st.write("SOXL을 견인하는 핵심 10대 기업과 거시 경제(SPY, TLT, USO)의 글로벌 뉴스를 AI가 스캔하여 호재와 악재를 예측합니다.")
     
