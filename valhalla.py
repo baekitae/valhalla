@@ -592,6 +592,57 @@ def analyze_treasury_yield_trigger():
         return None, None, None, None
 
 # ==========================================
+# 4.8 예측 검증실: 재현 가능한 기준선·워크포워드 평가
+# ==========================================
+@st.cache_data(ttl=1800)
+def run_walk_forward_validation(ticker="SOXL", horizon=20, lookback_days=60, fee_bps=10):
+    """Evaluate a simple trend forecast only on data available at each date."""
+    history = yf.download(ticker, period="5y", auto_adjust=True, progress=False)
+    if history.empty: return None
+    if isinstance(history.columns, pd.MultiIndex): history.columns = history.columns.droplevel(1)
+    close = history["Close"].dropna()
+    if len(close) < lookback_days + horizon + 100: return None
+
+    # Forecast is deliberately simple: recent daily trend, capped to avoid extreme extrapolation.
+    momentum = close.pct_change(lookback_days) / lookback_days * horizon
+    model_return = momentum.clip(-0.30, 0.30)
+    actual_return = close.shift(-horizon) / close - 1
+    results = pd.DataFrame({"price": close, "model_return": model_return, "actual_return": actual_return}).dropna()
+    results = results.iloc[lookback_days:]
+    if results.empty: return None
+
+    results["naive_price"] = results["price"]
+    results["model_price"] = results["price"] * (1 + results["model_return"])
+    results["future_price"] = results["price"] * (1 + results["actual_return"])
+    results["model_direction"] = np.where(results["model_return"] >= 0, 1, -1)
+    results["actual_direction"] = np.where(results["actual_return"] >= 0, 1, -1)
+    hit_rate = (results["model_direction"] == results["actual_direction"]).mean() * 100
+    naive_mae = (results["future_price"] - results["naive_price"]).abs().mean()
+    model_mae = (results["future_price"] - results["model_price"]).abs().mean()
+
+    # One non-overlapping trade per horizon avoids overstating a strategy's results.
+    trades = results.iloc[::horizon].copy()
+    trades["position"] = (trades["model_return"] > 0).astype(float)
+    trades["turnover"] = trades["position"].diff().abs().fillna(trades["position"])
+    trades["strategy_return"] = trades["position"] * trades["actual_return"] - trades["turnover"] * fee_bps / 10_000
+    equity = (1 + trades["strategy_return"]).cumprod()
+    max_drawdown = ((equity / equity.cummax()) - 1).min() * 100
+
+    recent_returns = close.pct_change().dropna().tail(252)
+    simulations = np.random.default_rng(42).normal(recent_returns.mean(), recent_returns.std(), size=(10000, horizon)).sum(axis=1)
+    current_price = float(close.iloc[-1])
+    forecast_prices = current_price * np.exp(simulations)
+    return {
+        "results": results, "trades": trades, "current_price": current_price,
+        "hit_rate": hit_rate, "naive_mae": naive_mae, "model_mae": model_mae,
+        "avg_return": trades["strategy_return"].mean() * 100,
+        "mdd": max_drawdown, "trade_count": len(trades),
+        "median": float(np.median(forecast_prices)), "p25": float(np.percentile(forecast_prices, 25)),
+        "p75": float(np.percentile(forecast_prices, 75)), "p05": float(np.percentile(forecast_prices, 5)),
+        "p95": float(np.percentile(forecast_prices, 95)), "loss_probability": float((forecast_prices < current_price).mean() * 100),
+    }
+
+# ==========================================
 # 5. 웹 UI 구현 (Streamlit)
 # ==========================================
 st.title("🚀 무한매수 전술 관제소 (Project Valhalla V3.1)")
@@ -602,7 +653,7 @@ else: st.sidebar.warning("🟡 로컬 DB 사용 중")
 krw_rate = get_exchange_rate()
 st.sidebar.info(f"💱 **실시간 환율:** 1 USD = {krw_rate:,.2f} KRW")
 
-tab1, tab5, tab4, tab2, tab3 = st.tabs(["📊 전술 관제", "📡 SOXL 생태계", "⚔️ 발할라 실전 리그", "🧠 훈련소 (진화)", "🗄️ 매매 일지"])
+tab1, tab5, tab4, tab2, tab3, tab6 = st.tabs(["📊 전술 관제", "📡 SOXL 생태계", "⚔️ 발할라 실전 리그", "🧠 훈련소 (진화)", "🗄️ 매매 일지", "🔬 예측 검증실"])
 
 # ------------------------------------------
 # 사이드바
@@ -1097,3 +1148,48 @@ with tab3:
         if st.button("🗑️ AI 장부 초기화"):
             overwrite_db("ai_ledger", pd.DataFrame(columns=["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"]))
             st.rerun()
+
+# ------------------------------------------
+# TAB 6: 예측 검증실
+# ------------------------------------------
+with tab6:
+    st.markdown("## 🔬 예측 검증실")
+    st.caption("가격을 단정하지 않습니다. 기준선과 추세 모델을 과거의 미사용 구간에서 비교한 참고용 결과입니다.")
+    c1, c2, c3 = st.columns(3)
+    validation_ticker = c1.text_input("검증 티커", "SOXL", key="validation_ticker").upper().strip()
+    validation_horizon = c2.selectbox("예측·보유 기간", [5, 10, 20, 60], index=2, format_func=lambda x: f"{x} 거래일")
+    validation_fee = c3.number_input("편도 비용 가정 (bp)", min_value=0, max_value=100, value=10, help="수수료와 슬리피지를 보수적으로 반영합니다.")
+    if st.button("워크포워드 검증 실행", key="run_validation", type="primary"):
+        try:
+            validation = run_walk_forward_validation(validation_ticker, validation_horizon, 60, validation_fee)
+            if validation is None:
+                st.error("검증에 필요한 가격 데이터가 부족하거나 데이터를 불러오지 못했습니다.")
+            else:
+                st.session_state["validation"] = validation
+                st.session_state["validation_label"] = validation_ticker
+        except Exception as exc:
+            LOGGER.exception("Walk-forward validation failed")
+            st.error(f"검증 실행 실패: {exc}")
+
+    validation = st.session_state.get("validation")
+    if validation:
+        st.markdown(f"### {st.session_state.get('validation_label', '선택 종목')} · 최근 5년 워크포워드 결과")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("방향 적중률", f"{validation['hit_rate']:.1f}%", help="각 시점의 추세 방향과 이후 실제 방향의 일치율")
+        m2.metric("모델 평균 오차", f"${validation['model_mae']:.2f}", delta=f"기준선 ${validation['naive_mae']:.2f}", delta_color="inverse")
+        m3.metric("전략 최대낙폭", f"{validation['mdd']:.1f}%")
+        m4.metric("비중 진입 횟수", f"{validation['trade_count']}회")
+        st.write(f"비용 반영 거래당 평균 수익률: **{validation['avg_return']:+.2f}%**. 모델 오차가 기준선보다 작을 때만 예측 신호를 참고할 가치가 있습니다.")
+        st.markdown("### 20거래일 확률 범위")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("중앙값", f"${validation['median']:.2f}")
+        p2.metric("50% 구간", f"${validation['p25']:.2f} – ${validation['p75']:.2f}")
+        p3.metric("90% 구간", f"${validation['p05']:.2f} – ${validation['p95']:.2f}")
+        st.warning(f"현재가보다 낮을 확률 추정치: {validation['loss_probability']:.1f}%. 이는 과거 변동성 기반 시뮬레이션이며 미래를 보장하지 않습니다.")
+        chart = go.Figure()
+        chart.add_trace(go.Scatter(x=validation["trades"].index, y=(1 + validation["trades"]["strategy_return"]).cumprod(), name="추세 전략", line=dict(color="#00CC96")))
+        chart.add_hline(y=1, line_dash="dot", line_color="gray", annotation_text="초기 자본")
+        chart.update_layout(template="plotly_dark", height=350, yaxis_title="누적 자본 배수", margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(chart, use_container_width=True)
+        with st.expander("측정 방법과 한계"):
+            st.markdown("- **기준선:** 미래 가격은 현재 가격과 같다고 가정합니다.\n- **모델:** 직전 60거래일 추세를 다음 보유 기간으로 제한적으로 연장합니다.\n- **검증:** 각 시점에는 그날까지의 가격만 사용합니다. 중복을 피하려 보유 기간마다 한 번만 거래합니다.\n- 과거 성과·시뮬레이션은 미래 수익이나 손실을 보장하지 않으며, 레버리지 ETF는 일일 재설정과 높은 변동성 때문에 오차가 특히 클 수 있습니다.")
