@@ -11,9 +11,13 @@ import warnings
 import re
 import json
 import random
+import logging
+import tempfile
 from deep_translator import GoogleTranslator
 
 warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger("valhalla")
 
 # 🚨 스트림릿 절대 규칙: 페이지 설정은 무조건 최상단에 위치해야 합니다.
 st.set_page_config(page_title="무한매수 전술 관제소 V3.1", layout="wide")
@@ -57,6 +61,10 @@ class TitanRestV3Optimizer:
 DB_FILE = "trade_journal.csv"
 AI_MODELS_FILE = "ai_models.json"
 AI_LEDGER_FILE = "ai_ledger.csv"
+TABLE_COLUMNS = {
+    "trade_journal": ["Date", "Time", "Account", "Ticker", "Action", "Qty", "Price", "Format"],
+    "ai_ledger": ["Date", "Agent", "Ticker", "Action", "Qty", "Price", "Capital", "Profit"],
+}
 
 @st.cache_resource
 def get_supabase_client():
@@ -64,7 +72,8 @@ def get_supabase_client():
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
         return create_client(url, key)
-    except:
+    except (KeyError, FileNotFoundError) as exc:
+        LOGGER.info("Supabase credentials unavailable; using local CSV storage: %s", exc)
         return None
 
 supabase = get_supabase_client()
@@ -84,6 +93,35 @@ def init_local_files():
 
 if not supabase: init_local_files()
 
+def _validate_frame(table_name, frame):
+    """Validate journal/ledger rows before persisting them."""
+    if table_name not in TABLE_COLUMNS:
+        raise ValueError(f"지원하지 않는 테이블입니다: {table_name}")
+    missing = set(TABLE_COLUMNS[table_name]) - set(frame.columns)
+    if missing:
+        raise ValueError(f"필수 열이 없습니다: {', '.join(sorted(missing))}")
+    checked = frame[TABLE_COLUMNS[table_name]].copy()
+    for column in ("Qty", "Price"):
+        checked[column] = pd.to_numeric(checked[column], errors="coerce")
+        if checked[column].isna().any() or (checked[column] <= 0).any():
+            raise ValueError(f"{column}은 0보다 큰 숫자여야 합니다.")
+    if "Ticker" in checked:
+        checked["Ticker"] = checked["Ticker"].astype(str).str.strip().str.upper()
+    if "Action" in checked and not checked["Action"].isin(["Buy", "Sell"]).all():
+        raise ValueError("Action은 Buy 또는 Sell이어야 합니다.")
+    return checked
+
+def _atomic_csv_write(file_name, frame):
+    directory = os.path.dirname(os.path.abspath(file_name)) or "."
+    handle, temporary_name = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    os.close(handle)
+    try:
+        frame.to_csv(temporary_name, index=False)
+        os.replace(temporary_name, file_name)
+    except Exception:
+        if os.path.exists(temporary_name): os.remove(temporary_name)
+        raise
+
 def read_db(table_name):
     if supabase:
         res = supabase.table(table_name).select("*").execute()
@@ -96,9 +134,13 @@ def read_db(table_name):
     else:
         file_name = DB_FILE if table_name == "trade_journal" else AI_LEDGER_FILE
         try: return pd.read_csv(file_name)
-        except: return pd.DataFrame()
+        except (OSError, pd.errors.ParserError) as exc:
+            LOGGER.exception("Could not read %s", file_name)
+            st.error(f"로컬 DB를 읽지 못했습니다: {exc}")
+            return pd.DataFrame(columns=TABLE_COLUMNS[table_name])
 
 def overwrite_db(table_name, df_new):
+    df_new = _validate_frame(table_name, df_new) if not df_new.empty else pd.DataFrame(columns=TABLE_COLUMNS[table_name])
     if supabase:
         supabase.table(table_name).delete().neq('id', 0).execute() 
         if not df_new.empty:
@@ -106,15 +148,19 @@ def overwrite_db(table_name, df_new):
             supabase.table(table_name).insert(records).execute()
     else:
         file_name = DB_FILE if table_name == "trade_journal" else AI_LEDGER_FILE
-        df_new.to_csv(file_name, index=False)
+        _atomic_csv_write(file_name, df_new)
 
 def append_db(table_name, df_append):
+    df_append = _validate_frame(table_name, df_append)
     if supabase:
         records = df_append.to_dict(orient='records')
         supabase.table(table_name).insert(records).execute()
     else:
         file_name = DB_FILE if table_name == "trade_journal" else AI_LEDGER_FILE
-        df_append.to_csv(file_name, mode='a', header=False, index=False)
+        existing = read_db(table_name)
+        # Idempotent append prevents duplicate records after a browser retry.
+        combined = pd.concat([existing, df_append], ignore_index=True).drop_duplicates().reset_index(drop=True)
+        _atomic_csv_write(file_name, combined)
 
 def load_ai_models():
     if supabase:
