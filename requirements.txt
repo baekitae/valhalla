@@ -1,0 +1,7 @@
+streamlit>=1.60
+pandas>=2.2
+numpy>=1.26
+plotly>=5.22
+yfinance>=0.2.54
+supabase>=2.4
+deep-translator>=1.11
