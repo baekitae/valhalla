@@ -1,0 +1,24 @@
+name: 발할라 리그 자동 실행
+
+on:
+  schedule:
+    # 한국 시간 화~토 07:10 (미국장 마감 후) = UTC 월~금 22:10
+    - cron: "10 22 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  league:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install pandas numpy yfinance supabase
+      - name: 리그 가상매매 · 장부 · 일별 성적 저장
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python jobs/daily_league.py

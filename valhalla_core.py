@@ -756,6 +756,131 @@ def walk_forward(close: pd.Series, horizon: int = 20, lookback: int = 60, fee_bp
 
 
 # ==========================================================================
+# 8-1. 시세 정리 · 실전 리그 계산 · 요원 검증 (앱과 자동 실행 스크립트가 함께 사용)
+# ==========================================================================
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
+
+
+def clean_ohlcv(raw: pd.DataFrame | None) -> pd.DataFrame | None:
+    """yfinance 결과 → 표준 OHLCV (MultiIndex·시간대·결측 정리)."""
+    if raw is None or raw.empty:
+        return None
+    df = raw.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.loc[:, ~df.columns.duplicated()]
+    if any(c not in df.columns for c in OHLCV):
+        return None
+    index = pd.to_datetime(df.index)
+    df.index = index.tz_localize(None) if index.tz is not None else index
+    df = df[OHLCV].apply(pd.to_numeric, errors="coerce").dropna(subset=["Close"])
+    df["Volume"] = df["Volume"].fillna(0)
+    for col in ("Open", "High", "Low"):
+        df[col] = df[col].fillna(df["Close"])
+    return None if df.empty else df
+
+
+def league_period(start: str, today: pd.Timestamp | None = None) -> str:
+    days = ((today or pd.Timestamp.now()) - pd.Timestamp(start)).days
+    return "2y" if days < 550 else "5y" if days < 1700 else "max"
+
+
+def league_run(df: pd.DataFrame, start: str, capital: float, fee_bps: float, genes, names: list[str],
+               ticker: str) -> dict | None:
+    """리그 시작일부터 오늘까지 요원들을 실제 일봉에 적용. 같은 입력이면 언제 돌려도 같은 결과."""
+    idx = df.index
+    start_i = max(int(idx.searchsorted(pd.Timestamp(start))), FEATURE_WARMUP + 1)
+    if start_i >= len(df):
+        return None
+    feats = compute_features(df["Close"], df["Volume"])
+    fee = fee_bps / 10_000
+    res = simulate(np.array(genes), df["Open"], df["High"], df["Low"], df["Close"], feats, start_i,
+                   capital, fee, record=True, dates=list(idx.strftime("%Y-%m-%d")),
+                   agent_names=list(names), ticker=ticker, keep_curve=True)
+    close = df["Close"].to_numpy()
+    curve = pd.DataFrame(res.equity_curve, index=idx[start_i:], columns=list(names))
+    curve["Buy & Hold"] = capital * close[start_i:] / close[start_i - 1] * (1 - fee)
+    bh_ret, bh_mdd = buy_and_hold(close, start_i, fee)
+    summary = pd.DataFrame({
+        "요원": list(names), "총자산": res.final_equity, "수익률(%)": res.return_pct,
+        "실현손익": res.realized, "평가손익": res.qty * close[-1] - res.cost,
+        "MDD(%)": res.mdd_pct, "체결수": res.n_trades.astype(int), "보유수량": res.qty,
+    })
+    return {"summary": summary, "trades": res.trades, "curve": curve, "bh_ret": bh_ret, "bh_mdd": bh_mdd,
+            "start": str(idx[start_i].date()), "end": str(idx[-1].date()), "last_close": float(close[-1]),
+            "days": int(len(df) - start_i)}
+
+
+def rolling_validation(df: pd.DataFrame, genes, names: list[str], window: int = 126, capital: float = 10_000.0,
+                       fee_bps: float = 10.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """기간별 안정성 검증: 전체 기간을 겹치지 않는 window 거래일 구간으로 잘라 각 구간을 처음부터 따로 매매.
+
+    반환: (구간별 수익률 표, 요원별 요약 표)
+    요약: 수익 구간 비율, 보유 대비 우세 구간 비율, 최악 구간 수익, 평균 수익, 평균 MDD
+    """
+    G = np.array(genes, dtype=float)
+    feats = compute_features(df["Close"], df["Volume"])
+    o, h, l, c = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
+    fee = fee_bps / 10_000
+    rows = []
+    first = FEATURE_WARMUP + 1
+    for s in range(first, len(df) - window + 1, window):
+        e = s + window
+        r = simulate(G, o[:e], h[:e], l[:e], c[:e], feats[:e], s, capital, fee)
+        bh, bh_mdd = buy_and_hold(c[:e], s, fee)
+        row = {"구간": f"{df.index[s]:%Y-%m} ~ {df.index[e - 1]:%Y-%m}", "보유(%)": round(bh, 1)}
+        for name, ret, mdd in zip(names, r.return_pct, r.mdd_pct):
+            row[name] = round(float(ret), 1)
+            row[f"{name}__mdd"] = float(mdd)
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return table, pd.DataFrame()
+    summary = []
+    for name in names:
+        rets = table[name]
+        summary.append({
+            "요원": name, "구간 수": len(rets),
+            "수익 구간(%)": round((rets > 0).mean() * 100, 0),
+            "보유 대비 우세(%)": round((rets > table["보유(%)"]).mean() * 100, 0),
+            "평균 수익(%)": round(rets.mean(), 1), "최악 구간(%)": round(rets.min(), 1),
+            "평균 MDD(%)": round(table[f"{name}__mdd"].mean(), 1),
+        })
+    table = table.drop(columns=[c for c in table.columns if c.endswith("__mdd")])
+    return table, pd.DataFrame(summary)
+
+
+# 판정 기준 (화면에도 그대로 표시)
+TRAIN_RULES = ("검증 구간(학습에 안 쓴 기간) 수익 > 0", "기간별 안정성: 수익 구간 비율 ≥ 50%",
+               "학습→검증 성적 하락이 과도하지 않을 것 (학습의 −50%p 이내)")
+LIVE_MIN_DAYS = 20
+
+
+def judge_training(test_ret: float, train_ret: float, positive_ratio: float | None) -> tuple[str, list[str]]:
+    """훈련 결과 판정 → ('pass' | 'fail', 사유 목록)"""
+    reasons = []
+    if test_ret <= 0:
+        reasons.append(f"검증 구간 손실 ({test_ret:+.1f}%)")
+    if positive_ratio is not None and positive_ratio < 50:
+        reasons.append(f"수익 구간 비율 {positive_ratio:.0f}% < 50%")
+    if train_ret - test_ret > 50:
+        reasons.append(f"과적합 의심 (학습 {train_ret:+.0f}% → 검증 {test_ret:+.0f}%)")
+    return ("fail" if reasons else "pass"), reasons
+
+
+def judge_live(live_ret: float, live_mdd: float, bh_ret: float, days: int, test_mdd: float | None) -> tuple[str, str]:
+    """실전 리그 판정 → (상태, 설명). 상태: watch / ok / warn / retire"""
+    if days < LIVE_MIN_DAYS:
+        return "watch", f"관찰 중 ({days}/{LIVE_MIN_DAYS}거래일)"
+    mdd_limit = max(1.5 * (test_mdd or 0), 30.0)
+    if live_ret < 0 and live_mdd > mdd_limit:
+        return "retire", f"손실 중이고 MDD {live_mdd:.0f}% > 허용 {mdd_limit:.0f}% → 교체 권고"
+    if live_ret >= bh_ret - 10 and live_mdd <= mdd_limit:
+        return "ok", "보유 대비 −10%p 이내 성적 · 낙폭 허용 범위"
+    return "warn", f"보유 대비 {live_ret - bh_ret:+.1f}%p · MDD {live_mdd:.0f}% → 지켜보기"
+
+
+# ==========================================================================
 # 9. 뉴스 키워드 센티먼트
 # ==========================================================================
 POS_WORDS = ["surge", "surges", "beat", "beats", "rally", "rallies", "strong", "growth", "gain", "gains",

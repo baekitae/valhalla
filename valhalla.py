@@ -379,22 +379,7 @@ def save_models(models: list[dict]) -> None:
 # 시세 데이터 (yfinance)
 # ==========================================================================
 def _clean_ohlcv(raw: pd.DataFrame | None) -> pd.DataFrame | None:
-    if raw is None or raw.empty:
-        return None
-    df = raw.copy()
-    if isinstance(df.columns, pd.MultiIndex):     # 최신 yfinance는 단일 종목도 MultiIndex
-        df.columns = df.columns.get_level_values(0)
-    df = df.loc[:, ~df.columns.duplicated()]
-    need = ["Open", "High", "Low", "Close", "Volume"]
-    if any(c not in df.columns for c in need):
-        return None
-    index = pd.to_datetime(df.index)
-    df.index = index.tz_localize(None) if index.tz is not None else index
-    df = df[need].apply(pd.to_numeric, errors="coerce").dropna(subset=["Close"])
-    df["Volume"] = df["Volume"].fillna(0)
-    for col in ("Open", "High", "Low"):
-        df[col] = df[col].fillna(df["Close"])
-    return None if df.empty else df
+    return core.clean_ohlcv(raw)
 
 
 def _download(ticker: str, period: str, adjusted: bool) -> pd.DataFrame | None:
@@ -496,31 +481,53 @@ def cached_walk_forward(ticker: str, horizon: int, fee_bps: int) -> dict | None:
 @st.cache_data(ttl=600, show_spinner=False)
 def run_league(ticker: str, start: str, capital: float, fee_bps: float,
                genes: tuple[tuple[float, ...], ...], names: tuple[str, ...]) -> dict | None:
-    days = (today_kst() - dt.date.fromisoformat(start)).days
-    period = "2y" if days < 550 else "5y" if days < 1700 else "max"
-    df = load_long(ticker, period, False)
+    df = load_long(ticker, core.league_period(start), False)
     if df is None:
         return None
-    idx = df.index
-    start_i = max(int(idx.searchsorted(pd.Timestamp(start))), core.FEATURE_WARMUP + 1)
-    if start_i >= len(df):
-        return None
-    feats = core.compute_features(df["Close"], df["Volume"])
-    fee = fee_bps / 10_000
-    res = core.simulate(np.array(genes), df["Open"], df["High"], df["Low"], df["Close"], feats, start_i,
-                        capital, fee, record=True, dates=list(idx.strftime("%Y-%m-%d")),
-                        agent_names=list(names), ticker=ticker, keep_curve=True)
-    close = df["Close"].to_numpy()
-    curve = pd.DataFrame(res.equity_curve, index=idx[start_i:], columns=list(names))
-    curve["Buy & Hold"] = capital * close[start_i:] / close[start_i - 1] * (1 - fee)
-    bh_ret, bh_mdd = core.buy_and_hold(close, start_i, fee)
-    summary = pd.DataFrame({
-        "요원": list(names), "총자산": res.final_equity, "수익률(%)": res.return_pct,
-        "실현손익": res.realized, "평가손익": res.qty * close[-1] - res.cost,
-        "MDD(%)": res.mdd_pct, "체결수": res.n_trades.astype(int), "보유수량": res.qty,
-    })
-    return {"summary": summary, "trades": res.trades, "curve": curve, "bh_ret": bh_ret, "bh_mdd": bh_mdd,
-            "start": str(idx[start_i].date()), "end": str(idx[-1].date()), "last_close": float(close[-1])}
+    return core.league_run(df, start, capital, fee_bps, list(genes), list(names), ticker)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_rolling(ticker: str, period: str, window: int, fee_bps: float,
+                   genes: tuple[tuple[float, ...], ...], names: tuple[str, ...]):
+    df = load_long(ticker, period, False)
+    if df is None:
+        return None, None
+    return core.rolling_validation(df, list(genes), list(names), window, 10_000.0, fee_bps)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_job_runs(backend_name: str) -> pd.DataFrame:
+    if backend_name != "supabase":
+        return pd.DataFrame()
+    try:
+        rows = get_supabase().table("valhalla_job_runs").select("*").order("id", desc=True).limit(10).execute().data
+        return pd.DataFrame(rows or [])
+    except Exception:
+        LOGGER.warning("자동 실행 기록 조회 실패 (테이블 없음?)")
+        return pd.DataFrame()
+
+
+def render_rolling(table: pd.DataFrame, summary: pd.DataFrame, key: str) -> None:
+    """기간별 안정성 검증 결과 표시."""
+    if table is None or table.empty:
+        st.info("검증할 기간이 부족합니다.")
+        return
+    pct = st.column_config.NumberColumn(format="%+.1f")
+    st.dataframe(summary, hide_index=True, column_config={
+        "수익 구간(%)": st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100),
+        "보유 대비 우세(%)": st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100),
+        "평균 수익(%)": pct, "최악 구간(%)": pct, "평균 MDD(%)": st.column_config.NumberColumn(format="%.1f")})
+    names = [c for c in table.columns if c not in ("구간", "보유(%)")]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=table["구간"], y=table["보유(%)"], name="Buy & Hold", marker_color=NEUTRAL, opacity=0.6))
+    for i, n in enumerate(names):
+        fig.add_trace(go.Bar(x=table["구간"], y=table[n], name=n, marker_color=SERIES[i % len(SERIES)]))
+    base_layout(fig, 300)
+    fig.update_layout(barmode="group", title=dict(text="구간별 수익률(%) — 각 구간을 새 자본으로 따로 매매", font=dict(size=13)))
+    show_chart(fig, key=key)
+    with st.expander("구간별 상세", icon=":material/table:"):
+        st.dataframe(table, hide_index=True)
 
 
 # ==========================================================================
@@ -972,20 +979,50 @@ def page_league() -> None:
         hide_index=True)
 
     section("리그 설정", "매수는 전일 종가 기준 지정가, 매도는 평단 기준 목표가 지정가로 체결을 가정합니다. "
-                     "같은 날 여러 번 실행해도 결과가 중복되지 않습니다.")
+                     "매일 아침 7시(KST, 화~토) 자동 실행이 같은 설정으로 장부와 일별 성적을 저장합니다.")
+    lead = models[0]
     trained = [m.get("trained_at") for m in models if m.get("trained_at")]
-    default_start = dt.date.fromisoformat(min(trained)) if trained else today_kst() - dt.timedelta(days=180)
+    trained_end = max(trained) if trained else None
+    saved_start = lead.get("league_start") or trained_end
+    default_start = dt.date.fromisoformat(saved_start) if saved_start else today_kst() - dt.timedelta(days=180)
     c = st.columns(4)
-    ticker = c[0].text_input("종목", value=models[0].get("ticker", "SOXL"), key="league_ticker").upper().strip()
+    ticker = c[0].text_input("종목", value=lead.get("league_ticker") or lead.get("ticker", "SOXL"),
+                             key="league_ticker").upper().strip()
     start = c[1].date_input("리그 시작일", value=default_start, max_value=today_kst(), key="league_start")
-    capital = c[2].number_input("요원별 자본 ($)", min_value=1_000.0, value=10_000.0, step=1_000.0, key="league_cap")
-    fee_bps = c[3].number_input("편도 비용 (bp)", min_value=0, max_value=100, value=10, key="league_fee",
+    capital = c[2].number_input("요원별 자본 ($)", min_value=1_000.0, value=float(lead.get("league_capital", 10_000.0)),
+                                step=1_000.0, key="league_cap")
+    fee_bps = c[3].number_input("편도 비용 (bp)", min_value=0, max_value=100, value=int(lead.get("league_fee", 10)),
+                                key="league_fee",
                                 help="수수료 + 슬리피지. 키움 해외주식 기본 수수료는 약 0.07~0.25% 수준입니다.")
+    if trained_end and start.isoformat() < trained_end:
+        st.warning(f"리그 시작일이 훈련일({trained_end})보다 앞입니다. 훈련에 이미 쓴 기간이 섞여서 "
+                   "성적이 실제보다 좋아 보일 수 있어요. 진짜 실전 검증은 훈련일 이후부터입니다.",
+                   icon=":material/warning:")
+    changed = (ticker != (lead.get("league_ticker") or lead.get("ticker")) or start.isoformat() != saved_start
+               or float(capital) != float(lead.get("league_capital", 10_000.0))
+               or int(fee_bps) != int(lead.get("league_fee", 10)))
+    if changed and st.button("이 설정을 자동 실행에 저장", icon=":material/schedule:"):
+        try:
+            save_models([{**m, "league_ticker": ticker, "league_start": start.isoformat(),
+                          "league_capital": float(capital), "league_fee": int(fee_bps)} for m in models])
+            flash("자동 실행 설정을 저장했습니다.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"저장 실패: {exc}")
     with st.spinner("리그 계산 중…"):
         result = run_league(ticker, start.isoformat(), float(capital), float(fee_bps),
                             tuple(tuple(m["genes"]) for m in models), tuple(m["name"] for m in models))
     if result is None:
-        st.error("시세가 없거나 시작일 이후 데이터가 부족합니다.", icon=":material/cloud_off:")
+        latest = load_recent(ticker)
+        if latest is not None and pd.Timestamp(start) > latest.index[-1]:
+            st.info(f"리그는 {start:%Y-%m-%d} 이후 첫 거래일부터 시작됩니다. 다음 날 아침 자동 실행 뒤 성적이 표시돼요. "
+                    "그동안 아래 기간별 안정성 검증으로 요원을 미리 점검할 수 있습니다.", icon=":material/hourglass_top:")
+            section("기간별 안정성 검증", "최근 5년을 6개월(126거래일)씩 잘라 각 구간을 처음부터 따로 매매합니다.")
+            r_table, r_sum = cached_rolling(ticker, "5y", 126, float(fee_bps), tuple(tuple(m["genes"]) for m in models),
+                                            tuple(m["name"] for m in models))
+            render_rolling(r_table, r_sum, "league_rolling_wait")
+        else:
+            st.error("시세가 없거나 시작일 이후 데이터가 부족합니다.", icon=":material/cloud_off:")
         return
 
     section("리더보드", f"기간 {result['start']} ~ {result['end']} · AI는 리그 기간, 사령관은 매매 일지 전체 기준입니다.")
@@ -1034,6 +1071,41 @@ def page_league() -> None:
     fig.update_yaxes(title_text="자산 (시작=100)")
     show_chart(fig, key="league_curve")
 
+    section("실전 검증", f"리그 기간의 성적으로 요원 상태를 판정합니다 (최소 {core.LIVE_MIN_DAYS}거래일 관찰 후). "
+                       "기준: 보유(Buy & Hold) 대비 −10%p 이내면 정상, 손실 중 낙폭이 훈련 검증 MDD의 1.5배(최소 30%)를 넘으면 교체 권고.")
+    by_name = {m["name"]: m for m in models}
+    verdicts = []
+    for _, row in result["summary"].iterrows():
+        name, ret, mdd = row["요원"], float(row["수익률(%)"]), float(row["MDD(%)"])
+        mdl = by_name.get(name, {})
+        state, why = core.judge_live(ret, mdd, result["bh_ret"], result["days"], mdl.get("test_mdd"))
+        label = {"watch": "👀 관찰 중", "ok": "✅ 정상", "warn": "⚠️ 주의", "retire": "❌ 교체 권고"}[state]
+        verdicts.append({"요원": name, "판정": label, "리그 수익(%)": round(ret, 2),
+                         "보유 대비(%p)": round(ret - result["bh_ret"], 2), "리그 MDD(%)": round(mdd, 1),
+                         "훈련 검증 수익(%)": mdl.get("test_ret"), "설명": why})
+    vdf = pd.DataFrame(verdicts)
+    st.dataframe(vdf, hide_index=True, column_config={
+        "리그 수익(%)": st.column_config.NumberColumn(format="%+.2f"),
+        "보유 대비(%p)": st.column_config.NumberColumn(format="%+.2f"),
+        "훈련 검증 수익(%)": st.column_config.NumberColumn(format="%+.1f")})
+    if (vdf["판정"] == "❌ 교체 권고").any():
+        st.error("교체 권고 요원이 있습니다. 훈련소에서 다시 훈련해 검증을 통과한 요원으로 바꾸는 것을 권합니다.",
+                 icon=":material/report:")
+
+    section("기간별 안정성 검증", "최근 5년을 6개월(126거래일)씩 잘라 각 구간을 처음부터 따로 매매합니다. "
+                              "특정 시기에만 운 좋게 맞은 요원인지 확인합니다 (학습에 쓴 기간도 포함되니 참고용).")
+    with st.spinner("구간별 검증 중…"):
+        r_table, r_sum = cached_rolling(ticker, "5y", 126, float(fee_bps), tuple(tuple(m["genes"]) for m in models),
+                                        tuple(m["name"] for m in models))
+    render_rolling(r_table, r_sum, "league_rolling")
+
+    runs = load_job_runs(backend())
+    with st.expander("자동 실행 기록", icon=":material/schedule:"):
+        if runs.empty:
+            st.caption("아직 자동 실행 기록이 없습니다. GitHub 저장소 Actions 탭에서 'Run workflow'로 시험해 보세요.")
+        else:
+            st.dataframe(runs.drop(columns=["id"], errors="ignore"), hide_index=True)
+
     section("가상 매매 장부 저장", "계산된 체결 내역으로 이 종목의 AI 장부를 교체합니다 (다른 종목 기록은 유지).")
     trades = result["trades"]
     c1, c2 = st.columns([1, 3], vertical_alignment="center")
@@ -1057,7 +1129,7 @@ def page_league() -> None:
 # 페이지 4: 훈련소
 # ==========================================================================
 def page_training() -> None:
-    page_header("BOOTCAMP", "AI 훈련소", "유전 알고리즘 (선택 · 교차 · 변이) + 부트스트랩 시나리오 + 미사용 구간 검증")
+    page_header("BOOTCAMP", "AI 훈련소", "유전 알고리즘 (선택 · 교차 · 변이) + 부트스트랩 시나리오 + 미사용 구간 · 기간별 검증")
     with st.form("train_form", border=True):
         c = st.columns(4)
         ticker = c[0].text_input("훈련 종목", "SOXL").upper().strip()
@@ -1089,8 +1161,8 @@ def page_training() -> None:
             try:
                 result = core.run_evolution(history, population, generations, n_scen, mc_days, train_ratio,
                                             fee_bps, 10_000.0, penalty, int(seed), seeds, on_progress)
-                st.session_state["train_result"] = {**result, "ticker": ticker,
-                                                    "trained_at": today_kst().isoformat()}
+                st.session_state["train_result"] = {**result, "ticker": ticker, "years": years,
+                                                    "fee_bps": fee_bps, "trained_at": today_kst().isoformat()}
                 bar.empty()
             except ValueError as exc:
                 bar.empty()
@@ -1138,19 +1210,44 @@ def page_training() -> None:
                                  index=[f"Rank {r['rank']}" for r in result["top"]]).T
             st.dataframe(genes, column_config={c: st.column_config.NumberColumn(format="%.3f") for c in genes.columns})
 
-    section("실전 배치", "상위 3명이 기존 요원을 대체하고, AI 가상 매매 장부는 초기화됩니다.")
+    section("배치 전 검증", "기준: " + " · ".join(core.TRAIN_RULES))
+    names = [f"Rank {r['rank']}" for r in result["top"]]
+    with st.spinner("기간별 안정성 검증 중…"):
+        r_table, r_sum = cached_rolling(result["ticker"], f"{result.get('years', 3)}y", 126, float(result.get("fee_bps", 10)),
+                                        tuple(tuple(r["genes"]) for r in result["top"]), tuple(names))
+    pos_ratio = dict(zip(r_sum["요원"], r_sum["수익 구간(%)"])) if r_sum is not None and not r_sum.empty else {}
+    judged = []
+    for r, n in zip(result["top"], names):
+        verdict, reasons = core.judge_training(r["test_ret"], r["train_ret"], pos_ratio.get(n))
+        judged.append({**r, "passed": verdict == "pass", "reasons": reasons})
+    st.dataframe(pd.DataFrame([{"요원": n, "판정": "✅ 통과" if j["passed"] else "❌ 불통과",
+                                "검증수익(%)": j["test_ret"], "수익 구간(%)": pos_ratio.get(n),
+                                "사유": " · ".join(j["reasons"]) or "모든 기준 충족"} for n, j in zip(names, judged)]),
+                 hide_index=True, column_config={"검증수익(%)": st.column_config.NumberColumn(format="%+.1f")})
+    render_rolling(r_table, r_sum, "train_rolling")
+
+    section("실전 배치", "선택한 요원이 기존 요원을 대체하고, AI 가상 매매 장부는 초기화됩니다. 리그는 오늘부터 시작합니다.")
+    only_passed = st.toggle("검증 통과 요원만 배치", value=True, key="deploy_only_passed")
+    chosen = [j for j in judged if j["passed"] or not only_passed]
+    if not chosen:
+        st.warning("검증을 통과한 요원이 없습니다. 학습 기간·시나리오 수·낙폭 페널티를 바꿔 다시 훈련하거나, "
+                   "위 토글을 끄고 배치하세요 (권장하지 않음).", icon=":material/warning:")
+        return
     c1, c2 = st.columns([2, 1], vertical_alignment="center")
-    ok = c1.checkbox("기존 요원 교체와 AI 장부 초기화에 동의합니다.", key="deploy_ok")
-    if c2.button("상위 3명 배치", type="primary", disabled=not ok, icon=":material/rocket_launch:", width="stretch"):
-        models = [{"name": f"Agent_Rank_{r['rank']} ({result['ticker']})", "rank": r["rank"], "genes": r["genes"],
+    ok = c1.checkbox(f"{len(chosen)}명 배치 · 기존 요원 교체와 AI 장부 초기화에 동의합니다.", key="deploy_ok")
+    if c2.button(f"{len(chosen)}명 배치", type="primary", disabled=not ok, icon=":material/rocket_launch:", width="stretch"):
+        models = [{"name": f"Agent_Rank_{i + 1} ({result['ticker']})", "rank": i + 1, "genes": r["genes"],
                    "ticker": result["ticker"], "trained_at": result["trained_at"],
-                   "train_ret": round(r["train_ret"], 2), "test_ret": round(r["test_ret"], 2)}
-                  for r in result["top"]]
+                   "train_ret": round(r["train_ret"], 2), "test_ret": round(r["test_ret"], 2),
+                   "test_mdd": round(r["test_mdd"], 2), "passed": r["passed"],
+                   "league_ticker": result["ticker"], "league_start": today_kst().isoformat(),
+                   "league_capital": 10_000.0, "league_fee": int(result.get("fee_bps", 10))}
+                  for i, r in enumerate(chosen)]
         try:
             save_models(models)
             save_table("ai_ledger", core.empty_table("ai_ledger"))
             run_league.clear()
-            flash("상위 3명이 실전 리그에 배치되었습니다.", ":material/rocket_launch:")
+            flash(f"{len(chosen)}명이 실전 리그에 배치되었습니다.", ":material/rocket_launch:")
             st.session_state.pop("deploy_ok", None)
             st.rerun()
         except Exception as exc:
