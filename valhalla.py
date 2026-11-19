@@ -531,7 +531,8 @@ def render_rolling(table: pd.DataFrame, summary: pd.DataFrame, key: str) -> None
     for i, n in enumerate(names):
         fig.add_trace(go.Bar(x=table["구간"], y=table[n], name=n, marker_color=SERIES[i % len(SERIES)]))
     base_layout(fig, 300)
-    fig.update_layout(barmode="group", title=dict(text="구간별 수익률(%) — 각 구간을 새 자본으로 따로 매매", font=dict(size=13)))
+    fig.update_layout(barmode="group")
+    st.caption("구간별 수익률(%) — 각 구간을 새 자본으로 따로 매매")
     show_chart(fig, key=key)
     with st.expander("구간별 상세", icon=":material/table:"):
         st.dataframe(table, hide_index=True)
@@ -1201,7 +1202,7 @@ def page_training() -> None:
         fig.add_trace(go.Scatter(x=prog["세대"], y=prog["최고 적합도"], name="최고", line=dict(color=ACCENT, width=2.4)))
         fig.add_trace(go.Scatter(x=prog["세대"], y=prog["평균 적합도"], name="평균", line=dict(color=NEUTRAL, dash="dot")))
         base_layout(fig, 300)
-        fig.update_layout(title=dict(text="세대별 적합도", font=dict(size=13)))
+        st.caption("세대별 적합도")
         show_chart(fig, key="train_curve")
     with right:
         table = top.rename(columns={"rank": "순위", "fitness": "적합도", "train_ret": "학습수익(%)",
