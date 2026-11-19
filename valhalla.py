@@ -23,7 +23,14 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+import importlib
+
 import valhalla_core as core
+
+# Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
+# 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
+if not all(hasattr(core, name) for name in ("clean_ohlcv", "league_run", "rolling_validation", "judge_live")):
+    core = importlib.reload(core)
 
 try:
     from supabase import create_client
