@@ -568,16 +568,51 @@ def _scenario(df: pd.DataFrame) -> Scenario:
 
 
 def evaluate_population(G: np.ndarray, scenarios: list[Scenario], capital: float, fee_rate: float,
-                        risk_penalty: float) -> dict[str, np.ndarray]:
+                        risk_penalty: float, n_real: int = 1) -> dict[str, np.ndarray]:
+    """적합도 = (평균 수익 + 최악 시나리오 수익) / 2 − 낙폭 페널티 × 평균 MDD.
+
+    평균만 보면 한 차트에서 크게 번 요원이 뽑히기 쉬워서, 가장 나빴던 시나리오 성적을 절반 반영합니다.
+    scenarios[0] 은 실제 학습 차트 전체, 앞쪽 n_real 개는 실제 차트(전체·구간), 나머지는 가상 차트입니다.
+    """
     rets, mdds, trades = [], [], []
     for sc in scenarios:
         r = simulate(G, sc.o, sc.h, sc.l, sc.c, sc.f, FEATURE_WARMUP + 1, capital, fee_rate)
         rets.append(r.return_pct)
         mdds.append(r.mdd_pct)
         trades.append(r.n_trades)
-    ret, mdd = np.mean(rets, axis=0), np.mean(mdds, axis=0)
-    return {"fitness": ret - risk_penalty * mdd, "ret": ret, "mdd": mdd,
-            "worst": np.min(rets, axis=0), "trades": np.mean(trades, axis=0)}
+    rets, mdds = np.array(rets), np.array(mdds)
+    ret, mdd, worst = rets.mean(axis=0), mdds.mean(axis=0), rets.min(axis=0)
+    return {"fitness": 0.5 * (ret + worst) - risk_penalty * mdd, "ret": ret, "mdd": mdd, "worst": worst,
+            "real_ret": rets[0], "real_mdd": mdds[0], "synthetic_ret": rets[n_real:].mean(axis=0) if len(rets) > n_real else ret,
+            "trades": np.mean(trades, axis=0)}
+
+
+def build_scenarios(train: pd.DataFrame, n_scenarios: int, mc_days: int, rng: np.random.Generator,
+                    block: int = 10) -> tuple[list[Scenario], int]:
+    """평가용 시나리오: 실제 학습 차트(전체 + 앞/뒤 절반) + 서로 독립된 가상 차트.
+
+    가상 차트는 실제 차트 뒤에 이어 붙이지 않고, 짧은 준비 구간(지표 계산용) 뒤에 학습 기간의
+    하루 단위 움직임을 블록째 재표집해 처음부터 새로 만든 차트입니다.
+    → 모든 시나리오가 같은 실제 상승장을 공유하던 문제(실제 차트를 외우는 과적합)를 막습니다.
+    """
+    scenarios = [_scenario(train)]
+    n = len(train)
+    w = FEATURE_WARMUP + 1
+    if n >= 2 * (w + 60):
+        half = n // 2
+        scenarios.append(_scenario(train.iloc[:half]))
+        scenarios.append(_scenario(train.iloc[half - w:]))
+    n_real = len(scenarios)
+    seed = train.iloc[:w]
+    length = max(int(mc_days), 120)
+    last_close = float(train["Close"].iloc[-1])
+    for path in bootstrap_paths(train, length, max(int(n_scenarios) - 1, 0), rng, block):
+        # 가상 차트는 학습 마지막 종가에서 출발하므로, 준비 구간 마지막 종가 수준으로 옮깁니다 (전략은 % 기준이라 영향 없음)
+        path = path.copy()
+        path[["Open", "High", "Low", "Close"]] *= float(seed["Close"].iloc[-1]) / last_close
+        path.index = pd.bdate_range(seed.index[-1] + pd.Timedelta(days=1), periods=len(path))
+        scenarios.append(_scenario(pd.concat([seed, path])))
+    return scenarios, n_real
 
 
 def run_evolution(history: pd.DataFrame, population: int = 200, generations: int = 15,
@@ -599,9 +634,7 @@ def run_evolution(history: pd.DataFrame, population: int = 200, generations: int
     rng = np.random.default_rng(seed)
     fee = fee_bps / 10_000
     train = hist.iloc[:split]
-    scenarios = [_scenario(train)]
-    for path in bootstrap_paths(train, mc_days, max(n_scenarios - 1, 0), rng):
-        scenarios.append(_scenario(pd.concat([train, path])))
+    scenarios, n_real = build_scenarios(train, n_scenarios, mc_days, rng)
 
     lo, hi = GENE_BOUNDS[:, 0], GENE_BOUNDS[:, 1]
     span = hi - lo
@@ -614,7 +647,7 @@ def run_evolution(history: pd.DataFrame, population: int = 200, generations: int
     progress = []
     scores = None
     for gen in range(int(generations)):
-        scores = evaluate_population(G, scenarios, capital, fee, risk_penalty)
+        scores = evaluate_population(G, scenarios, capital, fee, risk_penalty, n_real)
         order = np.argsort(-scores["fitness"])
         progress.append({"세대": gen + 1, "최고 적합도": float(scores["fitness"][order[0]]),
                          "평균 적합도": float(np.mean(scores["fitness"])),
@@ -650,7 +683,8 @@ def run_evolution(history: pd.DataFrame, population: int = 200, generations: int
     top = []
     for rank, i in enumerate(order):
         top.append({"rank": rank + 1, "genes": [round(float(v), 4) for v in G[i]],
-                    "fitness": float(scores["fitness"][i]), "train_ret": float(scores["ret"][i]),
+                    "fitness": float(scores["fitness"][i]), "train_ret": float(scores["real_ret"][i]),
+                    "train_avg": float(scores["ret"][i]), "synthetic_ret": float(scores["synthetic_ret"][i]),
                     "train_mdd": float(scores["mdd"][i]), "train_worst": float(scores["worst"][i]),
                     "test_ret": float(oos.return_pct[rank]), "test_mdd": float(oos.mdd_pct[rank]),
                     "test_trades": int(oos.n_trades[rank])})
@@ -852,20 +886,24 @@ def rolling_validation(df: pd.DataFrame, genes, names: list[str], window: int = 
 
 # 판정 기준 (화면에도 그대로 표시)
 TRAIN_RULES = ("검증 구간(학습에 안 쓴 기간) 수익 > 0", "기간별 안정성: 수익 구간 비율 ≥ 50%",
-               "학습→검증 성적 하락이 과도하지 않을 것 (학습의 −50%p 이내)")
+               "검증 구간 낙폭(MDD)이 그냥 보유했을 때보다 작을 것")
 LIVE_MIN_DAYS = 20
 
 
-def judge_training(test_ret: float, train_ret: float, positive_ratio: float | None) -> tuple[str, list[str]]:
-    """훈련 결과 판정 → ('pass' | 'fail', 사유 목록)"""
+def judge_training(test_ret: float, train_ret: float, positive_ratio: float | None,
+                   test_mdd: float | None = None, bh_mdd: float | None = None) -> tuple[str, list[str]]:
+    """훈련 결과 판정 → ('pass' | 'fail', 사유 목록). 학습→검증 성적 하락은 참고 경고로만 붙입니다."""
     reasons = []
     if test_ret <= 0:
         reasons.append(f"검증 구간 손실 ({test_ret:+.1f}%)")
     if positive_ratio is not None and positive_ratio < 50:
         reasons.append(f"수익 구간 비율 {positive_ratio:.0f}% < 50%")
-    if train_ret - test_ret > 50:
-        reasons.append(f"과적합 의심 (학습 {train_ret:+.0f}% → 검증 {test_ret:+.0f}%)")
-    return ("fail" if reasons else "pass"), reasons
+    if test_mdd is not None and bh_mdd is not None and test_mdd >= bh_mdd:
+        reasons.append(f"검증 낙폭 {test_mdd:.0f}% ≥ 보유 낙폭 {bh_mdd:.0f}%")
+    verdict = "fail" if reasons else "pass"
+    if train_ret - test_ret > 100:
+        reasons.append(f"참고: 학습 {train_ret:+.0f}% → 검증 {test_ret:+.0f}% (과적합 가능성)")
+    return verdict, reasons
 
 
 def judge_live(live_ret: float, live_mdd: float, bh_ret: float, days: int, test_mdd: float | None) -> tuple[str, str]:

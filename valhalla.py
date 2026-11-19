@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-if not all(hasattr(core, name) for name in ("clean_ohlcv", "league_run", "rolling_validation", "judge_live")):
+if not all(hasattr(core, name) for name in ("clean_ohlcv", "league_run", "rolling_validation", "judge_live", "build_scenarios")):
     core = importlib.reload(core)
 
 try:
@@ -983,7 +983,7 @@ def page_league() -> None:
     section("참전 요원")
     st.dataframe(pd.DataFrame([{
         "순위": m["rank"], "요원": m["name"], "훈련 종목": m.get("ticker", "—"), "훈련일": m.get("trained_at", "—"),
-        "학습 평균수익": pct_text(m.get("train_ret")), "검증 수익": pct_text(m.get("test_ret"))} for m in models]),
+        "학습 수익": pct_text(m.get("train_ret")), "검증 수익": pct_text(m.get("test_ret"))} for m in models]),
         hide_index=True)
 
     section("리그 설정", "매수는 전일 종가 기준 지정가, 매도는 평단 기준 목표가 지정가로 체결을 가정합니다. "
@@ -1148,11 +1148,13 @@ def page_training() -> None:
         n_scen = c[0].slider("평가 시나리오 수", 1, 12, 6, help="실제 차트 1개 + 부트스트랩 가상 미래 (평균으로 평가)")
         mc_days = c[1].slider("가상 미래 길이 (일)", 50, 400, 200, 50)
         fee_bps = c[2].number_input("편도 비용 (bp)", 0, 100, 10)
-        penalty = c[3].slider("낙폭 페널티", 0.0, 2.0, 0.5, 0.1, help="적합도 = 평균수익률 − 페널티 × 평균 MDD")
+        penalty = c[3].slider("낙폭 페널티", 0.0, 2.0, 0.5, 0.1,
+                              help="적합도 = (평균 수익 + 최악 시나리오 수익) ÷ 2 − 페널티 × 평균 MDD. 올리면 낙폭 작은 요원이 뽑힙니다.")
         c = st.columns(4)
         train_ratio = c[0].slider("학습 구간 비율", 0.6, 0.9, 0.8, 0.05, help="나머지 뒤쪽 구간은 검증 전용")
         seed = c[1].number_input("난수 시드", 0, 99_999, 42, help="같은 시드 = 같은 결과 (재현 가능)")
-        include = c[2].toggle("현재 요원을 초기 개체에 포함", value=True)
+        include = c[2].toggle("현재 요원을 초기 개체에 포함", value=False,
+                             help="현재 요원이 검증을 통과하지 못했다면 끄는 것이 좋습니다 (과적합 유전자를 물려받음).")
         submitted = c[3].form_submit_button("훈련 시작", type="primary", icon=":material/play_arrow:", width="stretch")
 
     if submitted:
@@ -1186,7 +1188,8 @@ def page_training() -> None:
     top = pd.DataFrame(result["top"])
     m = st.columns(4)
     m[0].metric("1위 적합도", f"{top['fitness'].iloc[0]:,.2f}", border=True)
-    m[1].metric("1위 학습 평균수익", f"{top['train_ret'].iloc[0]:+.1f}%", border=True)
+    m[1].metric("1위 학습 수익 (실제 차트)", f"{top['train_ret'].iloc[0]:+.1f}%",
+                f"가상 차트 평균 {top['synthetic_ret'].iloc[0]:+.1f}%", delta_color="off", delta_arrow="off", border=True)
     m[2].metric("1위 검증 수익", f"{top['test_ret'].iloc[0]:+.1f}%",
                 f"{top['test_ret'].iloc[0] - result['buy_hold_test_ret']:+.1f}%p vs 보유",
                 delta_color=kr_delta(top["test_ret"].iloc[0] - result["buy_hold_test_ret"]), border=True)
@@ -1206,11 +1209,13 @@ def page_training() -> None:
         show_chart(fig, key="train_curve")
     with right:
         table = top.rename(columns={"rank": "순위", "fitness": "적합도", "train_ret": "학습수익(%)",
+                                    "train_avg": "시나리오평균(%)", "synthetic_ret": "가상차트(%)",
                                     "train_mdd": "학습MDD(%)", "train_worst": "최악시나리오(%)",
                                     "test_ret": "검증수익(%)", "test_mdd": "검증MDD(%)", "test_trades": "검증체결"})
         pct = st.column_config.NumberColumn(format="%+.1f")
         st.dataframe(table.drop(columns=["genes"]), hide_index=True, column_config={
             "적합도": st.column_config.NumberColumn(format="%.2f"), "학습수익(%)": pct, "최악시나리오(%)": pct,
+            "시나리오평균(%)": pct, "가상차트(%)": pct,
             "검증수익(%)": pct, "학습MDD(%)": st.column_config.NumberColumn(format="%.1f"),
             "검증MDD(%)": st.column_config.NumberColumn(format="%.1f")})
         with st.expander("상위 3명 유전자", icon=":material/genetics:"):
@@ -1226,7 +1231,8 @@ def page_training() -> None:
     pos_ratio = dict(zip(r_sum["요원"], r_sum["수익 구간(%)"])) if r_sum is not None and not r_sum.empty else {}
     judged = []
     for r, n in zip(result["top"], names):
-        verdict, reasons = core.judge_training(r["test_ret"], r["train_ret"], pos_ratio.get(n))
+        verdict, reasons = core.judge_training(r["test_ret"], r["train_ret"], pos_ratio.get(n), r.get("test_mdd"),
+                                               result.get("buy_hold_test_mdd"))
         judged.append({**r, "passed": verdict == "pass", "reasons": reasons})
     st.dataframe(pd.DataFrame([{"요원": n, "판정": "✅ 통과" if j["passed"] else "❌ 불통과",
                                 "검증수익(%)": j["test_ret"], "수익 구간(%)": pos_ratio.get(n),
