@@ -173,5 +173,20 @@ def test_lab_techniques_only_on_leveraged_etfs():
         assert len(v) > 50 and v.between(0, 1).all()
     assert abs(lev["rebal50"].dropna().median() - 0.5) < 0.1          # 50:50은 비중 절반 근처
     assert core.player_label("inf_v2_safe").startswith("④")
+    ch = lev["charles"].dropna()
+    assert ch.between(0, 1).all() and set(ch.round(2).unique()) <= {0.0, 0.15, 0.25, 0.35, 0.4, 0.7}
     bt = core.backtest_players(lev, hist["close"])
     assert set(core.TECHNIQUE_PLAYERS) <= set(bt["id"])
+
+
+def test_charles_rules_follow_signal_index():
+    n = 900
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    up = pd.DataFrame({"Close": 100 * np.exp(np.linspace(0, 0.6, n))}, index=idx)      # 잔잔한 상승
+    down = pd.DataFrame({"Close": 100 * np.exp(np.linspace(0, -0.6, n))}, index=idx)   # 꾸준한 하락
+    soxl = pd.DataFrame({"Close": 30 * np.exp(np.linspace(0, 1.8, n))}, index=idx)
+    assert abs(core.charles_exposure(soxl, up).iloc[-1] - 0.70) < 1e-9          # 큰 규칙: 70% 보유(과열 아님)
+    assert core.charles_exposure(soxl, down).iloc[-1] == 0.0                     # 200일선 아래면 쉼
+    # 과열: 평균선보다 25% 넘게 위면 절반(35%)
+    hotc = pd.DataFrame({"Close": 100 * np.exp(np.linspace(0, 3.0, n))}, index=idx)
+    assert abs(core.charles_exposure(soxl, hotc).iloc[-1] - 0.35) < 1e-9

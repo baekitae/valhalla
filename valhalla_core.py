@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-10"
+CORE_VERSION = "2026.11.20-11"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1784,7 +1784,8 @@ def vol_positions(index: pd.DatetimeIndex, daily: pd.DataFrame, window: int = 20
 #  일봉으로 계좌를 굴리고, 매주 금요일 종가 기준 '투자 비중(주식 평가액 ÷ 계좌 총액)'을 비중으로 냄.
 #  분할매수 기법은 레버리지 ETF용이라 3배·2배 ETF에만 적용.
 TECHNIQUE_PLAYERS = {"inf_mine": "① 내 방식 (40분할)", "inf_v2": "② V2형 (별지점)",
-                     "inf_v2_safe": "④ V2+손절+200일선", "rebal50": "⑥ 50:50 리밸런싱"}
+                     "inf_v2_safe": "④ V2+손절+200일선", "rebal50": "⑥ 50:50 리밸런싱",
+                     "charles": "찰스 SOXL 시스템"}
 TECHNIQUE_CATEGORIES = ("3배 ETF", "2배 ETF")
 TECHNIQUE_START = "2016-01-01"
 _FEE = 0.001
@@ -1896,12 +1897,83 @@ def rebalance_exposure(daily: pd.DataFrame, w: float = 0.5, band: float = 0.10, 
     return pd.Series(out, index=df.index, dtype=float)
 
 
-def technique_positions(index: pd.DatetimeIndex, daily: pd.DataFrame) -> pd.DataFrame:
-    """연구소 기법 4개의 주별 비중 (금요일 종가 시점의 투자 비중)."""
+def _wilder_rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn)
+
+
+CHARLES_RULES = {"ma": 200, "band": 2.0, "vol_out": 45.0, "vol_in": 30.0, "hot_trim": 25.0, "hot_back": 12.0,
+                 "cap": 0.70, "fast": 20, "slope": 5, "st_band": 1.0, "st_pct": 0.25, "rsi_len": 14,
+                 "rsi_low": 25.0, "rsi_back": 32.0, "rsi_exit": 55.0, "rb_max": 10, "rb_stop": 15.0,
+                 "rb_pct": 0.15, "vol_len": 20}
+
+
+def charles_exposure(daily: pd.DataFrame, sig_daily: pd.DataFrame | None, rules: dict | None = None) -> pd.Series:
+    """찰스 SOXL 시스템 v5 (TradingView 공개 스크립트) 이식. 반환: 날짜별 보유 비중(신호 다음 날 종가 체결).
+    큰 규칙: 신호 지수가 200일선 +2% 위·변동성 낮으면 70% 보유, 과열(+25%)이면 35%, 깨지면 0.
+    큰 규칙이 쉴 때만 단기 1(20일선 위·상승 → 25%)과 단기 2(RSI 25 아래→32 회복 → 15%, 최대 10일)."""
+    th = {**CHARLES_RULES, **(rules or {})}
+    close = daily["Close"].astype(float).dropna()
+    sig = (sig_daily["Close"].astype(float) if sig_daily is not None and not sig_daily.empty else close)
+    sig = sig.reindex(close.index.union(sig.index)).ffill().reindex(close.index)
+    s_ma = sig.rolling(th["ma"]).mean()
+    dist = (sig / s_ma - 1) * 100
+    s_vol = np.log(sig / sig.shift(1)).rolling(th["vol_len"]).std(ddof=0) * np.sqrt(252) * 100
+    s_fast = sig.rolling(th["fast"]).mean()
+    s_fast_prev = s_fast.shift(th["slope"])
+    f_dist = (sig / s_fast - 1) * 100
+    rsi = _wilder_rsi(close, th["rsi_len"])
+    cross_up = (rsi > th["rsi_back"]) & (rsi.shift(1) <= th["rsi_back"])
+    rsi_low5 = rsi.rolling(5).min().shift(1)
+    trend_on = vol_off = hot = st_on = rb_on = False
+    rb_bars, rb_entry, raw = 0, np.nan, []
+    for i in range(len(close)):
+        d, v, fd, px = dist.iloc[i], s_vol.iloc[i], f_dist.iloc[i], close.iloc[i]
+        if pd.notna(d):
+            if d > th["band"]:
+                trend_on = True
+            if d < -th["band"]:
+                trend_on = False
+            if d > th["hot_trim"]:
+                hot = True
+            if d < th["hot_back"]:
+                hot = False
+        if pd.notna(v):
+            if v > th["vol_out"]:
+                vol_off = True
+            if v < th["vol_in"]:
+                vol_off = False
+        main = 0.0 if (not trend_on or vol_off) else (0.5 if hot else 1.0)
+        main *= th["cap"]
+        if pd.notna(fd) and pd.notna(s_fast_prev.iloc[i]):
+            if fd > th["st_band"] and s_fast.iloc[i] > s_fast_prev.iloc[i]:
+                st_on = True
+            if fd < -th["st_band"]:
+                st_on = False
+        else:
+            st_on = False
+        trig = bool(cross_up.iloc[i]) and pd.notna(rsi_low5.iloc[i]) and rsi_low5.iloc[i] < th["rsi_low"]
+        if not rb_on and trig:
+            rb_on, rb_bars, rb_entry = True, 0, px
+        elif rb_on:
+            rb_bars += 1
+            if rsi.iloc[i] > th["rsi_exit"] or rb_bars >= th["rb_max"] or px <= rb_entry * (1 - th["rb_stop"] / 100):
+                rb_on = False
+        sub = ((th["st_pct"] if st_on else 0.0) + (th["rb_pct"] if rb_on else 0.0)) if main == 0 else 0.0
+        raw.append(min(1.0, main + sub))
+    return pd.Series(raw, index=close.index).shift(1).fillna(0.0)   # 신호 다음 날 종가 체결
+
+
+def technique_positions(index: pd.DatetimeIndex, daily: pd.DataFrame,
+                        ref_daily: pd.DataFrame | None = None) -> pd.DataFrame:
+    """연구소 기법 4개 + 찰스 시스템의 주별 비중 (금요일 종가 시점의 투자 비중)."""
     series = {"inf_mine": infinite_exposure(daily),
               "inf_v2": infinite_exposure(daily, star=True),
               "inf_v2_safe": infinite_exposure(daily, star=True, quarter_cut=True, trend_filter=True),
-              "rebal50": rebalance_exposure(daily)}
+              "rebal50": rebalance_exposure(daily),
+              "charles": charles_exposure(daily, ref_daily)}
     return pd.DataFrame({k: v.resample("W-FRI").last().reindex(index).round(4) for k, v in series.items()},
                         index=index)
 
@@ -1916,7 +1988,7 @@ def player_positions(hist: pd.DataFrame, daily: pd.DataFrame, ref_daily: pd.Data
     out["voltarget"] = vol_positions(hist.index, daily)
     out["hold"] = 1.0
     if ticker is not None and category_of(ticker) in TECHNIQUE_CATEGORIES:
-        out = out.join(technique_positions(hist.index, daily))
+        out = out.join(technique_positions(hist.index, daily, ref_daily))
     return out
 
 

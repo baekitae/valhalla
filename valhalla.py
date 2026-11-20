@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-10"
+REQUIRED_CORE_VERSION = "2026.11.20-11"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1882,7 +1882,7 @@ def render_arena(ticker: str, partner: str) -> None:
                                          key="arena_scope") or "AI 위원회 10개 종목"
             tick_scope = scopes[scope]
             table = core.arena_table(pos, tick_scope)
-            st.caption("① 내 방식 · ② V2형 · ④ V2+손절+200일선 · ⑥ 50:50은 매매기법 연구소 백테스트와 같은 규칙으로 "
+            st.caption("① 내 방식 · ② V2형 · ④ V2+손절+200일선 · ⑥ 50:50(매매기법 연구소와 같은 규칙)과 찰스 SOXL 시스템(TradingView 공개 스크립트)은 "
                        "레버리지 ETF에서만 뜁니다. 같은 조건끼리 비교하려면 '레버리지 ETF' 범위를 보세요. "
                        "챔피언 도전 판정은 항상 같은 종목·같은 주끼리만 맞대어 계산합니다.")
             if table.empty:
