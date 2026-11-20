@@ -823,6 +823,7 @@ def page_dashboard() -> None:
                     if model.get("trained_at"):
                         st.caption(f"{model.get('ticker', '')} · {model['trained_at']} 훈련")
         render_what_if(hist, price, pos, models[0], last, budget_usd, resistance)
+    render_breakeven(ticker, pos.avg if pos.qty else None)
     st.markdown('<div class="vh-foot">모든 수치는 과거 데이터 기반 참고 지표이며 미래 수익을 보장하지 않습니다.</div>',
                 unsafe_allow_html=True)
 
@@ -858,8 +859,6 @@ def render_what_if(hist: pd.DataFrame, price: float, pos: core.Position, model: 
         else:
             st.success(f"최대 매물대 {md_usd(resistance)} 도달 전에 빠져나오는 보수적인 타점입니다.",
                        icon=":material/verified:")
-
-    render_breakeven(ticker, pos.avg if pos.qty else None)
 
 
 BREAKEVEN_INDEX = {"SOXL": "^SOX", "USD": "^SOX", "SOXS": "^SOX"}
