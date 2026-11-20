@@ -1713,16 +1713,19 @@ TITAN_APP_URL = "https://titanbot.streamlit.app"
 
 
 @st.cache_resource(show_spinner=False)
+def _titan_engine(uri: str):
+    from sqlalchemy import create_engine
+    return create_engine(uri, pool_pre_ping=True, pool_recycle=1800)
+
+
 def get_titan_engine():
+    """Secrets를 매번 읽음 (연결 정보가 없던 상태가 캐시에 남지 않도록)."""
     try:
         uri = st.secrets.get("TITAN_DB_URI")
     except Exception:
         uri = None
     uri = uri or os.environ.get("TITAN_DB_URI")
-    if not uri:
-        return None
-    from sqlalchemy import create_engine
-    return create_engine(uri, pool_pre_ping=True, pool_recycle=1800)
+    return _titan_engine(uri) if uri else None
 
 
 @st.cache_data(ttl=600, show_spinner=False)
