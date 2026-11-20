@@ -944,3 +944,233 @@ def highlight_keywords(text: str) -> str:
     safe = html.escape(text or "")
     safe = _POS_RE.sub(r'<span class="kw-pos">\1</span>', safe)
     return _NEG_RE.sub(r'<span class="kw-neg">\1</span>', safe)
+
+
+# ==========================================================================
+# 10. 반등 신호 관제 (주봉 체크리스트 · 거시 신호 · 점수별 과거 확률 · 예측 장부)
+#   - 모든 신호는 '그 주 금요일까지의 데이터'만 사용합니다 (미래 데이터 누수 없음).
+#   - 확률은 공식이 아니라 과거에 같은 점수가 나왔던 주의 실제 결과 비율입니다.
+#   - 최근 2년은 학습에 쓰지 않는 검증 구간으로 따로 보여 줍니다 (과최적화 점검).
+# ==========================================================================
+CHART_SIGNALS = [
+    ("low_hold", "저점 유지", "이번 주 저가가 직전 8주 최저가보다 높음 (신저가 갱신 멈춤)"),
+    ("weekly_up", "주봉 상승", "이번 주 종가가 지난주 종가보다 높음"),
+    ("macd_up", "MACD 개선", "주봉 MACD 히스토그램이 지난주보다 커짐 (하락 힘 약화)"),
+    ("rsi_up", "RSI 상승", "주봉 RSI(14)가 지난주보다 높음"),
+    ("above_ma20d", "20일선 회복", "금요일 종가가 일봉 20일 이동평균선 위"),
+    ("soxx_up", "1배 지수 동행", "SOXX(레버리지 없는 반도체 ETF)도 이번 주 상승"),
+]
+MACRO_SIGNALS = [
+    ("rate_down", "금리 하락", "미국 10년물 금리가 4주 전보다 낮음", "^TNX"),
+    ("dollar_down", "달러 약세", "달러 인덱스가 4주 전보다 낮음", "DX-Y.NYB"),
+    ("oil_calm", "유가 안정", "WTI 유가 4주 상승률이 +10% 미만", "CL=F"),
+    ("fear_easing", "공포 진정", "VIX가 이번 주 하락했고 8주 고점보다 15% 이상 낮음", "^VIX"),
+]
+MACRO_TICKERS_SIGNAL = {key: ticker for key, _, _, ticker in MACRO_SIGNALS}
+HORIZONS = (4, 12)          # 주 단위 예측 기간
+TEST_WEEKS = 104            # 최근 2년 = 검증 구간
+SHRINK_K = 10               # 표본이 적은 점수는 전체 평균 쪽으로 당겨 과신을 막음
+
+
+def signal_on(value) -> bool:
+    return bool(pd.notna(value) and bool(value))
+
+
+def to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
+    """일봉 OHLCV → 주봉 (금요일 기준 라벨)."""
+    w = daily.resample("W-FRI").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last",
+                                     "Volume": "sum"})
+    return w.dropna(subset=["Close"])
+
+
+def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+    macd = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    return macd - macd.ewm(span=signal, adjust=False).mean()
+
+
+def chart_signal_table(daily: pd.DataFrame, partner_daily: pd.DataFrame | None = None) -> pd.DataFrame:
+    """주별 차트 신호(True/False)와 점수. partner_daily 는 SOXX 같은 1배 지수."""
+    w = to_weekly(daily)
+    close = w["Close"]
+    out = pd.DataFrame(index=w.index)
+    out["close"] = close
+    prior_low = w["Low"].shift(1).rolling(8, min_periods=8).min()
+    out["low_hold"] = (w["Low"] > prior_low).where(prior_low.notna())
+    out["weekly_up"] = (close > close.shift(1)).where(close.shift(1).notna())
+    hist = macd_hist(close)
+    out["macd_up"] = (hist > hist.shift(1)).where(close.index >= close.index[min(len(close) - 1, 34)])
+    rsi = wilder_rsi(close)
+    out["rsi_up"] = (rsi > rsi.shift(1)).where(rsi.shift(1).notna())
+    ma20 = daily["Close"].rolling(20).mean()
+    above = (daily["Close"] > ma20).where(ma20.notna())
+    out["above_ma20d"] = above.resample("W-FRI").last().reindex(out.index)
+    if partner_daily is not None and not partner_daily.empty:
+        pc = to_weekly(partner_daily)["Close"].reindex(out.index)
+        out["soxx_up"] = (pc > pc.shift(1)).where(pc.notna() & pc.shift(1).notna())
+    else:
+        out["soxx_up"] = np.nan
+    keys = [k for k, _, _ in CHART_SIGNALS]
+    out["chart_score"] = out[keys].apply(lambda r: int(sum(bool(v) for v in r if pd.notna(v))), axis=1)
+    out["chart_valid"] = out[keys].notna().sum(axis=1)
+    out["weekly_rsi"] = rsi
+    out["macd_hist"] = hist
+    for h in HORIZONS:
+        out[f"ret_{h}w"] = (close.shift(-h) / close - 1) * 100
+    return out
+
+
+def macro_signal_table(macro_daily: dict[str, pd.DataFrame | None], index: pd.DatetimeIndex) -> pd.DataFrame:
+    """주별 거시 신호. macro_daily = {ticker: 일봉 DataFrame}. 없는 지표는 NaN."""
+    out = pd.DataFrame(index=index)
+
+    def weekly_close(ticker):
+        df = macro_daily.get(ticker)
+        if df is None or df.empty:
+            return None
+        return df["Close"].resample("W-FRI").last().reindex(index).ffill(limit=1)
+
+    tnx, dxy, oil, vix = (weekly_close(MACRO_TICKERS_SIGNAL[k]) for k in
+                          ("rate_down", "dollar_down", "oil_calm", "fear_easing"))
+    out["rate_down"] = (tnx < tnx.shift(4)).where(tnx.shift(4).notna()) if tnx is not None else np.nan
+    out["dollar_down"] = (dxy < dxy.shift(4)).where(dxy.shift(4).notna()) if dxy is not None else np.nan
+    if oil is not None:
+        chg = oil / oil.shift(4) - 1
+        out["oil_calm"] = (chg < 0.10).where(chg.notna())
+    else:
+        out["oil_calm"] = np.nan
+    if vix is not None:
+        peak = vix.rolling(8, min_periods=8).max()
+        out["fear_easing"] = ((vix < vix.shift(1)) & (vix <= peak * 0.85)).where(peak.notna() & vix.shift(1).notna())
+    else:
+        out["fear_easing"] = np.nan
+    keys = [k for k, _, _, _ in MACRO_SIGNALS]
+    out["macro_score"] = out[keys].apply(lambda r: int(sum(bool(v) for v in r if pd.notna(v))), axis=1)
+    out["macro_valid"] = out[keys].notna().sum(axis=1)
+    return out
+
+
+def build_signal_history(daily: pd.DataFrame, partner_daily: pd.DataFrame | None,
+                         macro_daily: dict[str, pd.DataFrame | None] | None) -> pd.DataFrame:
+    chart = chart_signal_table(daily, partner_daily)
+    macro = macro_signal_table(macro_daily or {}, chart.index)
+    return chart.join(macro)
+
+
+def _bucket_stats(frame: pd.DataFrame, score_col: str, horizon: int, max_score: int) -> pd.DataFrame:
+    col = f"ret_{horizon}w"
+    data = frame.dropna(subset=[col])
+    base = float((data[col] > 0).mean() * 100) if len(data) else float("nan")
+    rows = []
+    for s in range(max_score + 1):
+        g = data.loc[data[score_col] == s, col]
+        rows.append({"점수": s, "표본(주)": int(len(g)),
+                     "상승 확률(%)": round(float((g > 0).mean() * 100), 1) if len(g) else None,
+                     "평균 수익(%)": round(float(g.mean()), 1) if len(g) else None,
+                     "중앙값(%)": round(float(g.median()), 1) if len(g) else None})
+    table = pd.DataFrame(rows)
+    table.attrs["base"] = base
+    table.attrs["n"] = int(len(data))
+    return table
+
+
+def score_backtest(history: pd.DataFrame, score_col: str = "chart_score", min_valid: int | None = None,
+                   test_weeks: int = TEST_WEEKS) -> dict:
+    """점수별 과거 성적. 학습 구간(최근 2년 제외)과 검증 구간(최근 2년)을 나눠 계산."""
+    max_score = len(CHART_SIGNALS) if score_col == "chart_score" else len(MACRO_SIGNALS)
+    valid_col = "chart_valid" if score_col == "chart_score" else "macro_valid"
+    need = max_score - 1 if min_valid is None else min_valid   # 신호가 대부분 계산된 주만 사용
+    h = history[history[valid_col] >= need]
+    cut = h.index[-1] - pd.Timedelta(weeks=test_weeks) if len(h) else None
+    train = h[h.index <= cut] if cut is not None else h
+    test = h[h.index > cut] if cut is not None else h.iloc[0:0]
+    out = {"cutoff": cut, "start": h.index[0] if len(h) else None}
+    for hz in HORIZONS:
+        out[f"train_{hz}"] = _bucket_stats(train, score_col, hz, max_score)
+        out[f"test_{hz}"] = _bucket_stats(test, score_col, hz, max_score)
+    return out
+
+
+def shrunk_probability(table: pd.DataFrame, score: int, k: float = SHRINK_K) -> tuple[float, int]:
+    """해당 점수의 상승 확률 (표본이 적으면 전체 평균 쪽으로 보정). (확률%, 표본 수)"""
+    base = table.attrs.get("base", float("nan"))
+    row = table[table["점수"] == score]
+    if row.empty or not np.isfinite(base):
+        return base, 0
+    n = int(row["표본(주)"].iloc[0])
+    p = row["상승 확률(%)"].iloc[0]
+    if n == 0 or p is None or pd.isna(p):
+        return float(base), 0
+    return float((p * n + base * k) / (n + k)), n
+
+
+def complete_weeks(history: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
+    """asof(미국 날짜) 기준으로 마감된 주만 남김."""
+    return history[history.index <= pd.Timestamp(asof).normalize()]
+
+
+def make_prediction(history: pd.DataFrame, ticker: str = "SOXL") -> dict | None:
+    """가장 최근 '마감된' 주의 신호로 예측 1건 생성 (과거 확률표는 그 주 이전 데이터만 사용)."""
+    if history is None or history.empty:
+        return None
+    last = history.iloc[-1]
+    week = history.index[-1]
+    n_rows = len(history)
+    pred = {"week": week.strftime("%Y-%m-%d"), "ticker": ticker, "close": round(float(last["close"]), 4),
+            "chart_score": int(last["chart_score"]), "macro_score": int(last["macro_score"]),
+            "signals": ",".join(lbl for key, lbl, _ in CHART_SIGNALS if signal_on(last.get(key))),
+            "macro_signals": ",".join(lbl for key, lbl, _, _ in MACRO_SIGNALS if signal_on(last.get(key)))}
+    for hz in HORIZONS:
+        # 예측 시점에 이미 결과가 확정된 주만 사용 (j + hz <= 예측 주) → 미래 정보 누수 방지
+        past = history.iloc[: max(n_rows - hz, 0)]
+        table = _bucket_stats(past[past["chart_valid"] >= len(CHART_SIGNALS) - 1], "chart_score", hz,
+                              len(CHART_SIGNALS))
+        p, n = shrunk_probability(table, pred["chart_score"])
+        pred[f"p_up_{hz}w"] = round(p, 1) if np.isfinite(p) else None
+        pred[f"base_{hz}w"] = round(table.attrs["base"], 1) if np.isfinite(table.attrs["base"]) else None
+        pred[f"n_{hz}w"] = n
+    return pred
+
+
+def grade_predictions(ledger: pd.DataFrame, weekly_close: pd.Series) -> pd.DataFrame:
+    """예측 장부에 실제 결과(4·12주 뒤 수익률)를 채움. 기간이 안 지난 건 비워 둠."""
+    if ledger is None or ledger.empty:
+        return ledger
+    out = ledger.copy()
+    wc = weekly_close.dropna()
+    for i, row in out.iterrows():
+        week = pd.Timestamp(row["week"])
+        if week not in wc.index:
+            continue
+        pos = wc.index.get_loc(week)
+        for hz in HORIZONS:
+            col = f"ret_{hz}w"
+            if col in out.columns and pd.notna(row.get(col)):
+                continue
+            if pos + hz < len(wc):
+                out.at[i, col] = round(float((wc.iloc[pos + hz] / wc.iloc[pos] - 1) * 100), 2)
+    return out
+
+
+def calibration(ledger: pd.DataFrame, horizon: int = 4) -> tuple[pd.DataFrame, dict]:
+    """'AI가 60%라고 한 예측이 실제로 60% 맞았나' 표 + 요약(브라이어 점수 vs 기준선)."""
+    pcol, rcol, bcol = f"p_up_{horizon}w", f"ret_{horizon}w", f"base_{horizon}w"
+    if ledger is None or ledger.empty or rcol not in ledger:
+        return pd.DataFrame(), {}
+    d = ledger.dropna(subset=[pcol, rcol]).copy()
+    if d.empty:
+        return pd.DataFrame(), {"n": 0}
+    d["hit"] = (d[rcol] > 0).astype(float)
+    bins = [0, 40, 50, 60, 70, 101]
+    labels = ["40% 미만", "40~50%", "50~60%", "60~70%", "70% 이상"]
+    d["구간"] = pd.cut(d[pcol], bins=bins, labels=labels, right=False)
+    table = (d.groupby("구간", observed=False)
+               .agg(예측수=("hit", "size"), 예측확률평균=(pcol, "mean"), 실제상승비율=("hit", "mean"))
+               .reset_index())
+    table["예측확률평균"] = table["예측확률평균"].round(1)
+    table["실제상승비율"] = (table["실제상승비율"] * 100).round(1)
+    brier = float(((d[pcol] / 100 - d["hit"]) ** 2).mean())
+    base = d[bcol].fillna(d[pcol]) / 100 if bcol in d else pd.Series(d["hit"].mean(), index=d.index)
+    brier_base = float(((base - d["hit"]) ** 2).mean())
+    direction_hit = float(((d[pcol] >= 50) == (d["hit"] == 1)).mean() * 100)
+    return table, {"n": int(len(d)), "brier": brier, "brier_base": brier_base,
+                   "direction_hit": direction_hit, "up_rate": float(d["hit"].mean() * 100)}

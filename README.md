@@ -4,9 +4,10 @@
 
 | 파일 | 역할 |
 |---|---|
-| `valhalla.py` | Streamlit 화면 (6개 페이지) · 저장소 · 시세 조회 |
+| `valhalla.py` | Streamlit 화면 (7개 페이지) · 저장소 · 시세 조회 |
 | `valhalla_core.py` | 계산 로직 (평단·손익, 키움 파서, 지표, AI 엔진, 백테스트, 유전 알고리즘, 리그, 검증) |
 | `jobs/daily_league.py` | 리그 자동 실행 스크립트 (GitHub Actions) |
+| `jobs/weekly_signals.py` | 신호 관제 주간 예측 기록·채점 (GitHub Actions, KST 토 07:20) |
 | `.github/workflows/daily_league.yml` | 매일 KST 화~토 07:10 자동 실행 |
 | `.streamlit/config.toml` | 다크 테마 |
 | `requirements.txt` | 배포용 패키지 |
@@ -81,3 +82,31 @@ python -m pytest -q tests
     - ✅ 정상: 보유(Buy & Hold) 대비 −10%p 이내
     - ⚠️ 주의: 그 밖의 경우
     - ❌ 교체 권고: 손실 중이면서 낙폭이 허용치(훈련 검증 MDD의 1.5배, 최소 30%)를 넘은 경우
+
+## 신호 관제 (반등 신호 점수판 · 예측 장부)
+
+- **차트 신호 6개 (주봉):** 저점 유지, 주봉 상승, MACD 개선, RSI 상승, 20일선 회복, 1배 지수(SOXX) 동행
+- **거시 신호 4개:** 10년물 금리 하락, 달러 약세, 유가 안정, VIX 진정
+- **확률:** 과거에 같은 점수가 나왔던 주의 4·12주 뒤 실제 상승 비율. 표본이 적으면 평소 확률 쪽으로 보정합니다.
+- **과최적화 점검:** 최근 2년은 확률 계산에 쓰지 않는 검증 구간으로 따로 보여 줍니다.
+- **예측 장부:** 매주 토요일 아침 자동으로 마감된 주의 예측을 남기고(같은 주는 다시 쓰지 않음), 기간이 지나면 실제 수익률로 채점합니다. 화면에서 확률 정확도(브라이어 점수)를 '평소 확률'과 비교합니다.
+
+### 처음 한 번: Supabase 테이블 만들기 (SQL Editor)
+
+```sql
+create table if not exists valhalla_predictions (
+  id bigserial primary key,
+  week date not null,
+  ticker text not null default 'SOXL',
+  created_at timestamptz default now(),
+  close double precision, chart_score int, macro_score int,
+  signals text, macro_signals text,
+  p_up_4w double precision, base_4w double precision, n_4w int,
+  p_up_12w double precision, base_12w double precision, n_12w int,
+  ret_4w double precision, ret_12w double precision,
+  unique (week, ticker)
+);
+```
+
+다른 테이블에 RLS 정책을 쓰고 있다면 이 테이블에도 같은 정책을 추가하세요.
+대상 종목은 Actions 변수 없이 기본 `SOXL:SOXX`이며, 바꾸려면 워크플로의 `SIGNAL_TICKERS` 환경변수(예: `SOXL:SOXX,TQQQ:QQQ`)를 추가합니다.

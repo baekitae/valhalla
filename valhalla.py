@@ -29,7 +29,8 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-if not all(hasattr(core, name) for name in ("clean_ohlcv", "league_run", "rolling_validation", "judge_live", "build_scenarios")):
+if not all(hasattr(core, name) for name in ("clean_ohlcv", "league_run", "rolling_validation", "judge_live", "build_scenarios",
+                                           "build_signal_history")):
     core = importlib.reload(core)
 
 try:
@@ -1468,6 +1469,244 @@ def page_validation() -> None:
 
 
 # ==========================================================================
+# 페이지: 신호 관제 (반등 신호 점수판 · 과거 확률 · 예측 장부)
+# ==========================================================================
+PRED_TABLE = "valhalla_predictions"
+PRED_FILE = BASE_DIR / "predictions.csv"
+PRED_COLUMNS = ["week", "ticker", "close", "chart_score", "macro_score", "signals", "macro_signals",
+                "p_up_4w", "base_4w", "n_4w", "p_up_12w", "base_12w", "n_12w", "ret_4w", "ret_12w"]
+PRED_SQL = f"""create table if not exists {PRED_TABLE} (
+  id bigserial primary key,
+  week date not null,
+  ticker text not null default 'SOXL',
+  created_at timestamptz default now(),
+  close double precision, chart_score int, macro_score int,
+  signals text, macro_signals text,
+  p_up_4w double precision, base_4w double precision, n_4w int,
+  p_up_12w double precision, base_12w double precision, n_12w int,
+  ret_4w double precision, ret_12w double precision,
+  unique (week, ticker)
+);"""
+ET = ZoneInfo("America/New_York")
+
+
+def us_asof() -> pd.Timestamp:
+    """미국 정규장이 마감된 마지막 날짜 (주봉 마감 판정용)."""
+    now = dt.datetime.now(ET)
+    day = pd.Timestamp(now.date())
+    return day if now.hour >= 16 else day - pd.Timedelta(days=1)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_signal_history(ticker: str, partner: str) -> pd.DataFrame | None:
+    daily = load_long(ticker, "max", True)
+    if daily is None or len(daily) < 300:
+        return None
+    partner_df = load_long(partner, "max", True) if partner else None
+    macro = {t: load_long(t, "max", False) for t in core.MACRO_TICKERS_SIGNAL.values()}
+    return core.build_signal_history(daily, partner_df, macro)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_predictions(backend_name: str) -> tuple[pd.DataFrame, str | None]:
+    """(장부, 오류 메시지). Supabase 테이블이 없으면 오류 메시지를 돌려줌."""
+    try:
+        if backend_name == "supabase":
+            rows = get_supabase().table(PRED_TABLE).select("*").order("week").execute().data or []
+            df = pd.DataFrame(rows)
+        else:
+            df = pd.read_csv(PRED_FILE) if PRED_FILE.exists() else pd.DataFrame()
+    except Exception as exc:
+        LOGGER.warning("예측 장부 조회 실패: %s", exc)
+        return pd.DataFrame(columns=PRED_COLUMNS), str(exc)
+    for col in PRED_COLUMNS:
+        if col not in df:
+            df[col] = np.nan
+    return df[PRED_COLUMNS], None
+
+
+def save_prediction(pred: dict) -> None:
+    row = {k: pred.get(k) for k in PRED_COLUMNS if k in pred}
+    if backend() == "supabase":
+        get_supabase().table(PRED_TABLE).upsert(row, on_conflict="week,ticker").execute()
+    else:
+        df, _ = load_predictions("local")
+        df = df[~((df["week"].astype(str) == row["week"]) & (df["ticker"] == row["ticker"]))]
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        _atomic_write(PRED_FILE, df.to_csv(index=False))
+    load_predictions.clear()
+
+
+def _signal_rows(last: pd.Series) -> pd.DataFrame:
+    rows = []
+    for key, label, desc in core.CHART_SIGNALS:
+        v = last.get(key)
+        rows.append({"구분": "차트", "신호": label, "상태": "—" if pd.isna(v) else ("✅ 켜짐" if v else "⬜ 꺼짐"),
+                     "기준": desc})
+    for key, label, desc, ticker in core.MACRO_SIGNALS:
+        v = last.get(key)
+        rows.append({"구분": "거시", "신호": label, "상태": "—" if pd.isna(v) else ("✅ 켜짐" if v else "⬜ 꺼짐"),
+                     "기준": f"{desc} ({ticker})"})
+    return pd.DataFrame(rows)
+
+
+def _streak(history: pd.DataFrame, threshold: int = 3) -> int:
+    n = 0
+    for score in history["chart_score"].iloc[::-1]:
+        if score >= threshold:
+            n += 1
+        else:
+            break
+    return n
+
+
+def page_signals() -> None:
+    page_header("SIGNAL ROOM", "신호 관제",
+                "반등 신호 점수판 · 과거 같은 점수의 실제 결과 · 매주 남기는 예측과 채점",
+                [("주봉 기준", ACCENT), ("확률 = 과거 실제 비율", GOLD)])
+    c = st.columns([1, 1, 3], vertical_alignment="bottom")
+    ticker = c[0].text_input("종목", "SOXL", key="sig_ticker").upper().strip()
+    partner = c[1].text_input("1배 비교 지수", "SOXX", key="sig_partner").upper().strip()
+    with st.spinner("10년 이상 주봉 데이터로 신호를 계산하는 중…"):
+        hist = load_signal_history(ticker, partner)
+    if hist is None or hist.empty:
+        st.error("가격 데이터를 불러오지 못했습니다. 잠시 뒤 다시 시도하세요.", icon=":material/cloud_off:")
+        return
+
+    asof = us_asof()
+    done = core.complete_weeks(hist, asof)
+    partial = len(done) < len(hist)
+    last = hist.iloc[-1]
+    week_label = hist.index[-1].strftime("%Y-%m-%d")
+    bt = core.score_backtest(done)
+    n_chart, n_macro = len(core.CHART_SIGNALS), len(core.MACRO_SIGNALS)
+
+    section(f"이번 주 점수판 · {week_label} 주" + (" (진행 중)" if partial else " (마감)"),
+            "진행 중인 주는 금요일 종가가 나오기 전이라 점수가 바뀔 수 있습니다. 판단은 마감된 주봉으로 하세요.")
+    m = st.columns(4)
+    m[0].metric("차트 신호", f"{int(last['chart_score'])} / {n_chart}", border=True)
+    m[1].metric("거시 신호", f"{int(last['macro_score'])} / {n_macro}", border=True)
+    done_score = int(done["chart_score"].iloc[-1]) if len(done) else int(last["chart_score"])
+    for i, hz in enumerate(core.HORIZONS):
+        p, n = core.shrunk_probability(bt[f"train_{hz}"], done_score)
+        base = bt[f"train_{hz}"].attrs.get("base", float("nan"))
+        if np.isfinite(p):
+            m[2 + i].metric(f"{hz}주 뒤 상승 확률", f"{p:.0f}%", f"{p - base:+.0f}%p vs 평소 {base:.0f}%",
+                            delta_color=kr_delta(p - base), border=True,
+                            help=f"마감된 주 점수({done_score}점)와 같은 점수였던 과거 {n}주의 실제 결과 (표본 보정 포함)")
+        else:
+            m[2 + i].metric(f"{hz}주 뒤 상승 확률", "—", border=True)
+
+    streak = _streak(done)
+    if streak >= 2:
+        st.success(f"마감된 주봉 기준으로 차트 신호 3점 이상이 {streak}주 연속입니다. 반등 가능성이 높아진 구간이에요.",
+                   icon=":material/trending_up:")
+    elif streak == 1:
+        st.info("마감된 주봉 기준으로 차트 신호 3점 이상이 1주 나왔습니다. 다음 주에도 이어지는지 확인하세요.",
+                icon=":material/hourglass_top:")
+    else:
+        st.warning("마감된 주봉 기준으로 아직 반등 신호가 모이지 않았습니다 (3점 미만).", icon=":material/trending_down:")
+
+    st.dataframe(_signal_rows(last), hide_index=True, width="stretch",
+                 column_config={"기준": st.column_config.TextColumn(width="large")})
+
+    recent = hist.tail(52)
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    colors = [UP if s >= 3 else NEUTRAL for s in recent["chart_score"]]
+    fig.add_trace(go.Bar(x=recent.index, y=recent["chart_score"], name="차트 신호 점수", marker_color=colors,
+                         opacity=.75), secondary_y=False)
+    fig.add_trace(go.Scatter(x=recent.index, y=recent["close"], name=f"{ticker} 주봉 종가",
+                             line=dict(color=GOLD, width=2)), secondary_y=True)
+    fig.add_hline(y=3, line=dict(color="rgba(240,68,82,.5)", dash="dot", width=1), secondary_y=False)
+    base_layout(fig, 320)
+    fig.update_yaxes(range=[0, n_chart], dtick=1, title_text="점수", secondary_y=False)
+    fig.update_yaxes(type="log", title_text="가격", secondary_y=True, showgrid=False)
+    show_chart(fig, key="sig_trend")
+
+    section("점수별 과거 성적", f"{bt['start']:%Y-%m} ~ {bt['cutoff']:%Y-%m}은 학습 구간, 그 뒤 최근 2년은 확률 계산에 쓰지 않은 "
+                         "검증 구간입니다. 두 구간의 방향이 비슷해야 믿을 만한 신호예요.")
+    tabs = st.tabs([f"{hz}주 뒤" for hz in core.HORIZONS] + ["거시 점수별"])
+    fmt = {"상승 확률(%)": st.column_config.NumberColumn(format="%.1f%%"),
+           "평균 수익(%)": st.column_config.NumberColumn(format="%+.1f%%"),
+           "중앙값(%)": st.column_config.NumberColumn(format="%+.1f%%")}
+    for tab, hz in zip(tabs, core.HORIZONS):
+        with tab:
+            a, b = st.columns(2)
+            for col, key, name in ((a, f"train_{hz}", "학습 구간"), (b, f"test_{hz}", "검증 구간 (최근 2년)")):
+                table = bt[key]
+                col.markdown(f"**{name}** · 평소 상승 확률 {table.attrs['base']:.1f}% · {table.attrs['n']}주")
+                col.dataframe(table, hide_index=True, width="stretch", column_config=fmt)
+    with tabs[-1]:
+        mbt = core.score_backtest(done, "macro_score")
+        a, b = st.columns(2)
+        for col, key, name in ((a, "train_4", "학습 구간 · 4주 뒤"), (b, "test_4", "검증 구간 · 4주 뒤")):
+            table = mbt[key]
+            col.markdown(f"**{name}** · 평소 {table.attrs['base']:.1f}%")
+            col.dataframe(table, hide_index=True, width="stretch", column_config=fmt)
+
+    section("예측 장부", "매주 토요일 아침 자동으로 그 주의 예측을 남기고, 4·12주가 지나면 실제 결과로 채점합니다. "
+                     "기록된 예측은 고치지 않습니다.")
+    ledger, err = load_predictions(backend())
+    if err and backend() == "supabase":
+        st.warning("예측 장부 테이블이 아직 없습니다. Supabase → SQL Editor에서 아래 SQL을 한 번 실행하세요.",
+                   icon=":material/table_chart:")
+        st.code(PRED_SQL, language="sql")
+    else:
+        ledger = ledger[ledger["ticker"] == ticker] if not ledger.empty else ledger
+        graded = core.grade_predictions(ledger, done["close"])
+        if graded is None or graded.empty:
+            st.caption("아직 기록된 예측이 없습니다. 자동 실행이 돌거나 아래 버튼으로 첫 예측을 남기면 여기에 쌓입니다.")
+        else:
+            for hz in core.HORIZONS:
+                table, summ = core.calibration(graded, hz)
+                if not summ or summ.get("n", 0) == 0:
+                    st.caption(f"{hz}주 예측: 채점할 수 있는 기록이 아직 없습니다 ({hz}주가 지나야 채점).")
+                    continue
+                k = st.columns(4)
+                k[0].metric(f"{hz}주 예측 채점 수", f"{summ['n']}건")
+                k[1].metric("방향 적중률", f"{summ['direction_hit']:.0f}%",
+                            help="50% 이상이라고 한 주에 실제로 올랐고, 50% 미만이라고 한 주에 실제로 내린 비율")
+                k[2].metric("확률 오차 (브라이어)", f"{summ['brier']:.3f}",
+                            f"{summ['brier'] - summ['brier_base']:+.3f} vs 평소 확률", delta_color="inverse",
+                            help="낮을수록 좋습니다. '평소 상승 확률'만 말했을 때보다 낮아야 신호가 쓸모 있어요.")
+                k[3].metric("실제 상승 비율", f"{summ['up_rate']:.0f}%")
+                st.dataframe(table, hide_index=True, width="stretch")
+                if summ["n"] < 20:
+                    st.caption("채점 건수가 20건 미만이라 아직 판단하기 이릅니다. 최소 20~30건이 쌓인 뒤 평가하세요.")
+            show = graded.sort_values("week", ascending=False)
+            st.dataframe(show, hide_index=True, width="stretch",
+                         column_order=["week", "close", "chart_score", "macro_score", "p_up_4w", "ret_4w",
+                                       "p_up_12w", "ret_12w", "signals", "macro_signals"],
+                         column_config={"week": "주(금)", "close": st.column_config.NumberColumn("종가", format="$%.2f"),
+                                        "chart_score": "차트 점수", "macro_score": "거시 점수",
+                                        "signals": "켜진 차트 신호", "macro_signals": "켜진 거시 신호",
+                                        "p_up_4w": st.column_config.NumberColumn("4주 상승확률", format="%.0f%%"),
+                                        "p_up_12w": st.column_config.NumberColumn("12주 상승확률", format="%.0f%%"),
+                                        "ret_4w": st.column_config.NumberColumn("4주 실제", format="%+.1f%%"),
+                                        "ret_12w": st.column_config.NumberColumn("12주 실제", format="%+.1f%%")})
+        last_done = done.index[-1].strftime("%Y-%m-%d") if len(done) else None
+        recorded = set(ledger["week"].astype(str).str[:10]) if not ledger.empty else set()
+        if last_done and last_done not in recorded:
+            if st.button(f"마감된 주({last_done}) 예측 지금 기록", icon=":material/edit_note:"):
+                pred = core.make_prediction(done, ticker)
+                try:
+                    save_prediction(pred)
+                    flash("예측을 기록했습니다.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"기록 실패: {exc}")
+
+    with st.expander("이 점수판을 쓰는 방법과 한계", icon=":material/menu_book:"):
+        st.markdown("""
+- **한 주가 아니라 흐름으로 보세요.** 차트 신호 3점 이상이 **2주 연속**(마감 주봉 기준)일 때를 반등 확인 신호로 봅니다.
+- **확률은 과거 실제 비율입니다.** 같은 점수가 나왔던 주 이후 4·12주 동안 실제로 올랐던 비율이며, 표본이 적은 점수는 평소 확률 쪽으로 보정합니다.
+- **검증 구간을 꼭 확인하세요.** 학습 구간에서만 좋고 최근 2년 검증 구간에서 다르면 우연이었을 가능성이 큽니다.
+- **조건을 자주 바꾸지 마세요.** 결과를 보고 신호 기준을 계속 고치면 과거에만 맞는 규칙이 됩니다. 점검은 예측이 20~30건 쌓인 뒤 한 달에 한 번이면 충분합니다.
+- **3배 레버리지 ETF는 오차가 큽니다.** 이 화면은 판단을 돕는 참고 자료이며 매수·매도를 권유하지 않습니다.
+""")
+
+
+# ==========================================================================
 # 진입점
 # ==========================================================================
 PAGES: dict[str, st.Page] = {}
@@ -1480,13 +1719,14 @@ def main() -> None:
     init_local_storage()
     PAGES.update({
         "dashboard": st.Page(page_dashboard, title="전술 관제", icon=":material/monitoring:", url_path="dashboard", default=True),
+        "signals": st.Page(page_signals, title="신호 관제", icon=":material/insights:", url_path="signals"),
         "radar": st.Page(page_radar, title="시장 레이더", icon=":material/radar:", url_path="radar"),
         "league": st.Page(page_league, title="AI 실전 리그", icon=":material/emoji_events:", url_path="league"),
         "training": st.Page(page_training, title="AI 훈련소", icon=":material/model_training:", url_path="training"),
         "journal": st.Page(page_journal, title="매매 일지", icon=":material/menu_book:", url_path="journal"),
         "validation": st.Page(page_validation, title="예측 검증실", icon=":material/science:", url_path="validation"),
     })
-    nav = st.navigation({"운용": [PAGES["dashboard"], PAGES["radar"], PAGES["league"]],
+    nav = st.navigation({"운용": [PAGES["dashboard"], PAGES["signals"], PAGES["radar"], PAGES["league"]],
                          "연구 · 관리": [PAGES["training"], PAGES["validation"], PAGES["journal"]]})
     render_sidebar()
     show_flash()
