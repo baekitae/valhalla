@@ -44,6 +44,23 @@ def download(ticker: str, adjusted: bool) -> pd.DataFrame | None:
     return core.clean_ohlcv(raw)
 
 
+def load_histories(fetch=download) -> dict[str, pd.DataFrame]:
+    """규칙 점검용: 모든 대상 종목의 마감 주봉 신호 이력."""
+    macro = {t: fetch(t, False) for t in core.MACRO_TICKERS_SIGNAL.values()}
+    partners, out, asof = {}, {}, us_asof()
+    for ticker, partner in TICKERS:
+        try:
+            daily = fetch(ticker, True)
+            if daily is None:
+                continue
+            if partner and partner not in partners:
+                partners[partner] = fetch(partner, True)
+            out[ticker] = core.complete_weeks(core.build_signal_history(daily, partners.get(partner), macro), asof)
+        except Exception:
+            traceback.print_exc()
+    return out
+
+
 def us_asof() -> pd.Timestamp:
     now = dt.datetime.now(ET)
     day = pd.Timestamp(now.date())
@@ -55,11 +72,12 @@ def run(sb, fetch=download) -> str:
     lines = []
     partners: dict[str, pd.DataFrame | None] = {}
     asof = us_asof()
+    rule_version, rules = core.load_active_rule(sb)
     day = asof.strftime("%Y-%m-%d")
     reports, new_preds, graded, failed = [], 0, 0, []
     for ticker, partner in TICKERS:
         try:
-            res = _run_one(sb, ticker, partner, macro, partners, fetch, asof)
+            res = _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules, rule_version)
             new_preds += res["new"]
             graded += res["graded"]
             if res["report"]:
@@ -71,7 +89,7 @@ def run(sb, fetch=download) -> str:
         sb.table(core.REPORT_TABLE).upsert(reports[i:i + 100], on_conflict="date,ticker").execute()
     rep = pd.DataFrame(reports)
     share = float((rep["test_diff"].dropna() > 0).mean() * 100) if not rep.empty and rep["test_diff"].notna().any() else None
-    lines.append(f"{len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
+    lines.append(f"규칙 v{rule_version} · {len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
     if share is not None:
         lines.append(f"검증 구간에서 평소보다 나은 종목 {share:.0f}%")
     if failed:
@@ -79,7 +97,7 @@ def run(sb, fetch=download) -> str:
     return " / ".join(lines)
 
 
-def _run_one(sb, ticker, partner, macro, partners, fetch, asof) -> dict:
+def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule_version=None) -> dict:
     out = {"new": 0, "graded": 0, "report": None}
     daily = fetch(ticker, True)
     if daily is None:
@@ -101,7 +119,9 @@ def _run_one(sb, ticker, partner, macro, partners, fetch, asof) -> dict:
             if patch:
                 sb.table(TABLE).update(patch).eq("id", int(old["id"])).execute()
                 out["graded"] += 1
-    out["report"] = core.report_row(core.action_signals(hist), ticker, asof.strftime("%Y-%m-%d"))
+    out["report"] = core.report_row(core.action_signals(hist, rules), ticker, asof.strftime("%Y-%m-%d"))
+    if out["report"] is not None:
+        out["report"]["rule_version"] = rule_version
     return out
 
 

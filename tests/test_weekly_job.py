@@ -99,3 +99,25 @@ def test_one_failing_ticker_does_not_stop_others():
         return d
     msg = weekly.run(sb, fetch)
     assert "BAD(" in msg and len(sb.db["valhalla_predictions"]) == 1
+
+
+def test_rule_review_job_proposes_or_keeps():
+    import importlib.util as u
+    spec2 = u.spec_from_file_location("rule_review", Path(__file__).resolve().parents[1] / "jobs/rule_review.py")
+    rr = u.module_from_spec(spec2)
+    spec2.loader.exec_module(rr)
+    sb = FakeSB()
+    d = _daily(n=3000)
+    rr.daily.us_asof = lambda: pd.Timestamp(d.index[-1])
+    rr.daily.TICKERS = [("SOXL", "SOXX"), ("TQQQ", "QQQ")]
+    msg = rr.run(sb, lambda t, adj: d, candidates=weekly.core.candidate_rules()[:6])
+    rules = sb.db["valhalla_signal_rules"]
+    assert rules[0]["status"] == "active" and rules[0]["version"] == 1
+    assert ("제안" in msg) or ("교체 안 함" in msg)
+    # 승인 대기 중이면 새 점검을 건너뜀
+    sb.db["valhalla_signal_rules"].append({"id": 99, "version": 2, "status": "proposed", "params": {}})
+    assert "건너뜀" in rr.run(sb, lambda t, adj: d, candidates=[])
+    # 승인하면 이전 활성 규칙은 retired
+    weekly.core.decide_proposal(sb, 99, True, "2026-11-20T00:00:00")
+    status = {r["version"]: r["status"] for r in sb.db["valhalla_signal_rules"]}
+    assert status[1] == "retired" and status[2] == "active"

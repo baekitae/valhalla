@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-5"
+CORE_VERSION = "2026.11.20-6"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1186,7 +1186,7 @@ def calibration(ledger: pd.DataFrame, horizon: int = 4) -> tuple[pd.DataFrame, d
 # ==========================================================================
 ACTION_RULES = {
     "buy": {"chart_min": 3, "weeks": 2, "macro_min": 2},
-    "sell": {"chart_max": 1, "weeks": 2},
+    "sell": {"chart_max": 1, "weeks": 2, "below_ma": True},
 }
 ACTION_RULE_TEXT = {
     "매수": "차트 신호 3점 이상이 2주 연속 + 거시 신호 2점 이상",
@@ -1202,7 +1202,9 @@ def action_signals(history: pd.DataFrame, rules: dict | None = None) -> pd.DataF
     chart = out["chart_score"].astype(float)
     buy_on = (chart.rolling(b["weeks"]).min() >= b["chart_min"]) & (out["macro_score"] >= b["macro_min"])
     above = out["above_ma20d"].map(lambda v: bool(v) if pd.notna(v) else True)
-    sell_on = (chart.rolling(s["weeks"]).max() <= s["chart_max"]) & ~above
+    sell_on = chart.rolling(s["weeks"]).max() <= s["chart_max"]
+    if s.get("below_ma", True):
+        sell_on = sell_on & ~above
     out["buy_on"], out["sell_on"] = buy_on.fillna(False), sell_on.fillna(False)
     action, state, cur = [], [], ""
     prev_buy = prev_sell = False
@@ -1467,3 +1469,183 @@ def live_health(ledger: pd.DataFrame, horizon: int = 4, min_n: int = 20) -> list
             status, msg = "주의", f"채점 {n}건 · 평소 확률보다 부정확 (브라이어 {summ['brier']:.3f} ≥ {summ['brier_base']:.3f})"
         out.append({"유형": cat, "상태": status, "설명": msg, "n": n})
     return out
+
+
+
+# ==========================================================================
+# 14. 규칙 개선 장치 (후보 규칙을 시험해서 '확실히 나을 때만' 교체 제안)
+#   1) 후보 규칙 = 지금 규칙의 숫자를 조금씩 바꾼 조합
+#   2) 학습 구간(최근 2년 제외)으로만 가장 좋은 후보 1개를 고름
+#   3) 고를 때 쓰지 않은 최근 2년(검증 구간)에서 지금 규칙보다 분명히 나을 때만 '제안'
+#   4) 적용은 사람이 화면에서 승인 → 버전 기록
+# ==========================================================================
+RULE_TABLE = "valhalla_signal_rules"
+ADOPT_MIN = {"plus_share_gain": 10.0, "diff_gain": 3.0, "min_signals": 30, "mdd_slack": 5.0}
+
+
+def rule_text(rules: dict | None = None) -> dict[str, str]:
+    r = rules or ACTION_RULES
+    b, s = r["buy"], r["sell"]
+    macro = f" + 거시 신호 {b['macro_min']}점 이상" if b.get("macro_min", 0) > 0 else ""
+    ma = " + 금요일 종가가 20일선 아래" if s.get("below_ma", True) else ""
+    return {"매수": f"차트 신호 {b['chart_min']}점 이상이 {b['weeks']}주 연속{macro}",
+            "매도": f"차트 신호 {s['chart_max']}점 이하가 {s['weeks']}주 연속{ma}"}
+
+
+def normalize_rules(rules: dict | None) -> dict:
+    base = {"buy": dict(ACTION_RULES["buy"]), "sell": dict(ACTION_RULES["sell"])}
+    for side in ("buy", "sell"):
+        base[side].update({k: v for k, v in ((rules or {}).get(side) or {}).items() if k in base[side]})
+    return base
+
+
+def candidate_rules() -> list[dict]:
+    out = []
+    for cmin in (2, 3, 4, 5):
+        for bw in (1, 2, 3):
+            for mmin in (0, 1, 2, 3):
+                for smax in (0, 1, 2):
+                    for sw in (1, 2, 3):
+                        for below in (True, False):
+                            out.append({"buy": {"chart_min": cmin, "weeks": bw, "macro_min": mmin},
+                                        "sell": {"chart_max": smax, "weeks": sw, "below_ma": below}})
+    return out
+
+
+def _rule_key(rules: dict) -> tuple:
+    r = normalize_rules(rules)
+    return tuple(sorted(r["buy"].items())) + tuple(sorted(r["sell"].items()))
+
+
+def evaluate_rule(histories: dict[str, pd.DataFrame], rules: dict, part: str = "train") -> dict:
+    """여러 종목에 같은 규칙을 적용한 성적. part = 'train'(최근 2년 제외) 또는 'test'(최근 2년)."""
+    diffs, signals, mdds, rets, holds = [], 0, [], [], []
+    for _, hist in histories.items():
+        if hist is None or hist.empty:
+            continue
+        bt = action_backtest(action_signals(hist, rules))
+        if not bt:
+            continue
+        t = bt[f"{part}_buy"].set_index("기간")
+        if "4주 뒤" not in t.index:
+            continue
+        r = t.loc["4주 뒤"]
+        if r["신호 수"] > 0 and r["적중률(%)"] is not None and r["평소 확률(%)"] is not None:
+            diffs.append(float(r["적중률(%)"]) - float(r["평소 확률(%)"]))
+            signals += int(r["신호 수"])
+        sm = bt["summary"]
+        mdds.append(sm["strategy_mdd"])
+        rets.append(sm["strategy"])
+        holds.append(sm["hold"])
+    if not diffs:
+        return {"n_tickers": 0, "signals": 0, "avg_diff": None, "plus_share": None,
+                "median_mdd": None, "median_ret": None, "median_hold": None}
+    d = np.array(diffs)
+    return {"n_tickers": int(len(d)), "signals": int(signals), "avg_diff": round(float(d.mean()), 2),
+            "plus_share": round(float((d > 0).mean() * 100), 1),
+            "median_mdd": round(float(np.median(mdds)), 1) if mdds else None,
+            "median_ret": round(float(np.median(rets)), 1) if rets else None,
+            "median_hold": round(float(np.median(holds)), 1) if holds else None}
+
+
+def _train_score(ev: dict, min_signals: int) -> float:
+    """학습 구간 점수: 평균 차이 + 평소보다 나은 종목 비율 (신호가 너무 적으면 탈락)."""
+    if not ev or ev["avg_diff"] is None or ev["signals"] < min_signals:
+        return -1e9
+    return ev["avg_diff"] + (ev["plus_share"] - 50) * 0.2
+
+
+def review_rules(histories: dict[str, pd.DataFrame], current: dict, candidates: list[dict] | None = None,
+                 thresholds: dict | None = None, progress=None) -> dict:
+    """규칙 점검: 학습 구간으로 최고 후보 1개 선택 → 검증 구간에서 지금 규칙보다 확실히 나을 때만 adopt=True."""
+    th = {**ADOPT_MIN, **(thresholds or {})}
+    current = normalize_rules(current)
+    cands = candidates if candidates is not None else candidate_rules()
+    min_train_signals = th["min_signals"] * 3
+    best, best_score, best_train = None, -1e9, None
+    for i, cand in enumerate(cands):
+        if _rule_key(cand) == _rule_key(current):
+            continue
+        ev = evaluate_rule(histories, cand, "train")
+        sc = _train_score(ev, min_train_signals)
+        if sc > best_score:
+            best, best_score, best_train = cand, sc, ev
+        if progress:
+            progress(i + 1, len(cands))
+    cur_train = evaluate_rule(histories, current, "train")
+    cur_test = evaluate_rule(histories, current, "test")
+    result = {"current": current, "current_train": cur_train, "current_test": cur_test,
+              "candidate": best, "candidate_train": best_train, "candidate_test": None,
+              "adopt": False, "reasons": [], "thresholds": th}
+    if best is None:
+        result["reasons"].append("조건을 만족하는 후보가 없습니다")
+        return result
+    cand_test = evaluate_rule(histories, best, "test")
+    result["candidate_test"] = cand_test
+    reasons, ok = [], True
+    if cand_test["avg_diff"] is None or cur_test["avg_diff"] is None:
+        return {**result, "reasons": ["검증 구간 신호가 없어 판단할 수 없습니다"]}
+    if cand_test["signals"] < th["min_signals"]:
+        ok = False
+        reasons.append(f"검증 구간 신호 {cand_test['signals']}건 < {th['min_signals']}건")
+    gain_share = cand_test["plus_share"] - cur_test["plus_share"]
+    gain_diff = cand_test["avg_diff"] - cur_test["avg_diff"]
+    if gain_share < th["plus_share_gain"]:
+        ok = False
+        reasons.append(f"평소보다 나은 종목 비율 개선 {gain_share:+.1f}%p < +{th['plus_share_gain']:.0f}%p")
+    if gain_diff < th["diff_gain"]:
+        ok = False
+        reasons.append(f"평균 적중률 차이 개선 {gain_diff:+.1f}%p < +{th['diff_gain']:.0f}%p")
+    if (cand_test["median_mdd"] is not None and cur_test["median_mdd"] is not None
+            and cand_test["median_mdd"] < cur_test["median_mdd"] - th["mdd_slack"]):
+        ok = False
+        reasons.append(f"최대 낙폭 악화 {cand_test['median_mdd']:.0f}% vs {cur_test['median_mdd']:.0f}%")
+    if cand_test["plus_share"] < 50:
+        ok = False
+        reasons.append(f"후보도 평소보다 나은 종목이 절반 미만 ({cand_test['plus_share']:.0f}%)")
+    result["adopt"] = ok
+    result["reasons"] = reasons or [f"검증 구간에서 종목 비율 {gain_share:+.1f}%p, 평균 차이 {gain_diff:+.1f}%p 개선"]
+    return result
+
+
+# ---- 규칙 저장소 (Supabase 클라이언트를 받아 사용: 앱·자동 실행 공용) ----
+def _rows(resp) -> list[dict]:
+    return list(getattr(resp, "data", None) or [])
+
+
+def load_active_rule(sb) -> tuple[int, dict]:
+    """활성 규칙 (없으면 기본 규칙을 v1로 등록)."""
+    rows = _rows(sb.table(RULE_TABLE).select("*").eq("status", "active").execute())
+    if rows:
+        row = sorted(rows, key=lambda r: r["version"])[-1]
+        params = row["params"] if isinstance(row["params"], dict) else __import__("json").loads(row["params"])
+        return int(row["version"]), normalize_rules(params)
+    sb.table(RULE_TABLE).insert({"version": 1, "status": "active", "params": normalize_rules(ACTION_RULES),
+                                 "reason": "처음 정한 기본 규칙"}).execute()
+    return 1, normalize_rules(ACTION_RULES)
+
+
+def pending_proposal(sb) -> dict | None:
+    rows = _rows(sb.table(RULE_TABLE).select("*").eq("status", "proposed").execute())
+    return sorted(rows, key=lambda r: r["id"])[-1] if rows else None
+
+
+def rule_history(sb) -> list[dict]:
+    return sorted(_rows(sb.table(RULE_TABLE).select("*").execute()), key=lambda r: r["id"])
+
+
+def save_proposal(sb, result: dict) -> int:
+    hist = rule_history(sb)
+    version = max([int(r["version"]) for r in hist] or [1]) + 1
+    ev = {k: result.get(k) for k in ("current_train", "current_test", "candidate_train", "candidate_test", "thresholds")}
+    sb.table(RULE_TABLE).insert({"version": version, "status": "proposed", "params": normalize_rules(result["candidate"]),
+                                 "reason": " · ".join(result["reasons"]), "evaluation": ev}).execute()
+    return version
+
+
+def decide_proposal(sb, proposal_id: int, accept: bool, now_iso: str) -> None:
+    if accept:
+        for row in _rows(sb.table(RULE_TABLE).select("*").eq("status", "active").execute()):
+            sb.table(RULE_TABLE).update({"status": "retired", "decided_at": now_iso}).eq("id", row["id"]).execute()
+    sb.table(RULE_TABLE).update({"status": "active" if accept else "rejected", "decided_at": now_iso}) \
+        .eq("id", proposal_id).execute()

@@ -117,3 +117,17 @@ def test_daily_report_helpers():
                            "ret_4w": [1.0] * 20 + [-1.0] * 5})
     health = {h["유형"]: h["상태"] for h in core.live_health(ledger)}
     assert health["3배 ETF"] == "정상" and health["1배 ETF"] == "표본 부족"
+
+
+def test_rule_review_picks_by_train_and_judges_on_test():
+    hs = {f"T{i}": core.build_signal_history(_daily(seed=i), _daily(seed=i + 50), _macro(2)) for i in range(3)}
+    cands = core.candidate_rules()[:12]
+    assert len(core.candidate_rules()) == 4 * 3 * 4 * 3 * 3 * 2
+    res = core.review_rules(hs, core.ACTION_RULES, cands, thresholds={"min_signals": 1})
+    assert res["candidate"] is not None and res["candidate_test"] is not None
+    assert isinstance(res["adopt"], bool) and res["reasons"]
+    # 지금 규칙과 같은 후보는 고르지 않음
+    assert core._rule_key(res["candidate"]) != core._rule_key(core.ACTION_RULES)
+    txt = core.rule_text({"buy": {"chart_min": 4, "weeks": 1, "macro_min": 0},
+                          "sell": {"chart_max": 2, "weeks": 3, "below_ma": False}})
+    assert "4점 이상이 1주" in txt["매수"] and "거시" not in txt["매수"] and "20일선" not in txt["매도"]

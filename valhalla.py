@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-5"
+REQUIRED_CORE_VERSION = "2026.11.20-6"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1525,6 +1525,21 @@ def load_predictions(backend_name: str) -> tuple[pd.DataFrame, str | None]:
     return df[PRED_COLUMNS], None
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_rule_state(backend_name: str) -> dict:
+    """활성 규칙·승인 대기 제안·이력 (Supabase 없으면 기본 규칙)."""
+    default = {"version": 1, "rules": core.normalize_rules(core.ACTION_RULES), "pending": None, "history": []}
+    if backend_name != "supabase":
+        return default
+    try:
+        sb = get_supabase()
+        version, rules = core.load_active_rule(sb)
+        return {"version": version, "rules": rules, "pending": core.pending_proposal(sb), "history": core.rule_history(sb)}
+    except Exception as exc:
+        LOGGER.warning("규칙 조회 실패 (테이블 없음?): %s", exc)
+        return default
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_reports(backend_name: str) -> pd.DataFrame:
     """매일 자동 점검 스냅샷 (Supabase 전용)."""
@@ -1574,15 +1589,17 @@ def _streak(history: pd.DataFrame, threshold: int = 3) -> int:
 
 def render_actions(done: pd.DataFrame, ticker: str) -> None:
     """매수·매도 행동 신호: 현재 상태, 차트 표시, 과거 적중률, '신호대로 했다면' 비교."""
-    section("매수 · 매도 신호", f"매수: {core.ACTION_RULE_TEXT['매수']} · 매도: {core.ACTION_RULE_TEXT['매도']}. "
+    state = load_rule_state(backend())
+    rules, text = state["rules"], core.rule_text(state["rules"])
+    section(f"매수 · 매도 신호 · 규칙 v{state['version']}", f"매수: {text['매수']} · 매도: {text['매도']}. "
                              "마감된 주봉 기준이며, 조건이 처음 켜진 주에만 표시합니다.")
-    sig = core.action_signals(done)
+    sig = core.action_signals(done, rules)
     if sig.empty:
         st.caption("신호를 계산할 데이터가 부족합니다.")
         return
     last = sig.iloc[-1]
     last_act = sig[sig["action"] != ""].tail(1)
-    b, sl = core.ACTION_RULES["buy"], core.ACTION_RULES["sell"]
+    b, sl = rules["buy"], rules["sell"]
     recent = sig["chart_score"].tail(b["weeks"]).tolist()
     c = st.columns([1.3, 1, 1])
     with c[0].container(border=True):
@@ -1601,10 +1618,10 @@ def render_actions(done: pd.DataFrame, ticker: str) -> None:
                        f"지금 {(last['close'] / r['close'] - 1) * 100:+.1f}%)")
     c[1].metric("매수 조건 진행", f"{sum(x >= b['chart_min'] for x in recent)} / {b['weeks']}주",
                 f"거시 {int(last['macro_score'])}점 (필요 {b['macro_min']}점)", delta_color="off", delta_arrow="off",
-                border=True, help=core.ACTION_RULE_TEXT["매수"])
+                border=True, help=text["매수"])
     c[2].metric("매도 조건 진행", f"{sum(x <= sl['chart_max'] for x in sig['chart_score'].tail(sl['weeks']))} / {sl['weeks']}주",
                 "20일선 아래" if last["above_ma20d"] == False else "20일선 위",  # noqa: E712
-                delta_color="off", delta_arrow="off", border=True, help=core.ACTION_RULE_TEXT["매도"])
+                delta_color="off", delta_arrow="off", border=True, help=text["매도"])
 
     view = sig[sig.index >= sig.index[-1] - pd.Timedelta(weeks=156)]
     fig = go.Figure(go.Scatter(x=view.index, y=view["close"], name=f"{ticker} 주봉 종가", line=dict(color=GOLD, width=2)))
@@ -1659,6 +1676,70 @@ def render_actions(done: pd.DataFrame, ticker: str) -> None:
                     "매수 신호가 '떠오르는 테마'와 겹치면 더 믿을 만합니다.", icon=":material/hub:")
     except Exception:
         LOGGER.warning("반도체 테마 상태 조회 실패")
+
+
+def _ev_table(ev_cur: dict | None, ev_new: dict | None) -> pd.DataFrame:
+    labels = {"plus_share": "평소보다 나은 종목(%)", "avg_diff": "평균 적중률 차이(%p)", "signals": "매수 신호 수",
+              "median_mdd": "신호대로 MDD 중앙값(%)", "median_ret": "신호대로 누적 중앙값(%)", "n_tickers": "평가 종목 수"}
+    return pd.DataFrame([{"항목": v, "지금 규칙": (ev_cur or {}).get(k), "제안 규칙": (ev_new or {}).get(k)}
+                         for k, v in labels.items()])
+
+
+def render_rule_improvement() -> None:
+    state = load_rule_state(backend())
+    section("규칙 개선", "매달 1일 자동 점검: 후보 432개 중 학습 구간으로 1개를 고르고, 고를 때 쓰지 않은 최근 2년에서 "
+                     "지금 규칙보다 확실히 나을 때만 제안합니다. 적용은 여기서 직접 승인해야 합니다.")
+    if backend() != "supabase":
+        st.caption("Supabase 연결이 있어야 규칙 버전 관리가 동작합니다.")
+        return
+    text = core.rule_text(state["rules"])
+    st.markdown(f"**지금 규칙 v{state['version']}** · 매수: {text['매수']} · 매도: {text['매도']}")
+    p = state["pending"]
+    if p:
+        params = p["params"] if isinstance(p["params"], dict) else json.loads(p["params"])
+        ntext = core.rule_text(core.normalize_rules(params))
+        ev = p.get("evaluation") or {}
+        if isinstance(ev, str):
+            ev = json.loads(ev)
+        with st.container(border=True):
+            st.markdown(f"**새 규칙 제안 v{p['version']}** {pill('승인 대기', 'warn')}", unsafe_allow_html=True)
+            st.markdown(f"- 매수: {ntext['매수']}\n- 매도: {ntext['매도']}")
+            st.caption(f"제안 이유: {p.get('reason') or '—'}")
+            a, b = st.columns(2)
+            a.markdown("**검증 구간 (최근 2년, 고를 때 안 쓴 구간)**")
+            a.dataframe(_ev_table(ev.get("current_test"), ev.get("candidate_test")), hide_index=True, width="stretch")
+            b.markdown("**학습 구간 (참고)**")
+            b.dataframe(_ev_table(ev.get("current_train"), ev.get("candidate_train")), hide_index=True, width="stretch")
+            c1, c2, _ = st.columns([1, 1, 3])
+            now_iso = now_kst().isoformat()
+            if c1.button("적용", type="primary", icon=":material/check:", key="rule_accept"):
+                core.decide_proposal(get_supabase(), int(p["id"]), True, now_iso)
+                load_rule_state.clear()
+                flash(f"규칙 v{p['version']}을 적용했습니다.")
+                st.rerun()
+            if c2.button("거절", icon=":material/close:", key="rule_reject"):
+                core.decide_proposal(get_supabase(), int(p["id"]), False, now_iso)
+                load_rule_state.clear()
+                flash("제안을 거절했습니다. 지금 규칙을 유지합니다.")
+                st.rerun()
+    else:
+        st.caption("승인 대기 중인 제안이 없습니다. 지금 규칙이 유지되고 있어요.")
+    runs = load_job_runs(backend())
+    if not runs.empty and "source" in runs:
+        last = runs[runs["source"] == "rules"].head(1)
+        if not last.empty:
+            st.caption(f"마지막 규칙 점검 {last.iloc[0]['ran_at']}: {last.iloc[0]['summary']}")
+    if state["history"]:
+        with st.expander("규칙 버전 이력", icon=":material/history:"):
+            rows = []
+            for h in state["history"]:
+                prm = h["params"] if isinstance(h["params"], dict) else json.loads(h["params"])
+                t = core.rule_text(core.normalize_rules(prm))
+                rows.append({"버전": h["version"], "상태": {"active": "사용 중", "proposed": "승인 대기", "rejected": "거절",
+                                                          "retired": "이전 규칙"}.get(h["status"], h["status"]),
+                             "매수": t["매수"], "매도": t["매도"], "이유": h.get("reason"),
+                             "등록": str(h.get("created_at"))[:16], "결정": str(h.get("decided_at") or "")[:16]})
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
 def page_signals() -> None:
@@ -1735,6 +1816,7 @@ def page_signals() -> None:
     show_chart(fig, key="sig_trend")
 
     render_actions(done, ticker)
+    render_rule_improvement()
 
     section("점수별 과거 성적", f"{bt['start']:%Y-%m} ~ {bt['cutoff']:%Y-%m}은 학습 구간, 그 뒤 최근 2년은 확률 계산에 쓰지 않은 "
                          "검증 구간입니다. 두 구간의 방향이 비슷해야 믿을 만한 신호예요.")
@@ -1771,7 +1853,8 @@ def page_signals() -> None:
             try:
                 h = load_signal_history(t, p)
                 if h is not None and not h.empty:
-                    row = core.ticker_summary(core.action_signals(core.complete_weeks(h, us_asof())), t)
+                    row = core.ticker_summary(core.action_signals(core.complete_weeks(h, us_asof()),
+                                                              load_rule_state(backend())["rules"]), t)
                     if row:
                         rows.append(row)
             except Exception:
