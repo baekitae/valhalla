@@ -890,7 +890,7 @@ def render_breakeven(ticker: str, journal_avg: float | None) -> None:
                                  f"TOTAL_AVG_{ticker}를 넣어두면 기본값으로 쓰입니다.")
     extra_default = st.secrets.get(f"TARGETS_{ticker}", "") if hasattr(st, "secrets") else ""
     extra = c[1].text_input("추가 목표가 (쉼표로 구분)", value=str(extra_default or ""), key=f"be_tg_{ticker}",
-                            placeholder="예: 165, 178.19, 200")
+                            placeholder="예: 107, 163.41, 178.19 (1차, 2차, 3차 순서)")
     if avg <= 0:
         st.caption("기준 평단을 넣으면 계산합니다.")
         return
@@ -902,14 +902,17 @@ def render_breakeven(ticker: str, journal_avg: float | None) -> None:
     vol = core.realized_vol(ic)
     vol = vol if np.isfinite(vol) else 0.35
     c[2].metric("지수 1년 변동성", f"{vol * 100:.0f}%", help="최근 252거래일 실제 변동성. 시간 가정 계산에 씁니다.")
-    targets = {"기준 평단": avg}
+    extras = []
     for part in str(extra).replace("$", "").split(","):
         try:
             v = float(part.strip())
             if v > 0:
-                targets[f"${v:,.2f}"] = v
+                extras.append(v)
         except ValueError:
             continue
+    targets = {} if any(abs(v - avg) < 0.005 for v in extras) else {"기준 평단": avg}
+    for n, v in enumerate(extras, 1):
+        targets[f"{n}차 목표" + (" (평단)" if abs(v - avg) < 0.005 else "")] = v
     i_now, p_now = float(ic.iloc[-1]), float(pc.iloc[-1])
     table = core.breakeven_table(i_now, p_now, targets, lev, vol)
     hist = core.needed_gain_history(ic, pc, avg, lev)
