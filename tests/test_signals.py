@@ -160,3 +160,18 @@ def test_player_positions_backtest_and_ensemble():
     # 표본 부족이면 균등
     w2 = core.ensemble_weights(g[g["week"] > g["week"].max()[:8] + "01"], h.index[-1])
     assert len(set(round(v, 4) for v in w2.values())) <= 1
+
+
+def test_lab_techniques_only_on_leveraged_etfs():
+    daily = _daily(seed=3, n=1500)
+    hist = core.complete_weeks(core.build_signal_history(daily, daily, {}), daily.index[-1])
+    lev = core.player_positions(hist, daily, daily, [(1, core.ACTION_RULES)], "SOXL")
+    stock = core.player_positions(hist, daily, daily, [(1, core.ACTION_RULES)], "NVDA")
+    for pid in core.TECHNIQUE_PLAYERS:
+        assert pid in lev and pid not in stock
+        v = lev[pid].dropna()
+        assert len(v) > 50 and v.between(0, 1).all()
+    assert abs(lev["rebal50"].dropna().median() - 0.5) < 0.1          # 50:50은 비중 절반 근처
+    assert core.player_label("inf_v2_safe").startswith("④")
+    bt = core.backtest_players(lev, hist["close"])
+    assert set(core.TECHNIQUE_PLAYERS) <= set(bt["id"])

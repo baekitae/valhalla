@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-9"
+CORE_VERSION = "2026.11.20-10"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1754,7 +1754,7 @@ ENSEMBLE_RULES = {"min_weeks": 20, "lookback": 26, "cap": 0.5, "shrink": 0.5}
 def player_label(pid: str) -> str:
     if pid.startswith("rule_v"):
         return f"규칙 {pid[5:]}"
-    return {**BASE_PLAYERS, **LIVE_ONLY}.get(pid, pid)
+    return {**BASE_PLAYERS, **TECHNIQUE_PLAYERS, **LIVE_ONLY}.get(pid, pid)
 
 
 def rule_positions(sig: pd.DataFrame) -> pd.Series:
@@ -1780,15 +1780,143 @@ def vol_positions(index: pd.DatetimeIndex, daily: pd.DataFrame, window: int = 20
     return pos.resample("W-FRI").last().reindex(index)
 
 
+# ---- 매매기법 연구소 선수들 (SOXL 매매기법 연구소 백테스트 엔진을 그대로 옮김) ----
+#  일봉으로 계좌를 굴리고, 매주 금요일 종가 기준 '투자 비중(주식 평가액 ÷ 계좌 총액)'을 비중으로 냄.
+#  분할매수 기법은 레버리지 ETF용이라 3배·2배 ETF에만 적용.
+TECHNIQUE_PLAYERS = {"inf_mine": "① 내 방식 (40분할)", "inf_v2": "② V2형 (별지점)",
+                     "inf_v2_safe": "④ V2+손절+200일선", "rebal50": "⑥ 50:50 리밸런싱"}
+TECHNIQUE_CATEGORIES = ("3배 ETF", "2배 ETF")
+TECHNIQUE_START = "2016-01-01"
+_FEE = 0.001
+
+
+class _Acct:
+    def __init__(self, cash):
+        self.cash, self.sh, self.cost = cash, 0.0, 0.0
+
+    @property
+    def avg(self):
+        return self.cost / self.sh if self.sh > 0 else 0.0
+
+    def buy(self, px, usd):
+        usd = min(usd, self.cash)
+        if usd <= 1:
+            return 0.0
+        q = usd / (px * (1 + _FEE))
+        self.cash -= q * px * (1 + _FEE); self.sh += q; self.cost += q * px * (1 + _FEE)
+        return q
+
+    def sell(self, px, q):
+        q = min(q, self.sh)
+        if q <= 1e-9:
+            return 0.0
+        c = self.avg * q
+        self.cash += q * px * (1 - _FEE); self.sh -= q; self.cost -= c
+        if self.sh < 1e-9:
+            self.sh, self.cost = 0.0, 0.0
+        return q
+
+    def exposure(self, px):
+        v = self.cash + self.sh * px
+        return self.sh * px / v if v > 0 else 0.0
+
+
+def _ohlc(daily: pd.DataFrame) -> pd.DataFrame:
+    c = daily["Close"].astype(float)
+    df = pd.DataFrame({"close": c,
+                       "open": daily["Open"].astype(float) if "Open" in daily else c,
+                       "high": daily["High"].astype(float) if "High" in daily else c}).dropna(subset=["close"])
+    df["open"] = df["open"].fillna(df["close"]); df["high"] = df["high"].fillna(df["close"])
+    df["ma200"] = df["close"].rolling(200).mean()
+    return df
+
+
+def infinite_exposure(daily: pd.DataFrame, splits: int = 40, target: float = 0.10, star: bool = False,
+                      quarter_cut: bool = False, trend_filter: bool = False, start: str = TECHNIQUE_START) -> pd.Series:
+    """무한매수법 계열 (연구소 엔진과 같은 규칙). 반환: 날짜별 투자 비중(0~1)."""
+    df = _ohlc(daily)
+    df = df[df.index >= pd.Timestamp(start)]
+    a, T, unit, out = _Acct(10_000.0), 0.0, None, []
+    for date, r in df.iterrows():
+        px = r.close
+        if a.sh == 0:
+            T = 0
+            if trend_filter and (np.isnan(r.ma200) or px < r.ma200):
+                out.append(0.0); continue
+            unit = a.cash / splits
+        if a.sh > 0:
+            lim = a.avg * (1 + target)
+            fill = r.open if r.open >= lim else (lim if r.high >= lim else None)
+            if fill:
+                a.sell(fill, a.sh); T = 0
+                out.append(a.exposure(px)); continue
+            if star:
+                sp = a.avg * (1 + target - T / 2 / 100 * (40 / splits))
+                if px >= sp and T > 0:
+                    a.sell(px, a.sh / 4); T *= 0.75
+        if T < splits - 0.5 and a.cash > 1:
+            if a.sh == 0:
+                a.buy(px, unit); T += 1
+            elif star:
+                sp = a.avg * (1 + target - T / 2 / 100 * (40 / splits))
+                n = 0.0
+                if px <= a.avg:
+                    a.buy(px, unit / 2); n += .5
+                if px <= sp:
+                    a.buy(px, unit / 2); n += .5
+                T += n
+            elif px <= a.avg * 1.05:
+                a.buy(px, unit); T += 1
+        elif a.sh > 0 and quarter_cut:
+            a.sell(px, a.sh / 4); T *= 0.75
+            unit = a.cash / (splits - T) if splits - T > 0 else unit
+        out.append(a.exposure(px))
+    return pd.Series(out, index=df.index, dtype=float)
+
+
+def rebalance_exposure(daily: pd.DataFrame, w: float = 0.5, band: float = 0.10, every: int = 10,
+                       start: str = TECHNIQUE_START) -> pd.Series:
+    """고정 비중 리밸런싱: 2주마다 비중이 ±10% 넘게 벗어나면 50%로 맞춤."""
+    df = _ohlc(daily)
+    df = df[df.index >= pd.Timestamp(start)]
+    a, out = _Acct(10_000.0), []
+    for i, (date, r) in enumerate(df.iterrows()):
+        v = a.cash + a.sh * r.close
+        if i == 0:
+            a.buy(r.close, v * w)
+        elif i % every == 0:
+            cur = a.sh * r.close / v
+            if abs(cur - w) > band * w:
+                diff = v * w - a.sh * r.close
+                if diff > 0:
+                    a.buy(r.close, diff)
+                else:
+                    a.sell(r.close, -diff / r.close)
+        out.append(a.exposure(r.close))
+    return pd.Series(out, index=df.index, dtype=float)
+
+
+def technique_positions(index: pd.DatetimeIndex, daily: pd.DataFrame) -> pd.DataFrame:
+    """연구소 기법 4개의 주별 비중 (금요일 종가 시점의 투자 비중)."""
+    series = {"inf_mine": infinite_exposure(daily),
+              "inf_v2": infinite_exposure(daily, star=True),
+              "inf_v2_safe": infinite_exposure(daily, star=True, quarter_cut=True, trend_filter=True),
+              "rebal50": rebalance_exposure(daily)}
+    return pd.DataFrame({k: v.resample("W-FRI").last().reindex(index).round(4) for k, v in series.items()},
+                        index=index)
+
+
 def player_positions(hist: pd.DataFrame, daily: pd.DataFrame, ref_daily: pd.DataFrame | None,
-                     rules: list[tuple[int, dict]]) -> pd.DataFrame:
-    """주별 × 선수 비중표 (계산 가능한 선수만: 규칙들·추세·변동성·보유)."""
+                     rules: list[tuple[int, dict]], ticker: str | None = None) -> pd.DataFrame:
+    """주별 × 선수 비중표 (계산 가능한 선수만: 규칙들·추세·변동성·보유 + 레버리지 ETF면 연구소 기법)."""
     out = pd.DataFrame(index=hist.index)
     for version, rule in rules:
         out[f"rule_v{version}"] = rule_positions(action_signals(hist, rule))
     out["trend200"] = trend_positions(hist.index, ref_daily)
     out["voltarget"] = vol_positions(hist.index, daily)
     out["hold"] = 1.0
+    if ticker is not None and category_of(ticker) in TECHNIQUE_CATEGORIES:
+        out = out.join(technique_positions(hist.index, daily))
     return out
 
 

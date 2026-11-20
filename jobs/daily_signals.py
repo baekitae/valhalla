@@ -175,7 +175,7 @@ def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule
                 sb.table(core.RULE_SIGNAL_TABLE).update(patch).eq("id", int(old["id"])).execute()
     # 선수 경기장: 계산 가능한 선수들의 이번 주 비중 기록 + 지난 기록 채점
     ref = core.trend_reference(ticker, daily, partners.get(partner))
-    pos = core.player_positions(hist, daily, ref, contenders or [])
+    pos = core.player_positions(hist, daily, ref, contenders or [], ticker)
     week = hist.index[-1].strftime("%Y-%m-%d")
     have = {r["player"] for r in core.sb_fetch_all(sb, core.POSITION_TABLE, {"ticker": ticker, "week": week})}
     new_rows = [{"player": pid, "ticker": ticker, "week": week, "position": round(float(v), 4),

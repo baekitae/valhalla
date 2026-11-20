@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-9"
+REQUIRED_CORE_VERSION = "2026.11.20-10"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1832,7 +1832,7 @@ def cached_player_backtest(ticker: str, partner: str, rules_key: str) -> pd.Data
     partner_df = load_long(partner, "max", True) if partner else None
     hist = core.complete_weeks(load_signal_history(ticker, partner), us_asof())
     rules = [(int(v), core.normalize_rules(r)) for v, r in json.loads(rules_key)]
-    pos = core.player_positions(hist, daily, core.trend_reference(ticker, daily, partner_df), rules)
+    pos = core.player_positions(hist, daily, core.trend_reference(ticker, daily, partner_df), rules, ticker)
     return core.backtest_players(pos, hist["close"])
 
 
@@ -1875,13 +1875,19 @@ def render_arena(ticker: str, partner: str) -> None:
         if pos.empty:
             st.caption("아직 실전 기록이 없습니다. 매일 아침 자동 점검이 선수별 비중을 기록하고, 1주 뒤부터 채점합니다.")
         else:
-            scope = st.segmented_control("범위", ["AI 위원회 10개 종목", "전체 53개 종목"], default="AI 위원회 10개 종목",
+            lev = [t for t in core.SIGNAL_UNIVERSE if core.category_of(t) in core.TECHNIQUE_CATEGORIES]
+            scopes = {"AI 위원회 10개 종목": core.COUNCIL_TICKERS, f"레버리지 ETF {len(lev)}개": lev,
+                      "전체 53개 종목": None}
+            scope = st.segmented_control("범위", list(scopes), default="AI 위원회 10개 종목",
                                          key="arena_scope") or "AI 위원회 10개 종목"
-            table = core.arena_table(pos, core.COUNCIL_TICKERS if scope.startswith("AI") else None)
+            tick_scope = scopes[scope]
+            table = core.arena_table(pos, tick_scope)
+            st.caption("① 내 방식 · ② V2형 · ④ V2+손절+200일선 · ⑥ 50:50은 매매기법 연구소 백테스트와 같은 규칙으로 "
+                       "레버리지 ETF에서만 뜁니다. 같은 조건끼리 비교하려면 '레버리지 ETF' 범위를 보세요. "
+                       "챔피언 도전 판정은 항상 같은 종목·같은 주끼리만 맞대어 계산합니다.")
             if table.empty:
                 st.caption("채점된 기록이 아직 없습니다 (비중을 낸 다음 주 금요일 종가가 나오면 채점).")
             else:
-                tick_scope = core.COUNCIL_TICKERS if scope.startswith("AI") else None
                 verdicts = core.arena_verdicts(pos, champ, tick_scope)
                 table["선수"] = [("👑 " if i == champ else "") + n for i, n in zip(table["id"], table["선수"])]
                 table["챔피언 도전 판정"] = [("현재 챔피언" if i == champ else verdicts.get(i, ("short", "기록 없음"))[1])
@@ -1924,7 +1930,7 @@ def render_arena(ticker: str, partner: str) -> None:
                              width="stretch", column_config={"이번 주 비중": st.column_config.ProgressColumn(
                                  min_value=0, max_value=100, format="%.0f%%")})
     with t2:
-        st.caption("계산 가능한 선수(규칙·추세 필터·변동성 조절·그냥 보유)를 과거 전체에 적용한 결과입니다. "
+        st.caption("계산 가능한 선수(규칙·추세 필터·변동성 조절·그냥 보유, 레버리지 ETF면 연구소 기법 4개)를 과거 전체에 적용한 결과입니다. "
                    "AI 위원회와 앙상블은 과거로 검증할 수 없어 실전 기록만 봅니다.")
         bt = cached_player_backtest(ticker, partner, json.dumps([[v, r] for v, r in rules]))
         if bt.empty:
