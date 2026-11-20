@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-4"
+CORE_VERSION = "2026.11.20-5"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1392,3 +1392,78 @@ def compare_tables(cmp_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
                   .reindex(index=SECTORS, columns=CATEGORIES).dropna(how="all").round(1))
     plus_share = float((cmp_df["검증 차이(%p)"].dropna() > 0).mean() * 100) if cmp_df["검증 차이(%p)"].notna().any() else float("nan")
     return {"by_cat": by_cat, "by_sec": by_sec, "grid": grid, "plus_share": plus_share}
+
+
+# ==========================================================================
+# 13. 매일 자동 점검 (비교 결과 스냅샷 · 실전 건강 상태)
+# ==========================================================================
+REPORT_TABLE = "valhalla_signal_reports"
+REPORT_MAP = {"train_n": "학습 신호 수", "train_hit": "학습 4주 적중률(%)", "train_base": "학습 평소(%)",
+              "train_diff": "학습 차이(%p)", "test_n": "검증 신호 수", "test_hit": "검증 4주 적중률(%)",
+              "test_base": "검증 평소(%)", "test_diff": "검증 차이(%p)", "strat_ret": "신호대로 누적(%)",
+              "hold_ret": "보유 누적(%)", "strat_mdd": "신호대로 MDD(%)", "hold_mdd": "보유 MDD(%)"}
+
+
+def _num_or_none(v):
+    try:
+        f = float(v)
+        return f if np.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def report_row(sig: pd.DataFrame, ticker: str, date: str) -> dict | None:
+    """매일 저장할 종목별 스냅샷 (ticker_summary + 이번 주 상태)."""
+    summ = ticker_summary(sig, ticker)
+    if not summ:
+        return None
+    last = sig.iloc[-1]
+    row = {"date": date, "ticker": ticker, "sector": summ["섹터"], "category": summ["유형"],
+           "chart_score": int(last["chart_score"]), "macro_score": int(last["macro_score"]), "state": last["state"] or ""}
+    for key, label in REPORT_MAP.items():
+        v = _num_or_none(summ.get(label))
+        row[key] = int(v) if v is not None and key.endswith("_n") else v
+    return row
+
+
+def report_to_compare(rows: pd.DataFrame) -> pd.DataFrame:
+    """저장된 스냅샷 → 화면의 비교표(ticker_summary) 형식."""
+    if rows is None or rows.empty:
+        return pd.DataFrame()
+    df = rows.rename(columns={"ticker": "종목", "sector": "섹터", "category": "유형", **REPORT_MAP})
+    keep = ["종목", "섹터", "유형"] + list(REPORT_MAP.values())
+    return df[[c for c in keep if c in df.columns]]
+
+
+def plus_share_trend(reports: pd.DataFrame) -> pd.DataFrame:
+    """날짜별 '검증 구간에서 평소보다 나았던 종목 비율' 추이 (전체·유형별)."""
+    if reports is None or reports.empty:
+        return pd.DataFrame()
+    d = reports.dropna(subset=["test_diff"]).copy()
+    d["plus"] = (d["test_diff"] > 0).astype(float) * 100
+    total = d.groupby("date")["plus"].mean().rename("전체")
+    by_cat = d.pivot_table(index="date", columns="category", values="plus", aggfunc="mean")
+    out = pd.concat([total, by_cat.reindex(columns=[c for c in CATEGORIES if c in by_cat.columns])], axis=1)
+    out.index = pd.to_datetime(out.index)
+    return out.sort_index().round(1)
+
+
+def live_health(ledger: pd.DataFrame, horizon: int = 4, min_n: int = 20) -> list[dict]:
+    """실전 예측의 유형별 건강 상태: 표본 부족 / 정상(평소 확률보다 나음) / 주의(못함)."""
+    out = []
+    if ledger is None or ledger.empty:
+        return out
+    d = ledger.copy()
+    d["유형"] = d["ticker"].map(category_of)
+    for cat in CATEGORIES:
+        g = d[d["유형"] == cat]
+        _, summ = calibration(g, horizon) if not g.empty else (None, {})
+        n = summ.get("n", 0) if summ else 0
+        if n < min_n:
+            status, msg = "표본 부족", f"채점 {n}건 / 판단에는 {min_n}건 이상 필요"
+        elif summ["brier"] < summ["brier_base"]:
+            status, msg = "정상", f"채점 {n}건 · 평소 확률보다 정확 (브라이어 {summ['brier']:.3f} < {summ['brier_base']:.3f})"
+        else:
+            status, msg = "주의", f"채점 {n}건 · 평소 확률보다 부정확 (브라이어 {summ['brier']:.3f} ≥ {summ['brier_base']:.3f})"
+        out.append({"유형": cat, "상태": status, "설명": msg, "n": n})
+    return out

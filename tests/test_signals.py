@@ -96,3 +96,24 @@ def test_app_and_core_versions_match():
     from pathlib import Path
     app = Path(__file__).resolve().parents[1].joinpath("valhalla.py").read_text(encoding="utf-8")
     assert re.search(r'REQUIRED_CORE_VERSION = "([^"]+)"', app).group(1) == core.CORE_VERSION
+
+
+def test_daily_report_helpers():
+    h = core.build_signal_history(_daily(), _daily(seed=1), _macro(2))
+    sig = core.action_signals(h)
+    rows = []
+    for day in ("2026-11-18", "2026-11-19"):
+        for t in ("SOXL", "FAS", "NVDA"):
+            r = core.report_row(sig, t, day)
+            assert r and r["category"] == core.category_of(t) and isinstance(r["test_n"], int)
+            rows.append(r)
+    rep = pd.DataFrame(rows)
+    cmp_df = core.report_to_compare(rep[rep["date"] == "2026-11-19"])
+    assert len(cmp_df) == 3 and "검증 차이(%p)" in cmp_df
+    assert core.compare_tables(cmp_df)["grid"].shape[0] >= 2
+    trend = core.plus_share_trend(rep)
+    assert len(trend) == 2 and "전체" in trend
+    ledger = pd.DataFrame({"ticker": ["SOXL"] * 25, "p_up_4w": [60.0] * 25, "base_4w": [50.0] * 25,
+                           "ret_4w": [1.0] * 20 + [-1.0] * 5})
+    health = {h["유형"]: h["상태"] for h in core.live_health(ledger)}
+    assert health["3배 ETF"] == "정상" and health["1배 ETF"] == "표본 부족"

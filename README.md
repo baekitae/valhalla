@@ -7,7 +7,7 @@
 | `valhalla.py` | Streamlit 화면 (7개 페이지) · 저장소 · 시세 조회 |
 | `valhalla_core.py` | 계산 로직 (평단·손익, 키움 파서, 지표, AI 엔진, 백테스트, 유전 알고리즘, 리그, 검증) |
 | `jobs/daily_league.py` | 리그 자동 실행 스크립트 (GitHub Actions) |
-| `jobs/weekly_signals.py` | 신호 관제 주간 예측 기록·채점 (GitHub Actions, KST 토 07:20) |
+| `jobs/daily_signals.py` | 신호 관제 매일 자동 점검: 주 1건 예측 기록·채점·섹터별 비교 저장 (GitHub Actions, KST 화~토 07:30) |
 | `.github/workflows/daily_league.yml` | 매일 KST 화~토 07:10 자동 실행 |
 | `.streamlit/config.toml` | 다크 테마 |
 | `requirements.txt` | 배포용 패키지 |
@@ -89,9 +89,12 @@ python -m pytest -q tests
 - **거시 신호 4개:** 10년물 금리 하락, 달러 약세, 유가 안정, VIX 진정
 - **확률:** 과거에 같은 점수가 나왔던 주의 4·12주 뒤 실제 상승 비율. 표본이 적으면 평소 확률 쪽으로 보정합니다.
 - **과최적화 점검:** 최근 2년은 확률 계산에 쓰지 않는 검증 구간으로 따로 보여 줍니다.
-- **예측 장부:** 매주 토요일 아침 자동으로 마감된 주의 예측을 남기고(같은 주는 다시 쓰지 않음), 기간이 지나면 실제 수익률로 채점합니다. 화면에서 확률 정확도(브라이어 점수)를 '평소 확률'과 비교합니다.
+- **매일 자동 점검:** 매일 아침 53개 종목의 섹터·유형별 비교 결과를 `valhalla_signal_reports`에 저장하고, 화면은 최신 결과와 날짜별 추이를 보여 줍니다.
+- **예측 장부:** 매일 아침 자동 점검이 마감된 주의 예측을 주 1건씩 남기고(같은 주는 다시 쓰지 않음), 기간이 지나면 실제 수익률로 채점합니다. 화면에서 확률 정확도(브라이어 점수)를 '평소 확률'과 비교합니다.
 
 ### 처음 한 번: Supabase 테이블 만들기 (SQL Editor)
+
+`valhalla_signal_reports`(매일 비교 스냅샷)도 필요합니다. 구조는 `jobs/daily_signals.py`와 `valhalla_core.REPORT_MAP` 참고.
 
 ```sql
 create table if not exists valhalla_predictions (

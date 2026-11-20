@@ -1,15 +1,15 @@
-name: 신호 관제 주간 예측 기록
+name: 신호 관제 매일 자동 점검
 
 on:
   schedule:
-    # 한국 시간 토 07:20 (미국 금요일 장 마감 후) = UTC 금 22:20
-    - cron: "20 22 * * 5"
+    # 한국 시간 화~토 07:30 (미국 장 마감 후) = UTC 월~금 22:30
+    - cron: "30 22 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
   signals:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,8 +17,8 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install pandas numpy yfinance supabase
-      - name: 반등 신호 예측 기록 · 지난 예측 채점
+      - name: 예측 기록(주 1건) · 채점 · 섹터·유형별 비교 저장
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python jobs/weekly_signals.py
+        run: python jobs/daily_signals.py

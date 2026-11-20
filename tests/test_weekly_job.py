@@ -6,7 +6,7 @@ import pandas as pd
 
 from tests.test_signals import _daily
 
-spec = importlib.util.spec_from_file_location("weekly", Path(__file__).resolve().parents[1] / "jobs/weekly_signals.py")
+spec = importlib.util.spec_from_file_location("daily", Path(__file__).resolve().parents[1] / "jobs/daily_signals.py")
 weekly = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(weekly)
 
@@ -26,6 +26,10 @@ class FakeQuery:
         self.op, self.payload = "insert", row
         return self
 
+    def upsert(self, rows, on_conflict=None):
+        self.op, self.payload = "upsert", rows
+        return self
+
     def update(self, patch):
         self.op, self.payload = "update", patch
         return self
@@ -35,6 +39,11 @@ class FakeQuery:
         match = [r for r in rows if all(str(r.get(c)) == str(v) for c, v in self.filters)]
         if self.op == "insert":
             rows.append({"id": len(rows) + 1, **self.payload})
+        elif self.op == "upsert":
+            keys = (on_keys := ("date", "ticker"))
+            for r in self.payload:
+                rows[:] = [x for x in rows if tuple(x.get(k) for k in keys) != tuple(r.get(k) for k in keys)]
+                rows.append(r)
         elif self.op == "update":
             for r in match:
                 r.update(self.payload)
@@ -63,8 +72,10 @@ def test_job_records_once_and_grades():
     msg1 = weekly.run(sb, fetch)
     msg2 = weekly.run(sb, fetch)
     rows = sb.db["valhalla_predictions"]
-    assert len(rows) == 2, msg1
-    assert "이미 기록됨" in msg2
+    assert len(rows) == 2, msg1                     # 매일 돌아도 주 1건
+    assert "새 예측 0건" in msg2
+    reports = sb.db["valhalla_signal_reports"]
+    assert len(reports) == 1 and reports[0]["ticker"] == "SOXL"   # 같은 날 재실행 → 갱신
     assert rows[0]["ret_4w"] is not None and rows[0]["ret_12w"] is not None
 
 
@@ -87,4 +98,4 @@ def test_one_failing_ticker_does_not_stop_others():
             raise RuntimeError("boom")
         return d
     msg = weekly.run(sb, fetch)
-    assert "BAD: 실패" in msg and len(sb.db["valhalla_predictions"]) == 1
+    assert "BAD(" in msg and len(sb.db["valhalla_predictions"]) == 1

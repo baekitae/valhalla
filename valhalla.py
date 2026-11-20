@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-4"
+REQUIRED_CORE_VERSION = "2026.11.20-5"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1525,6 +1525,18 @@ def load_predictions(backend_name: str) -> tuple[pd.DataFrame, str | None]:
     return df[PRED_COLUMNS], None
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_reports(backend_name: str) -> pd.DataFrame:
+    """매일 자동 점검 스냅샷 (Supabase 전용)."""
+    if backend_name != "supabase":
+        return pd.DataFrame()
+    try:
+        return pd.DataFrame(_sb_fetch_all(core.REPORT_TABLE))
+    except Exception as exc:
+        LOGGER.warning("자동 점검 기록 조회 실패: %s", exc)
+        return pd.DataFrame()
+
+
 def save_prediction(pred: dict) -> None:
     row = {k: pred.get(k) for k in PRED_COLUMNS if k in pred}
     if backend() == "supabase":
@@ -1748,7 +1760,11 @@ def page_signals() -> None:
     section("섹터 · 유형별 과거 비교", "같은 매수 규칙을 13개 섹터의 3배·2배·1배 ETF·개별 종목에 똑같이 적용한 과거 성적입니다. "
                                   "'차이(%p)'가 한 섹터가 아니라 여러 섹터에서 꾸준히 플러스여야 우연이 아닌 신호예요.")
     n_uni = len(core.SIGNAL_UNIVERSE)
-    if st.button(f"섹터·유형별 비교 계산 ({n_uni}개 종목 · 3~5분)", icon=":material/compare_arrows:", key="cmp_run"):
+    reports = load_reports(backend())
+    latest_day = str(reports["date"].max())[:10] if not reports.empty else None
+    if latest_day:
+        st.caption(f"매일 아침 자동 점검 결과 · 기준일 {latest_day} (미국 장 마감 기준). 아래 버튼은 지금 바로 다시 계산할 때만 쓰세요.")
+    if st.button(f"지금 다시 계산 ({n_uni}개 종목 · 3~5분)", icon=":material/compare_arrows:", key="cmp_run"):
         rows = []
         prog = st.progress(0.0, text="종목별 신호 계산 중…")
         for i, (t, (p, _, _)) in enumerate(core.SIGNAL_UNIVERSE.items()):
@@ -1764,7 +1780,9 @@ def page_signals() -> None:
         prog.empty()
         st.session_state["sig_compare"] = pd.DataFrame(rows)
     cmp_df = st.session_state.get("sig_compare")
-    tables = core.compare_tables(cmp_df) if cmp_df is not None else {}
+    if cmp_df is None and latest_day:
+        cmp_df = core.report_to_compare(reports[reports["date"].astype(str).str[:10] == latest_day])
+    tables = core.compare_tables(cmp_df) if cmp_df is not None and not cmp_df.empty else {}
     if tables:
         share = tables["plus_share"]
         if np.isfinite(share):
@@ -1772,7 +1790,21 @@ def page_signals() -> None:
             (st.success if share >= 60 else st.warning if share >= 40 else st.error)(
                 msg + (" → 여러 섹터에서 통하는 편" if share >= 60 else " → 섹터·종목에 따라 갈림" if share >= 40
                        else " → 이 규칙은 믿기 어려움"), icon=":material/fact_check:")
-        g1, g2, g3 = st.tabs(["섹터 × 유형 격자", "유형별", "섹터별"])
+        g1, g2, g3, g4 = st.tabs(["섹터 × 유형 격자", "유형별", "섹터별", "날짜별 추이"])
+        with g4:
+            trend = core.plus_share_trend(reports)
+            if trend.empty or len(trend) < 2:
+                st.caption("자동 점검이 이틀 이상 쌓이면 추이가 표시됩니다. 이 선이 꾸준히 50% 위에 있어야 신호가 계속 통하는 거예요.")
+            else:
+                figt = go.Figure()
+                for i, col in enumerate(trend.columns):
+                    figt.add_trace(go.Scatter(x=trend.index, y=trend[col], name=col, mode="lines+markers",
+                                              line=dict(width=3 if col == "전체" else 1.5,
+                                                        color=ACCENT if col == "전체" else SERIES[(i + 1) % len(SERIES)])))
+                figt.add_hline(y=50, line=dict(color="rgba(148,163,184,.5)", dash="dot"))
+                base_layout(figt, 300)
+                figt.update_yaxes(range=[0, 100], ticksuffix="%", title_text="평소보다 나은 종목 비율")
+                show_chart(figt, key="cmp_trend")
         with g1:
             st.caption("칸의 숫자 = 검증 구간 매수 신호 4주 적중률 − 평소 확률 (%p). 빨강이 많을수록 신호가 통한 곳입니다.")
             def _cell(v):
@@ -1792,7 +1824,7 @@ def page_signals() -> None:
     else:
         st.caption("버튼을 누르면 결과가 이 화면에 유지됩니다.")
 
-    section("예측 장부", "매주 토요일 아침 자동으로 그 주의 예측을 남기고, 4·12주가 지나면 실제 결과로 채점합니다. "
+    section("예측 장부", "매일 아침 자동 점검이 마감된 주의 예측을 주 1건씩 남기고, 4·12주가 지나면 실제 결과로 채점합니다. "
                      "기록된 예측은 고치지 않습니다.")
     ledger, err = load_predictions(backend())
     if err and backend() == "supabase":
@@ -1801,6 +1833,15 @@ def page_signals() -> None:
         st.code(PRED_SQL, language="sql")
     else:
         all_ledger = ledger
+        health = core.live_health(all_ledger)
+        if health:
+            kinds = {"정상": "ok", "주의": "stop", "표본 부족": "warn"}
+            st.markdown("**실전 건강 상태 (매일 자동 채점)** &nbsp;" + " ".join(
+                pill(f"{h['유형']}: {h['상태']}", kinds[h["상태"]]) for h in health), unsafe_allow_html=True)
+            st.caption(" · ".join(f"{h['유형']} {h['설명']}" for h in health))
+            if any(h["상태"] == "주의" for h in health):
+                st.warning("실전에서 '평소 확률'보다 못한 유형이 있습니다. 그 유형의 신호는 당분간 참고하지 마세요.",
+                           icon=":material/health_and_safety:")
         ledger = ledger[ledger["ticker"] == ticker] if not ledger.empty else ledger
         by_cat = core.ledger_by_category(all_ledger, 4)
         if not by_cat.empty:
