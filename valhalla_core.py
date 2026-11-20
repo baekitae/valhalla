@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-11"
+CORE_VERSION = "2026.11.20-12"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -2199,6 +2199,51 @@ def crown_champion(sb, player: str, reason: str, now_iso: str) -> None:
 
 def champion_history(sb) -> list[dict]:
     return _rows(sb.table(CHAMPION_TABLE).select("*").order("id", desc=True).limit(30).execute())
+
+
+# ==========================================================================
+# 16. 본전 거리: 레버리지 ETF 평단 회복에 필요한 기초 지수 수준
+#   즉시 가정: 레버리지 L배면 가격 비율 = 지수 비율^L (출렁임 없이 바로 오를 때, 가장 낙관적)
+#   시간 가정: 매년 (L(L-1)/2)·σ² (변동성 손실) + 비용(차입·운용보수)만큼 더 깎인다고 보고 필요 지수를 올림
+# ==========================================================================
+LEV_COST = 0.0875          # 연 비용 가정: 차입 약 2×금리(8%) + 운용보수(0.75%)
+BREAKEVEN_HORIZONS = (0.0, 0.5, 1.0, 2.0)
+
+
+def leverage_drag(vol: float, lev: int = 3, cost: float = LEV_COST) -> float:
+    """연간 끌림(로그 기준): 변동성 손실 + 비용."""
+    return lev * (lev - 1) / 2 * vol ** 2 + cost
+
+
+def needed_index(index_now: float, price_now: float, target: float, lev: int = 3,
+                 years: float = 0.0, vol: float = 0.0, cost: float = LEV_COST) -> float:
+    ratio = target / price_now * np.exp(leverage_drag(vol, lev, cost) * years if years else 0.0)
+    return float(index_now * ratio ** (1 / lev))
+
+
+def breakeven_table(index_now: float, price_now: float, targets: dict[str, float], lev: int, vol: float,
+                    horizons=BREAKEVEN_HORIZONS) -> pd.DataFrame:
+    rows = []
+    for name, tgt in targets.items():
+        row = {"목표": name, "목표가": tgt}
+        for h in horizons:
+            need = needed_index(index_now, price_now, tgt, lev, h, vol)
+            label = "지금 즉시" if h == 0 else (f"{int(h * 12)}개월 뒤" if h < 1 else f"{int(h)}년 뒤")
+            row[label] = round(need, 0)
+            row[f"{label} 상승률(%)"] = round((need / index_now - 1) * 100, 1)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def needed_gain_history(index_close: pd.Series, price_close: pd.Series, target: float, lev: int = 3) -> pd.Series:
+    """날짜별 '지금 즉시' 기준 본전까지 필요한 지수 상승률(%). 줄어들면 본전이 가까워진 것."""
+    both = pd.concat([index_close.rename("i"), price_close.rename("p")], axis=1).dropna()
+    return ((target / both["p"]) ** (1 / lev) - 1) * 100
+
+
+def realized_vol(close: pd.Series, days: int = 252) -> float:
+    r = np.log(close / close.shift(1)).dropna().tail(days)
+    return float(r.std() * np.sqrt(252)) if len(r) > 20 else float("nan")
 
 
 def sb_fetch_all(sb, table: str, eq: dict | None = None, page: int = 1000) -> list[dict]:

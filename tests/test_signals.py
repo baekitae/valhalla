@@ -190,3 +190,16 @@ def test_charles_rules_follow_signal_index():
     # 과열: 평균선보다 25% 넘게 위면 절반(35%)
     hotc = pd.DataFrame({"Close": 100 * np.exp(np.linspace(0, 3.0, n))}, index=idx)
     assert abs(core.charles_exposure(soxl, hotc).iloc[-1] - 0.35) < 1e-9
+
+
+def test_breakeven_needed_index():
+    # 첨부 예시: SOX 9,419.72 · SOXL $45.30 · 평단 $163.41 → 즉시 기준 약 14,447 (+53.4%)
+    assert abs(core.needed_index(9419.72, 45.30, 163.41, 3) - 14447) < 2
+    later = core.needed_index(9419.72, 45.30, 163.41, 3, years=1, vol=0.30)
+    assert 16000 < later < 16600                          # 1년 뒤면 변동성·비용 때문에 더 올라야 함
+    t = core.breakeven_table(9419.72, 45.30, {"평단": 163.41, "최종": 200.0}, 3, 0.35)
+    assert list(t["지금 즉시 상승률(%)"].round(0)) == [53.0, 64.0]
+    assert (t["1년 뒤"] > t["지금 즉시"]).all() and (t["2년 뒤"] > t["1년 뒤"]).all()
+    idx = pd.bdate_range("2026-01-01", periods=3)
+    h = core.needed_gain_history(pd.Series([100, 100, 100.0], idx), pd.Series([50, 40, 60.0], idx), 100)
+    assert h.iloc[1] > h.iloc[0] > h.iloc[2]

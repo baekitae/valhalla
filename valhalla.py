@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-11"
+REQUIRED_CORE_VERSION = "2026.11.20-12"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -858,6 +858,82 @@ def render_what_if(hist: pd.DataFrame, price: float, pos: core.Position, model: 
         else:
             st.success(f"최대 매물대 {md_usd(resistance)} 도달 전에 빠져나오는 보수적인 타점입니다.",
                        icon=":material/verified:")
+
+    render_breakeven(ticker, pos.avg if pos.qty else None)
+
+
+BREAKEVEN_INDEX = {"SOXL": "^SOX", "USD": "^SOX", "SOXS": "^SOX"}
+
+
+def _secret_float(name: str) -> float | None:
+    try:
+        v = st.secrets.get(name)
+        return float(v) if v not in (None, "") else None
+    except Exception:
+        return None
+
+
+def render_breakeven(ticker: str, journal_avg: float | None) -> None:
+    """본전 거리: 평단 회복에 필요한 기초 지수 수준 (즉시 가정 + 시간이 걸릴 때)."""
+    cat = core.category_of(ticker)
+    lev = {"3배 ETF": 3, "2배 ETF": 2}.get(cat)
+    if lev is None:
+        return
+    idx_sym = BREAKEVEN_INDEX.get(ticker, core.partner_of(ticker))
+    section("본전 거리", f"{ticker} 평단을 회복하려면 기초 지수({idx_sym})가 어디까지 올라야 하는지 계산합니다. "
+                       "'지금 즉시'는 지수가 출렁임 없이 바로 오를 때(가장 낙관적)이고, 시간이 걸릴수록 레버리지의 "
+                       "변동성 손실과 비용 때문에 지수가 더 올라야 합니다. 매수·매도 신호가 아니라 장기 보유 부담을 보는 지표예요.")
+    default_avg = _secret_float(f"TOTAL_AVG_{ticker}") or journal_avg or 0.0
+    c = st.columns([1, 1.6, 1], vertical_alignment="bottom")
+    avg = c[0].number_input("기준 평단 (USD)", min_value=0.0, value=float(round(default_avg, 2)), step=0.01,
+                            key=f"be_avg_{ticker}",
+                            help="여러 계좌를 합친 통합 평단을 넣으세요. Streamlit Secrets에 "
+                                 f"TOTAL_AVG_{ticker}를 넣어두면 기본값으로 쓰입니다.")
+    extra_default = st.secrets.get(f"TARGETS_{ticker}", "") if hasattr(st, "secrets") else ""
+    extra = c[1].text_input("추가 목표가 (쉼표로 구분)", value=str(extra_default or ""), key=f"be_tg_{ticker}",
+                            placeholder="예: 165, 178.19, 200")
+    if avg <= 0:
+        st.caption("기준 평단을 넣으면 계산합니다.")
+        return
+    idx_df, px_df = load_long(idx_sym, "5y", False), load_long(ticker, "5y", False)
+    if idx_df is None or px_df is None or idx_df.empty or px_df.empty:
+        st.caption("지수 또는 가격 데이터를 불러오지 못했습니다.")
+        return
+    ic, pc = idx_df["Close"].dropna(), px_df["Close"].dropna()
+    vol = core.realized_vol(ic)
+    vol = vol if np.isfinite(vol) else 0.35
+    c[2].metric("지수 1년 변동성", f"{vol * 100:.0f}%", help="최근 252거래일 실제 변동성. 시간 가정 계산에 씁니다.")
+    targets = {"기준 평단": avg}
+    for part in str(extra).replace("$", "").split(","):
+        try:
+            v = float(part.strip())
+            if v > 0:
+                targets[f"${v:,.2f}"] = v
+        except ValueError:
+            continue
+    i_now, p_now = float(ic.iloc[-1]), float(pc.iloc[-1])
+    table = core.breakeven_table(i_now, p_now, targets, lev, vol)
+    hist = core.needed_gain_history(ic, pc, avg, lev)
+    m = st.columns(4)
+    m[0].metric(f"지금 {idx_sym}", f"{i_now:,.0f}", help=f"{ticker} ${p_now:,.2f} 기준")
+    m[1].metric("즉시 기준 필요 상승", f"{hist.iloc[-1]:+.0f}%")
+    for j, (d, lab) in enumerate([(5, "5거래일 전보다"), (20, "20거래일 전보다")]):
+        if len(hist) > d:
+            chg = hist.iloc[-1] - hist.iloc[-1 - d]
+            m[2 + j].metric(f"필요 상승 · {lab}", f"{chg:+.1f}%p", "본전에서 멀어짐" if chg > 0 else "본전에 가까워짐",
+                            delta_color="inverse" if chg > 0 else "normal")
+    show = table.drop(columns=[c for c in table.columns if c.endswith("(%)")])
+    for col in [c for c in show.columns if c not in ("목표", "목표가")]:
+        show[col] = [f"{v:,.0f} ({p:+.0f}%)" for v, p in zip(table[col], table[f"{col} 상승률(%)"])]
+    st.dataframe(show, hide_index=True, width="stretch",
+                 column_config={"목표가": st.column_config.NumberColumn(format="$%.2f")})
+    st.caption(f"시간 가정: 매년 변동성 손실({lev * (lev - 1) // 2}×변동성²)과 비용(약 {core.LEV_COST * 100:.1f}%)만큼 "
+               "더 깎인다고 보고 계산한 대략치입니다. 실제는 지수가 얼마나 출렁이며 오르느냐에 따라 달라져요.")
+    tail = hist.tail(250)
+    fig = go.Figure(go.Scatter(x=tail.index, y=tail.values, name="필요 상승률", line=dict(color=GOLD, width=2)))
+    base_layout(fig, 260)
+    fig.update_yaxes(title_text="본전까지 필요한 지수 상승률(%) · 즉시 기준")
+    show_chart(fig, key=f"be_chart_{ticker}")
 
 
 # ==========================================================================
