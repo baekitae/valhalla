@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-12"
+REQUIRED_CORE_VERSION = "2026.11.20-13"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1671,7 +1671,7 @@ def _streak(history: pd.DataFrame, threshold: int = 3) -> int:
     return n
 
 
-def render_actions(done: pd.DataFrame, ticker: str) -> None:
+def render_actions(done: pd.DataFrame, ticker: str, partner: str) -> None:
     """매수·매도 행동 신호: 현재 상태, 차트 표시, 과거 적중률, '신호대로 했다면' 비교."""
     state = load_rule_state(backend())
     rules, text = state["rules"], core.rule_text(state["rules"])
@@ -1707,28 +1707,11 @@ def render_actions(done: pd.DataFrame, ticker: str) -> None:
                 "20일선 아래" if last["above_ma20d"] == False else "20일선 위",  # noqa: E712
                 delta_color="off", delta_arrow="off", border=True, help=text["매도"])
 
-    view = sig[sig.index >= sig.index[-1] - pd.Timedelta(weeks=156)]
-    fig = go.Figure(go.Scatter(x=view.index, y=view["close"], name=f"{ticker} 주봉 종가", line=dict(color=GOLD, width=2)))
-    for kind, sym, color, pos in (("매수", "triangle-up", UP, "bottom center"), ("매도", "triangle-down", DOWN, "top center")):
-        pts = view[view["action"] == kind]
-        fig.add_trace(go.Scatter(x=pts.index, y=pts["close"], mode="markers+text", name=f"{kind} 신호", text=[kind] * len(pts),
-                                 textposition=pos, textfont=dict(color=color, size=11),
-                                 marker=dict(symbol=sym, size=13, color=color, line=dict(width=1, color="#0B1220"))))
-    for i, (cv, crule) in enumerate(state.get("challengers", [])):
-        csig = core.action_signals(done, crule)
-        cview = csig[csig.index >= view.index[0]]
-        for kind, sym, color in (("매수", "triangle-up-open", UP), ("매도", "triangle-down-open", DOWN)):
-            pts = cview[cview["action"] == kind]
-            if not pts.empty:
-                fig.add_trace(go.Scatter(x=pts.index, y=pts["close"], mode="markers", name=f"도전자 v{cv} {kind}",
-                                         marker=dict(symbol=sym, size=15 + 3 * i, color=color, line=dict(width=2, color=color))))
-        last_c = csig.iloc[-1]
-        st.caption(f"도전자 v{cv} ({core.rule_text(crule)['매수']}): 이번 주 "
-                   f"{last_c['action'] + ' 신호' if last_c['action'] else '새 신호 없음'} · 현재 상태 {last_c['state'] or '신호 없음'} "
-                   "· 차트의 빈 삼각형")
-    base_layout(fig, 360)
-    fig.update_yaxes(type="log", title_text="가격 (로그)")
-    show_chart(fig, key="act_chart")
+    for cv, crule in state.get("challengers", []):
+        last_c = core.action_signals(done, crule).iloc[-1]
+        st.caption(f"도전 규칙 v{cv} ({core.rule_text(crule)['매수']}): 이번 주 "
+                   f"{last_c['action'] + ' 신호' if last_c['action'] else '새 신호 없음'} · 현재 상태 {last_c['state'] or '신호 없음'}")
+    render_player_chart(ticker, partner, sig.index[-1] - pd.Timedelta(weeks=156))
 
     bt = core.action_backtest(sig)
     if not bt:
@@ -1903,7 +1886,8 @@ def load_arena(backend_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_player_backtest(ticker: str, partner: str, rules_key: str) -> pd.DataFrame:
+def cached_player_positions(ticker: str, partner: str, rules_key: str) -> pd.DataFrame:
+    """계산 가능한 선수들의 주별 비중표 (마감된 주까지). 마지막 열에 종가."""
     daily = load_long(ticker, "max", True)
     if daily is None:
         return pd.DataFrame()
@@ -1911,7 +1895,88 @@ def cached_player_backtest(ticker: str, partner: str, rules_key: str) -> pd.Data
     hist = core.complete_weeks(load_signal_history(ticker, partner), us_asof())
     rules = [(int(v), core.normalize_rules(r)) for v, r in json.loads(rules_key)]
     pos = core.player_positions(hist, daily, core.trend_reference(ticker, daily, partner_df), rules, ticker)
-    return core.backtest_players(pos, hist["close"])
+    pos["close"] = hist["close"]
+    return pos
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_player_backtest(ticker: str, partner: str, rules_key: str) -> pd.DataFrame:
+    pos = cached_player_positions(ticker, partner, rules_key)
+    if pos.empty:
+        return pd.DataFrame()
+    return core.backtest_players(pos.drop(columns=["close"]), pos["close"])
+
+
+PLAYER_COLORS = ["#F04452", "#3182F6", "#F5A524", "#22C55E", "#A855F7", "#14B8A6", "#EC4899", "#94A3B8",
+                 "#EAB308", "#06B6D4", "#F97316", "#84CC16"]
+
+
+def render_player_chart(ticker: str, partner: str, view_start: pd.Timestamp) -> None:
+    """선수를 골라 차트에 매수·매도 시점과 주별 비중을 겹쳐 봄."""
+    state = load_rule_state(backend())
+    rules = [(state["version"], state["rules"])] + list(state.get("challengers", []))
+    pos = cached_player_positions(ticker, partner, json.dumps([[v, r] for v, r in rules]))
+    if pos.empty:
+        return
+    close = pos["close"]
+    players = [c for c in pos.columns if c != "close" and pos[c].notna().any()]
+    live, _ = load_arena(backend())
+    live = live[live["ticker"] == ticker] if not live.empty else live
+    for pid in ("ai_council", "ensemble"):
+        if not live.empty and (live["player"] == pid).any():
+            players.append(pid)
+    champ = load_champion_state(backend())["champion"]["player"]
+    lead = f"rule_v{state['version']}"
+    default = [p for p in dict.fromkeys([champ, lead]) if p in players] or players[:1]
+    label = {p: ("👑 " if p == champ else "") + core.player_label(p) for p in players}
+    picked = st.multiselect("차트에 표시할 선수 (최대 4명)", players, default=default, max_selections=4,
+                            format_func=lambda p: label[p], key=f"chart_players_{ticker}")
+    if not picked:
+        st.caption("선수를 골라 주세요.")
+        return
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
+    view_close = close[close.index >= view_start]
+    fig.add_trace(go.Scatter(x=view_close.index, y=view_close, name=f"{ticker} 주봉 종가",
+                             line=dict(color=GOLD, width=2)), row=1, col=1)
+    single = len(picked) == 1
+    notes = []
+    for i, pid in enumerate(picked):
+        color = PLAYER_COLORS[players.index(pid) % len(PLAYER_COLORS)]
+        if pid in pos.columns:
+            series = pos[pid]
+        else:
+            g = live[live["player"] == pid].copy()
+            series = pd.Series(g["position"].astype(float).to_numpy(), index=pd.to_datetime(g["week"])).sort_index()
+        moves = core.position_moves(series)
+        moves = moves[moves.index >= view_start]
+        for kind, sym in (("매수", "triangle-up"), ("매도", "triangle-down")):
+            pts = moves[moves["action"] == kind]
+            if pts.empty:
+                continue
+            y = close.reindex(pts.index)
+            txt = [f"{kind} {a * 100:.0f}→{b * 100:.0f}%" for a, b in zip(pts["from"], pts["to"])]
+            fill = (UP if kind == "매수" else DOWN) if single else color
+            fig.add_trace(go.Scatter(x=pts.index, y=y, mode="markers+text" if single else "markers",
+                                     name=f"{label[pid]} {kind}", text=[kind] * len(pts) if single else None,
+                                     textposition="bottom center" if kind == "매수" else "top center",
+                                     textfont=dict(color=fill, size=11), hovertext=txt, hoverinfo="text+x",
+                                     marker=dict(symbol=sym, size=13, color=fill, line=dict(width=1.5, color="#0B1220")),
+                                     legendgroup=pid), row=1, col=1)
+        w = series[series.index >= view_start] * 100
+        fig.add_trace(go.Scatter(x=w.index, y=w, name=f"{label[pid]} 비중", line=dict(color=color, width=2, shape="hv"),
+                                 legendgroup=pid, showlegend=not single), row=2, col=1)
+        cur = series.dropna()
+        if not cur.empty:
+            last_move = core.position_moves(series).tail(1)
+            lm = (f" · 마지막 {last_move['action'].iloc[0]} {last_move.index[0]:%Y-%m-%d}"
+                  if not last_move.empty else "")
+            notes.append(f"**{label[pid]}** 이번 주 비중 {cur.iloc[-1] * 100:.0f}%{lm}")
+    base_layout(fig, 460)
+    fig.update_yaxes(type="log", title_text="가격 (로그)", row=1, col=1)
+    fig.update_yaxes(range=[-5, 105], title_text="비중 %", row=2, col=1)
+    show_chart(fig, key=f"player_chart_{ticker}")
+    st.caption(" · ".join(notes) + ". 비중이 25%p 이상 늘면 매수(▲), 줄면 매도(▼)로 표시합니다. "
+               "AI 위원회·앙상블은 실전 기록이 있는 주만 나옵니다.")
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -2108,7 +2173,7 @@ def page_signals() -> None:
     fig.update_yaxes(type="log", title_text="가격", secondary_y=True, showgrid=False)
     show_chart(fig, key="sig_trend")
 
-    render_actions(done, ticker)
+    render_actions(done, ticker, partner)
     render_arena(ticker, partner)
     render_rule_improvement()
 

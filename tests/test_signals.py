@@ -203,3 +203,13 @@ def test_breakeven_needed_index():
     idx = pd.bdate_range("2026-01-01", periods=3)
     h = core.needed_gain_history(pd.Series([100, 100, 100.0], idx), pd.Series([50, 40, 60.0], idx), 100)
     assert h.iloc[1] > h.iloc[0] > h.iloc[2]
+
+
+def test_position_moves_marks_only_meaningful_changes():
+    idx = pd.date_range("2026-01-02", periods=8, freq="W-FRI")
+    rule = pd.Series([1, 1, 0, 0, 1, 1, 1, 0], idx, dtype=float)
+    m = core.position_moves(rule)
+    assert list(m["action"]) == ["매도", "매수", "매도"]
+    wobble = pd.Series([0.5, 0.55, 0.45, 0.6, 0.8, 0.79, 0.5, 0.52], idx)   # 잔떨림은 무시
+    m2 = core.position_moves(wobble)
+    assert list(m2["action"]) == ["매수", "매도"] and m2["to"].iloc[0] == 0.8

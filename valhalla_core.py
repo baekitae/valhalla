@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-12"
+CORE_VERSION = "2026.11.20-13"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1990,6 +1990,21 @@ def player_positions(hist: pd.DataFrame, daily: pd.DataFrame, ref_daily: pd.Data
     if ticker is not None and category_of(ticker) in TECHNIQUE_CATEGORIES:
         out = out.join(technique_positions(hist.index, daily, ref_daily))
     return out
+
+
+def position_moves(pos: pd.Series, step: float = 0.25) -> pd.DataFrame:
+    """비중 변화 → 차트 표시용 매수(늘림)·매도(줄임) 시점.
+    잘게 흔들리는 선수(변동성 조절 등)가 매주 표시되지 않도록, 마지막 표시 때보다 step 이상 바뀌었을 때만 표시."""
+    p = pos.dropna().astype(float)
+    rows, ref = [], None
+    for t, v in p.items():
+        if ref is None:
+            ref = v
+            continue
+        if abs(v - ref) >= step - 1e-9:
+            rows.append({"week": t, "action": "매수" if v > ref else "매도", "from": ref, "to": v})
+            ref = v
+    return pd.DataFrame(rows, columns=["week", "action", "from", "to"]).set_index("week")
 
 
 def trend_reference(ticker: str, daily: pd.DataFrame, partner_daily: pd.DataFrame | None) -> pd.DataFrame | None:
