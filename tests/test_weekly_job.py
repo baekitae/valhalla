@@ -29,6 +29,9 @@ class FakeQuery:
         self.filters.append((col, val))
         return self
 
+    def limit(self, n):
+        return self
+
     def insert(self, row):
         self.op, self.payload = "insert", row
         return self
@@ -181,3 +184,38 @@ def test_positions_recorded_graded_and_ensemble():
     n = len(sb.db["valhalla_positions"])
     weekly.run(sb, lambda t, adj: d)
     assert len(sb.db["valhalla_positions"]) == n
+
+
+def test_any_player_can_become_champion():
+    core = weekly.core
+    sb = FakeSB()
+    sb.table(core.RULE_TABLE).insert({"version": 1, "status": "active", "params": core.ACTION_RULES}).execute()
+    assert core.load_champion(sb)["player"] == "rule_v1"          # 첫 챔피언 = 활성 규칙
+    weeks = pd.date_range("2026-01-02", periods=25, freq="W-FRI").strftime("%Y-%m-%d")
+    rows = []
+    for i, w in enumerate(weeks):
+        r = 2.0 if i % 2 else -2.0                                  # 오르고 내리는 장
+        for t in ("AAA", "BBB"):
+            rows += [{"player": "rule_v1", "ticker": t, "week": w, "position": 1.0, "ret_1w": r},
+                     {"player": "trend200", "ticker": t, "week": w, "position": 1.0 if r > 0 else 0.0, "ret_1w": r},
+                     {"player": "hold", "ticker": t, "week": w, "position": 1.0, "ret_1w": r},
+                     {"player": "ensemble", "ticker": t, "week": w, "position": 0.0, "ret_1w": r}]
+    graded = pd.DataFrame(rows)
+    v = core.arena_verdicts(graded, "rule_v1")
+    assert v["trend200"][0] == "promote"                            # 기준 선수도 승격 추천
+    assert v["hold"][0] == "close" and v["ensemble"][0] in ("close", "behind")
+    short = core.arena_verdicts(graded[graded["week"] <= weeks[5]], "rule_v1")
+    assert short["trend200"][0] == "short"
+    core.crown_champion(sb, "trend200", "test", "2026-06-01")
+    assert core.load_champion(sb)["player"] == "trend200"
+    assert [h["status"] for h in sb.db[core.CHAMPION_TABLE]].count("champion") == 1
+
+
+def test_rule_promotion_carries_crown():
+    core = weekly.core
+    sb = FakeSB()
+    sb.table(core.RULE_TABLE).insert({"version": 1, "status": "active", "params": core.ACTION_RULES}).execute()
+    sb.table(core.RULE_TABLE).insert({"version": 2, "status": "challenger", "params": core.ACTION_RULES}).execute()
+    core.load_champion(sb)
+    core.decide_proposal(sb, 2, "accept", "2026-06-01")
+    assert core.load_champion(sb)["player"] == "rule_v2"

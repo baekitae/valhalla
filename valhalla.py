@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-8"
+REQUIRED_CORE_VERSION = "2026.11.20-9"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1705,13 +1705,13 @@ def _ev_table(ev_cur: dict | None, ev_new: dict | None) -> pd.DataFrame:
 
 def render_rule_improvement() -> None:
     state = load_rule_state(backend())
-    section("규칙 개선 · 챔피언 vs 도전자", "매달 1일 자동 점검: 후보 432개 중 학습 구간으로 1개를 고르고, 최근 2년에서 지금 규칙보다 "
+    section("규칙 개선 · 대표 규칙 vs 도전 규칙", "매달 1일 자동 점검: 후보 432개 중 학습 구간으로 1개를 고르고, 최근 2년에서 지금 규칙보다 "
                      "확실히 나을 때만 제안합니다. 바로 적용하거나, 도전자로 등록해 실전 신호로 경쟁시킬 수 있어요.")
     if backend() != "supabase":
         st.caption("Supabase 연결이 있어야 규칙 버전 관리가 동작합니다.")
         return
     text = core.rule_text(state["rules"])
-    st.markdown(f"**챔피언 v{state['version']}** · 매수: {text['매수']} · 매도: {text['매도']}")
+    st.markdown(f"**대표 규칙 v{state['version']}** · 매수: {text['매수']} · 매도: {text['매도']}")
     p = state["pending"]
     if p:
         params = p["params"] if isinstance(p["params"], dict) else json.loads(p["params"])
@@ -1734,6 +1734,7 @@ def render_rule_improvement() -> None:
                          help="지금 규칙을 이 규칙으로 바로 교체합니다."):
                 core.decide_proposal(get_supabase(), int(p["id"]), "accept", now_iso)
                 load_rule_state.clear()
+                load_champion_state.clear()
                 flash(f"규칙 v{p['version']}을 적용했습니다.")
                 st.rerun()
             full = len(state.get("challengers", [])) >= core.MAX_CHALLENGERS
@@ -1741,19 +1742,21 @@ def render_rule_improvement() -> None:
                          help="지금 규칙은 그대로 두고, 오늘부터 실전 신호로 승부를 가립니다."):
                 core.decide_proposal(get_supabase(), int(p["id"]), "challenge", now_iso)
                 load_rule_state.clear()
+                load_champion_state.clear()
                 flash(f"규칙 v{p['version']}을 도전자로 등록했습니다. 매일 실전 신호로 경쟁합니다.")
                 st.rerun()
             if c3.button("거절", icon=":material/close:", key="rule_reject"):
                 core.decide_proposal(get_supabase(), int(p["id"]), "reject", now_iso)
                 load_rule_state.clear()
+                load_champion_state.clear()
                 flash("제안을 거절했습니다. 지금 규칙을 유지합니다.")
                 st.rerun()
     else:
         st.caption("승인 대기 중인 제안이 없습니다.")
     challengers = state.get("challengers", [])
     if challengers:
-        st.markdown("**챔피언 vs 도전자 (오늘부터 쌓이는 실전 신호로만 비교)**")
-        roles = {state["version"]: "챔피언", **{v: "도전자" for v, _ in challengers}}
+        st.markdown("**대표 규칙 vs 도전 규칙 (오늘부터 쌓이는 실전 신호로만 비교)**")
+        roles = {state["version"]: "대표", **{v: "도전" for v, _ in challengers}}
         live = state.get("live", pd.DataFrame())
         live = live[live["rule_version"].isin(list(roles))] if not live.empty else live
         table = core.rule_competition(live, roles)
@@ -1771,17 +1774,19 @@ def render_rule_improvement() -> None:
                 st.markdown(f"**도전자 v{v}** {pill(verdict.split(' (')[0], kind)} · 매수: {core.rule_text(crule)['매수']}",
                             unsafe_allow_html=True)
                 st.caption(verdict + f" · 승격 기준: 매수 채점 {core.PROMOTE_MIN['graded']}건·서로 다른 {core.PROMOTE_MIN['weeks']}주 이상, "
-                           f"챔피언보다 적중률 +{core.PROMOTE_MIN['hit_gain']:.0f}%p")
+                           f"대표 규칙보다 적중률 +{core.PROMOTE_MIN['hit_gain']:.0f}%p")
                 b1, b2, _ = st.columns([1, 1, 3])
-                if row and b1.button("챔피언으로 승격", key=f"promote_{v}", icon=":material/military_tech:",
+                if row and b1.button("대표 규칙으로 승격", key=f"promote_{v}", icon=":material/military_tech:",
                                      type="primary" if verdict.startswith("승격") else "secondary"):
                     core.decide_proposal(get_supabase(), int(row["id"]), "accept", now_iso)
                     load_rule_state.clear()
-                    flash(f"v{v}을 챔피언으로 승격했습니다.")
+                    load_champion_state.clear()
+                    flash(f"v{v}을 대표 규칙으로 올렸습니다.")
                     st.rerun()
                 if row and b2.button("경쟁 종료", key=f"retire_{v}", icon=":material/flag:"):
                     core.decide_proposal(get_supabase(), int(row["id"]), "retire", now_iso)
                     load_rule_state.clear()
+                    load_champion_state.clear()
                     flash(f"v{v}의 경쟁을 종료했습니다.")
                     st.rerun()
     runs = load_job_runs(backend())
@@ -1795,7 +1800,7 @@ def render_rule_improvement() -> None:
             for h in state["history"]:
                 prm = h["params"] if isinstance(h["params"], dict) else json.loads(h["params"])
                 t = core.rule_text(core.normalize_rules(prm))
-                rows.append({"버전": h["version"], "상태": {"active": "챔피언(사용 중)", "proposed": "승인 대기", "rejected": "거절",
+                rows.append({"버전": h["version"], "상태": {"active": "대표(사용 중)", "proposed": "승인 대기", "rejected": "거절",
                                                           "challenger": "도전자", "retired": "이전 규칙"}.get(h["status"], h["status"]),
                              "매수": t["매수"], "매도": t["매도"], "이유": h.get("reason"),
                              "등록": str(h.get("created_at"))[:16], "결정": str(h.get("decided_at") or "")[:16]})
@@ -1831,12 +1836,40 @@ def cached_player_backtest(ticker: str, partner: str, rules_key: str) -> pd.Data
     return core.backtest_players(pos, hist["close"])
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_champion_state(backend_name: str) -> dict:
+    """경기장 챔피언과 이력."""
+    if backend_name != "supabase":
+        return {"champion": {"player": "rule_v1", "reason": "기본"}, "history": []}
+    try:
+        sb = get_supabase()
+        return {"champion": core.load_champion(sb), "history": core.champion_history(sb)}
+    except Exception as exc:
+        LOGGER.warning("챔피언 조회 실패 (테이블 없음?): %s", exc)
+        return {"champion": {"player": "rule_v1", "reason": "기본"}, "history": []}
+
+
 def render_arena(ticker: str, partner: str) -> None:
     section("선수 경기장", "모든 선수가 매주 종목별 비중(0~100%)을 내고, 다음 주 실제 수익률로 똑같이 채점합니다. "
-                       "'그냥 보유'보다 나아야 쓸모 있는 선수예요.")
+                       "규칙이든 기준 선수든 AI 위원회든 앙상블이든, 챔피언을 이기면 누구나 챔피언이 될 수 있어요.")
     state = load_rule_state(backend())
     rules = [(state["version"], state["rules"])] + list(state.get("challengers", []))
     pos, mins = load_arena(backend())
+    champ_state = load_champion_state(backend())
+    champ = champ_state["champion"]["player"]
+    alive = {f"rule_v{state['version']}"} | {f"rule_v{v}" for v, _ in state.get("challengers", [])}
+    cur_pos = None
+    if not pos.empty:
+        mine = pos[(pos["ticker"] == ticker) & (pos["player"] == champ)]
+        if not mine.empty:
+            cur_pos = float(mine.sort_values("week")["position"].iloc[-1])
+    msg = f"👑 현재 챔피언: **{core.player_label(champ)}**"
+    if cur_pos is not None:
+        msg += f" · 이번 주 {ticker} 비중 **{cur_pos * 100:.0f}%**"
+    st.info(msg + " — 경기장의 공식 판단은 챔피언의 비중을 따릅니다.", icon=":material/military_tech:")
+    if champ.startswith("rule_v") and champ not in alive:
+        st.warning(f"챔피언 {core.player_label(champ)}은 경쟁이 종료되어 더 이상 기록되지 않습니다. 아래에서 새 챔피언을 정해 주세요.",
+                   icon=":material/warning:")
     t1, t2, t3 = st.tabs(["실전 경기표", f"{ticker} 과거 성적", "AI 위원회 회의록"])
     with t1:
         if pos.empty:
@@ -1848,12 +1881,38 @@ def render_arena(ticker: str, partner: str) -> None:
             if table.empty:
                 st.caption("채점된 기록이 아직 없습니다 (비중을 낸 다음 주 금요일 종가가 나오면 채점).")
             else:
+                tick_scope = core.COUNCIL_TICKERS if scope.startswith("AI") else None
+                verdicts = core.arena_verdicts(pos, champ, tick_scope)
+                table["선수"] = [("👑 " if i == champ else "") + n for i, n in zip(table["id"], table["선수"])]
+                table["챔피언 도전 판정"] = [("현재 챔피언" if i == champ else verdicts.get(i, ("short", "기록 없음"))[1])
+                                     for i in table["id"]]
                 st.dataframe(table.drop(columns=["id"]), hide_index=True, width="stretch",
                              column_config={"누적(%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                                            "보유 대비(%p)": st.column_config.NumberColumn(format="%+.2f")})
+                                            "보유 대비(%p)": st.column_config.NumberColumn(format="%+.2f"),
+                                            "챔피언 도전 판정": st.column_config.TextColumn(width="large")})
                 weeks = int(table["채점 주 수"].max())
-                if weeks < 20:
-                    st.caption(f"채점 {weeks}주째입니다. 최소 20주는 지나야 순위를 믿을 수 있어요.")
+                th = core.ARENA_PROMOTE
+                st.caption(f"승격 기준: 챔피언과 같은 종목·같은 주로 {th['weeks']}주 이상 맞대결해서 누적 수익이 "
+                           f"{th['gain']:.0f}%p 이상 높고, 최대 낙폭이 {th['mdd_slack']:.0f}%p 넘게 나쁘지 않을 것. "
+                           "기준을 넘으면 '승격 추천'이 뜨고, 올릴지는 직접 결정합니다."
+                           + (f" 지금은 채점 {weeks}주째라 아직 아무도 도전 자격이 없어요." if weeks < th["weeks"] else ""))
+                ready = [i for i, (code, _) in verdicts.items() if code == "promote"]
+                for pid in ready:
+                    cols = st.columns([3, 1], vertical_alignment="center")
+                    cols[0].success(f"**{core.player_label(pid)}** — {verdicts[pid][1]}", icon=":material/emoji_events:")
+                    if cols[1].button("챔피언으로 올리기", key=f"crown_{pid}", type="primary", width="stretch"):
+                        core.crown_champion(get_supabase(), pid, f"{scope} 경기에서 승격: {verdicts[pid][1]}",
+                                            pd.Timestamp.now(tz="Asia/Seoul").isoformat())
+                        load_champion_state.clear()
+                        st.rerun()
+            hist_rows = champ_state.get("history") or []
+            if hist_rows:
+                with st.expander("챔피언 이력"):
+                    st.dataframe(pd.DataFrame([{"선수": core.player_label(h["player"]),
+                                                "상태": "현재" if h.get("status") == "champion" else "이전",
+                                                "이유": h.get("reason"), "등극": str(h.get("created_at") or "")[:16],
+                                                "물러남": str(h.get("ended_at") or "")[:16]} for h in hist_rows]),
+                                 hide_index=True, width="stretch")
             latest = pos[(pos["ticker"] == ticker)]
             if not latest.empty:
                 wk = latest["week"].max()

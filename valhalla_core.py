@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-8"
+CORE_VERSION = "2026.11.20-9"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1656,11 +1656,23 @@ MAX_CHALLENGERS = 3
 def decide_proposal(sb, proposal_id: int, decision, now_iso: str) -> None:
     """decision: True/'accept'(챔피언으로) · False/'reject'(거절) · 'challenge'(도전자로 경쟁) · 'retire'(경쟁 종료)."""
     decision = {True: "accept", False: "reject"}.get(decision, decision)
+    old_versions = []
     if decision == "accept":
         for row in _rows(sb.table(RULE_TABLE).select("*").eq("status", "active").execute()):
+            old_versions.append(int(row["version"]))
             sb.table(RULE_TABLE).update({"status": "retired", "decided_at": now_iso}).eq("id", row["id"]).execute()
     status = {"accept": "active", "reject": "rejected", "challenge": "challenger", "retire": "retired"}[decision]
     sb.table(RULE_TABLE).update({"status": status, "decided_at": now_iso}).eq("id", proposal_id).execute()
+    if decision == "accept" and old_versions:
+        # 경기장 챔피언이 옛 대표 규칙이었다면 새 대표 규칙이 자리를 이어받음
+        try:
+            new = _rows(sb.table(RULE_TABLE).select("version").eq("id", proposal_id).execute())
+            cur = _rows(sb.table(CHAMPION_TABLE).select("*").eq("status", "champion").execute())
+            if new and cur and cur[0]["player"] in {f"rule_v{v}" for v in old_versions}:
+                crown_champion(sb, f"rule_v{new[0]['version']}",
+                               f"대표 규칙 교체로 이어받음 (v{old_versions[0]} → v{new[0]['version']})", now_iso)
+        except Exception:
+            pass
 
 
 def load_challengers(sb) -> list[tuple[int, dict]]:
@@ -1910,6 +1922,83 @@ def arena_table(graded: pd.DataFrame, tickers: list[str] | None = None) -> pd.Da
                      "들어갔을 때 오른 비율(%)": round(float((inn["ret_1w"] > 0).mean() * 100), 1) if len(inn) else None,
                      "빠졌을 때 피한 비율(%)": round(float((out["ret_1w"] < 0).mean() * 100), 1) if len(out) else None})
     return pd.DataFrame(rows).sort_values("누적(%)", ascending=False).reset_index(drop=True)
+
+
+# ---- 경기장 챔피언: 규칙뿐 아니라 모든 선수가 챔피언이 될 수 있음 ----
+CHAMPION_TABLE = "valhalla_arena_champion"
+ARENA_PROMOTE = {"weeks": 20, "gain": 3.0, "mdd_slack": 5.0}
+
+
+def _curve_stats(rows: pd.DataFrame) -> tuple[float, float]:
+    """종목별로 (비중×수익) 복리 누적·최대 낙폭을 구해 종목 평균 (%)."""
+    rets, mdds = [], []
+    for _, g in rows.sort_values("week").groupby("ticker"):
+        eq = (1 + g["pr"]).cumprod()
+        rets.append(float(eq.iloc[-1] - 1))
+        mdds.append(float(((eq / eq.cummax()) - 1).min()))
+    return (float(np.mean(rets) * 100), float(np.mean(mdds) * 100)) if rets else (float("nan"), float("nan"))
+
+
+def arena_verdicts(graded: pd.DataFrame, champion: str, tickers: list[str] | None = None,
+                   th: dict | None = None) -> dict[str, tuple[str, str]]:
+    """챔피언과 '같은 종목·같은 주'만 맞대어 비교. 반환: 선수 → (코드, 설명).
+    코드: short(표본 부족) · promote(승격 추천) · behind(열세) · close(접전) · wait(챔피언 기록 없음)."""
+    th = {**ARENA_PROMOTE, **(th or {})}
+    out: dict[str, tuple[str, str]] = {}
+    if graded is None or graded.empty:
+        return out
+    d = graded.dropna(subset=["ret_1w"]).copy()
+    if tickers:
+        d = d[d["ticker"].isin(tickers)]
+    if d.empty:
+        return out
+    d["pr"] = d["position"].astype(float) * d["ret_1w"].astype(float) / 100
+    champ = d[d["player"] == champion][["ticker", "week", "pr"]]
+    for p, g in d.groupby("player"):
+        if p == champion:
+            continue
+        both = g[["ticker", "week", "pr"]].merge(champ, on=["ticker", "week"], suffixes=("", "_c"))
+        weeks = int(both["week"].nunique())
+        if champ.empty:
+            out[p] = ("wait", "챔피언 채점 기록이 아직 없어 비교 대기")
+            continue
+        if weeks < th["weeks"]:
+            out[p] = ("short", f"표본 부족 (챔피언과 맞대결 {weeks}주 / 필요 {th['weeks']}주)")
+            continue
+        r_p, m_p = _curve_stats(both[["ticker", "week", "pr"]])
+        r_c, m_c = _curve_stats(both[["ticker", "week", "pr_c"]].rename(columns={"pr_c": "pr"}))
+        gap = r_p - r_c
+        detail = f"누적 {r_p:+.1f}% vs 챔피언 {r_c:+.1f}% · 최대 낙폭 {m_p:.1f}% vs {m_c:.1f}% ({weeks}주)"
+        if gap >= th["gain"] and m_p >= m_c - th["mdd_slack"]:
+            out[p] = ("promote", "승격 추천 · " + detail)
+        elif gap <= -th["gain"]:
+            out[p] = ("behind", "열세 · " + detail)
+        else:
+            out[p] = ("close", "접전 · " + detail)
+    return out
+
+
+def load_champion(sb, default: str | None = None) -> dict:
+    """현재 경기장 챔피언. 기록이 없으면 활성 규칙을 챔피언으로 등록."""
+    rows = _rows(sb.table(CHAMPION_TABLE).select("*").eq("status", "champion").order("id", desc=True).limit(1).execute())
+    if rows:
+        return rows[0]
+    if default is None:
+        version, _ = load_active_rule(sb)
+        default = f"rule_v{version}"
+    row = {"player": default, "status": "champion", "reason": "첫 챔피언 (기존 활성 규칙)"}
+    sb.table(CHAMPION_TABLE).insert(row).execute()
+    return row
+
+
+def crown_champion(sb, player: str, reason: str, now_iso: str) -> None:
+    """새 챔피언 등극. 이전 챔피언은 'former'로 남김(이력 보존)."""
+    sb.table(CHAMPION_TABLE).update({"status": "former", "ended_at": now_iso}).eq("status", "champion").execute()
+    sb.table(CHAMPION_TABLE).insert({"player": player, "status": "champion", "reason": reason}).execute()
+
+
+def champion_history(sb) -> list[dict]:
+    return _rows(sb.table(CHAMPION_TABLE).select("*").order("id", desc=True).limit(30).execute())
 
 
 def sb_fetch_all(sb, table: str, eq: dict | None = None, page: int = 1000) -> list[dict]:
