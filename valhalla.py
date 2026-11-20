@@ -1707,6 +1707,153 @@ def page_signals() -> None:
 
 
 # ==========================================================================
+# 페이지: 종목 발굴 (타이탄봇이 매일 계산한 테마·주도주·수급을 읽기만 함)
+# ==========================================================================
+TITAN_APP_URL = "https://titanbot.streamlit.app"
+
+
+@st.cache_resource(show_spinner=False)
+def get_titan_engine():
+    try:
+        uri = st.secrets.get("TITAN_DB_URI")
+    except Exception:
+        uri = None
+    uri = uri or os.environ.get("TITAN_DB_URI")
+    if not uri:
+        return None
+    from sqlalchemy import create_engine
+    return create_engine(uri, pool_pre_ping=True, pool_recycle=1800)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def titan_query(sql: str, params: tuple = ()) -> pd.DataFrame:
+    from sqlalchemy import text
+    eng = get_titan_engine()
+    if eng is None:
+        return pd.DataFrame()
+    try:
+        with eng.connect() as conn:
+            return pd.read_sql(text(sql), conn, params=dict(params))
+    except Exception as exc:
+        LOGGER.warning("타이탄 DB 조회 실패: %s", exc)
+        return pd.DataFrame()
+
+
+def titan_latest(table: str, market: str) -> pd.DataFrame:
+    return titan_query(f"SELECT * FROM {table} WHERE market=:m AND date = "
+                       f"(SELECT MAX(date) FROM {table} WHERE market=:m) ORDER BY id", (("m", market),))
+
+
+def hit_stats(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for hz, label in (("ret_5d", "5거래일 뒤"), ("ret_20d", "20거래일 뒤")):
+        s = pd.to_numeric(df.get(hz), errors="coerce").dropna() if not df.empty else pd.Series(dtype=float)
+        rows.append({"기간": label, "채점 수": len(s),
+                     "적중률(%)": round(float((s > 0).mean() * 100), 1) if len(s) else None,
+                     "평균 수익(%)": round(float(s.mean()), 2) if len(s) else None})
+    return pd.DataFrame(rows)
+
+
+def page_discover() -> None:
+    page_header("DISCOVERY", "종목 발굴", "돈이 몰리는 테마 · 주도주 · 수급 (타이탄봇이 매일 아침 계산한 결과)",
+                [("계산: 타이탄봇", MAGENTA), ("매일 자동 채점", GOLD)])
+    if get_titan_engine() is None:
+        st.warning("타이탄봇 DB 연결 정보가 없습니다. Streamlit → 발할라 앱 Settings → Secrets에 아래 한 줄을 추가하세요. "
+                   "값은 타이탄봇의 DB_URI와 같습니다.", icon=":material/link_off:")
+        st.code('TITAN_DB_URI = "postgresql+psycopg2://사용자:비밀번호@호스트:6543/postgres"', language="toml")
+        return
+    market = st.segmented_control("시장", ["US", "KR"], default="US", key="disc_mkt",
+                                  format_func=lambda m: "미국" if m == "US" else "한국") or "US"
+    themes_df = titan_latest("theme_radar", market)
+    if themes_df.empty:
+        st.info("아직 기록이 없습니다. 타이탄봇의 '테마·주도주·수급' 탭에서 계산하거나 내일 아침 자동 실행을 기다려 주세요.",
+                icon=":material/hourglass_top:")
+        st.link_button("타이탄봇 열기", TITAN_APP_URL, icon=":material/open_in_new:")
+        return
+
+    themes_df = themes_df.sort_values("rank")
+    section(f"테마 순위 · 기준일 {themes_df['date'].iloc[0]}",
+            "테마 점수 = 1주(20%) · 1개월(30%) · 3개월(50%) 수익률 순위의 가중 합. 4주 전보다 순위가 3계단 이상 오르면 '떠오르는 테마'.")
+    hot = themes_df[themes_df["status"].isin(["주도 테마", "떠오르는 테마"])]
+    cards = st.columns(max(min(len(hot), 4), 1))
+    if hot.empty:
+        st.caption("지금은 뚜렷하게 돈이 몰리는 테마가 없습니다.")
+    for col, (_, r) in zip(cards, hot.head(4).iterrows()):
+        col.metric(r["status"], r["theme"], f"3개월 {r['ret_3m']:+.1f}% · {int(r['rank'])}위",
+                   delta_color=kr_delta(r["ret_3m"]), border=True)
+    fig = go.Figure(go.Bar(x=themes_df["score"], y=themes_df["theme"], orientation="h",
+                           marker_color=[UP if s in ("주도 테마", "떠오르는 테마") else NEUTRAL for s in themes_df["status"]],
+                           text=[f"{v:.0f}" for v in themes_df["score"]], textposition="outside"))
+    base_layout(fig, max(260, 26 * len(themes_df)), legend=False)
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(range=[0, 105], title_text="테마 점수")
+    show_chart(fig, key="disc_themes")
+    with st.expander("테마 상세 표", icon=":material/table_chart:"):
+        st.dataframe(themes_df[["rank", "theme", "ticker", "status", "score", "ret_1w", "ret_1m", "ret_3m", "rs_3m",
+                                "rank_prev"]], hide_index=True, width="stretch",
+                     column_config={"rank": "순위", "theme": "테마", "ticker": "대표 ETF", "status": "상태",
+                                    "score": st.column_config.NumberColumn("점수", format="%.0f"),
+                                    "ret_1w": st.column_config.NumberColumn("1주", format="%+.1f%%"),
+                                    "ret_1m": st.column_config.NumberColumn("1개월", format="%+.1f%%"),
+                                    "ret_3m": st.column_config.NumberColumn("3개월", format="%+.1f%%"),
+                                    "rs_3m": st.column_config.NumberColumn("지수 대비", format="%+.1f%%p"),
+                                    "rank_prev": "4주 전 순위"})
+
+    section("주도주 후보", "지수 대비 강도(50) + 52주 고점 근접(30) + 이동평균선 정배열(20). 상위 테마 종목을 먼저 보여 줍니다.")
+    leaders = titan_latest("leader_radar", market)
+    if market == "KR":
+        kr = titan_query("SELECT * FROM radar_signals WHERE market='KR' AND date = "
+                         "(SELECT MAX(date) FROM radar_signals WHERE market='KR') ORDER BY rs DESC")
+        if kr.empty:
+            st.caption("한국 주도주 후보(타이탄 KRX 레이더) 기록이 아직 없습니다.")
+        else:
+            st.caption(f"타이탄 KRX 레이더 · 기준일 {kr['date'].iloc[0]} (거래대금 상위 · 정배열 · 코스피 대비 RS)")
+            st.dataframe(kr[["ticker", "name", "price", "rs", "gap"]].head(20), hide_index=True, width="stretch",
+                         column_config={"ticker": "코드", "name": "종목", "price": st.column_config.NumberColumn("현재가", format="localized"),
+                                        "rs": st.column_config.NumberColumn("코스피 대비(%p)", format="%+.1f"),
+                                        "gap": st.column_config.NumberColumn("20일선 이격(%)", format="%+.1f")})
+    elif leaders.empty:
+        st.caption("기록 없음")
+    else:
+        top = list(themes_df.head(5)["theme"])
+        lv = leaders.assign(_top=leaders["theme"].isin(top)).sort_values(["_top", "score"], ascending=[False, False])
+        st.dataframe(lv[["theme", "ticker", "price", "score", "rs_3m", "ret_3m", "from_high", "aligned"]].head(25),
+                     hide_index=True, width="stretch",
+                     column_config={"theme": "테마", "ticker": "종목", "price": st.column_config.NumberColumn("현재가", format="$%.2f"),
+                                    "score": st.column_config.ProgressColumn("주도주 점수", min_value=0, max_value=100, format="%.0f"),
+                                    "rs_3m": st.column_config.NumberColumn("지수 대비", format="%+.1f%%p"),
+                                    "ret_3m": st.column_config.NumberColumn("3개월", format="%+.1f%%"),
+                                    "from_high": st.column_config.NumberColumn("52주 고점 대비", format="%+.1f%%"),
+                                    "aligned": st.column_config.CheckboxColumn("정배열")})
+
+    section("수급", "한국: 최근 5거래일 외국인·기관 순매수 · 미국: 평소의 2배 이상 거래되며 상승 (매수세 유입 추정)")
+    flows = titan_latest("flow_radar", market)
+    if flows.empty:
+        st.caption("기록 없음")
+    elif market == "KR":
+        st.dataframe(flows[["ticker", "name", "foreign_net", "inst_net"]], hide_index=True, width="stretch",
+                     column_config={"ticker": "코드", "name": "종목",
+                                    "foreign_net": st.column_config.NumberColumn("외국인 순매수(원)", format="localized"),
+                                    "inst_net": st.column_config.NumberColumn("기관 순매수(원)", format="localized")})
+    else:
+        st.dataframe(flows[["ticker", "price", "chg_1d", "vol_ratio"]], hide_index=True, width="stretch",
+                     column_config={"ticker": "종목", "price": st.column_config.NumberColumn("현재가", format="$%.2f"),
+                                    "chg_1d": st.column_config.NumberColumn("등락", format="%+.1f%%"),
+                                    "vol_ratio": st.column_config.NumberColumn("거래량 배수", format="%.1fx")})
+
+    section("이 신호들은 실제로 맞았나", "기록한 종목의 5·20거래일 뒤 수익률로 채점합니다. 표본이 30개는 넘어야 의미가 있어요.")
+    a, b = st.columns(2)
+    a.markdown("**주도주 후보**")
+    a.dataframe(hit_stats(titan_query("SELECT ret_5d, ret_20d FROM leader_radar WHERE market=:m", (("m", market),))),
+                hide_index=True, width="stretch")
+    b.markdown("**수급 종목**")
+    b.dataframe(hit_stats(titan_query("SELECT ret_5d, ret_20d FROM flow_radar WHERE market=:m", (("m", market),))),
+                hide_index=True, width="stretch")
+    st.caption("이 화면은 후보를 좁혀 주는 참고 자료입니다. 새 종목을 사기 전에 '신호 관제'로 타이밍을 함께 확인하세요.")
+    st.link_button("타이탄봇에서 테마 구성 편집 · 다시 계산", TITAN_APP_URL, icon=":material/open_in_new:")
+
+
+# ==========================================================================
 # 진입점
 # ==========================================================================
 PAGES: dict[str, st.Page] = {}
@@ -1720,13 +1867,15 @@ def main() -> None:
     PAGES.update({
         "dashboard": st.Page(page_dashboard, title="전술 관제", icon=":material/monitoring:", url_path="dashboard", default=True),
         "signals": st.Page(page_signals, title="신호 관제", icon=":material/insights:", url_path="signals"),
+        "discover": st.Page(page_discover, title="종목 발굴", icon=":material/travel_explore:", url_path="discover"),
         "radar": st.Page(page_radar, title="시장 레이더", icon=":material/radar:", url_path="radar"),
         "league": st.Page(page_league, title="AI 실전 리그", icon=":material/emoji_events:", url_path="league"),
         "training": st.Page(page_training, title="AI 훈련소", icon=":material/model_training:", url_path="training"),
         "journal": st.Page(page_journal, title="매매 일지", icon=":material/menu_book:", url_path="journal"),
         "validation": st.Page(page_validation, title="예측 검증실", icon=":material/science:", url_path="validation"),
     })
-    nav = st.navigation({"운용": [PAGES["dashboard"], PAGES["signals"], PAGES["radar"], PAGES["league"]],
+    nav = st.navigation({"운용": [PAGES["dashboard"], PAGES["signals"], PAGES["discover"], PAGES["radar"],
+                                 PAGES["league"]],
                          "연구 · 관리": [PAGES["training"], PAGES["validation"], PAGES["journal"]]})
     render_sidebar()
     show_flash()

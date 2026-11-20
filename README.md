@@ -110,3 +110,11 @@ create table if not exists valhalla_predictions (
 
 다른 테이블에 RLS 정책을 쓰고 있다면 이 테이블에도 같은 정책을 추가하세요.
 대상 종목은 Actions 변수 없이 기본 `SOXL:SOXX`이며, 바꾸려면 워크플로의 `SIGNAL_TICKERS` 환경변수(예: `SOXL:SOXX,TQQQ:QQQ`)를 추가합니다.
+
+## 종목 발굴 (타이탄봇 결과 읽기)
+
+- 테마 순위 · 주도주 · 수급은 **타이탄봇이 매일 아침 계산**해 자기 DB에 저장하고, 발할라는 그 결과를 **읽기만** 합니다 (계산 엔진은 한 곳).
+- 발할라 Streamlit Secrets에 타이탄봇의 DB_URI와 같은 값을 한 줄 추가하세요.
+  ```toml
+  TITAN_DB_URI = "postgresql+psycopg2://사용자:비밀번호@호스트:6543/postgres"
+  ```

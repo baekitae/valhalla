@@ -5,3 +5,5 @@ plotly>=5.22
 yfinance>=0.2.54
 supabase>=2.4
 deep-translator>=1.11
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
