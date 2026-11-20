@@ -57,3 +57,25 @@ def test_prediction_and_grading_and_calibration():
     table, summary = core.calibration(graded, 4)
     assert summary["n"] == len(graded) and 0 <= summary["brier"] <= 1
     assert table["예측수"].sum() == len(graded)
+
+
+def test_action_signals_edges_and_backtest():
+    h = core.build_signal_history(_daily(), _daily(seed=1), _macro(2))
+    sig = core.action_signals(h)
+    acts = sig.loc[sig["action"] != "", "action"].tolist()
+    # 같은 신호가 연달아 두 번 나오지 않음 (매수→매도→매수 …)
+    assert all(a != b for a, b in zip(acts, acts[1:]))
+    # 신호가 켜진 주는 반드시 조건을 만족
+    assert sig.loc[sig["action"] == "매수", "buy_on"].all()
+    assert sig.loc[sig["action"] == "매도", "sell_on"].all()
+    bt = core.action_backtest(sig)
+    assert {"train_buy", "test_sell", "equity", "summary"} <= set(bt)
+    assert 0 <= bt["summary"]["exposure"] <= 100
+
+
+def test_action_signals_no_future_leak():
+    d = _daily()
+    full = core.action_signals(core.build_signal_history(d, None, {}))
+    part = core.action_signals(core.build_signal_history(d.iloc[:2000], None, {}))
+    common = part.index[:-1]
+    assert (full.loc[common, "action"] == part.loc[common, "action"]).all()

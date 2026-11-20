@@ -1174,3 +1174,86 @@ def calibration(ledger: pd.DataFrame, horizon: int = 4) -> tuple[pd.DataFrame, d
     direction_hit = float(((d[pcol] >= 50) == (d["hit"] == 1)).mean() * 100)
     return table, {"n": int(len(d)), "brier": brier, "brier_base": brier_base,
                    "direction_hit": direction_hit, "up_rate": float(d["hit"].mean() * 100)}
+
+
+# ==========================================================================
+# 11. 매수 · 매도 행동 신호 (규칙을 먼저 정하고, 과거 성적을 함께 보여 줌)
+#   - 규칙은 결과를 보고 맞춘 값이 아니라 처음에 정한 단순한 기준입니다 (과최적화 방지).
+#   - 신호는 '마감된 주봉'에서 조건이 처음 충족된 주에만 한 번 표시합니다.
+# ==========================================================================
+ACTION_RULES = {
+    "buy": {"chart_min": 3, "weeks": 2, "macro_min": 2},
+    "sell": {"chart_max": 1, "weeks": 2},
+}
+ACTION_RULE_TEXT = {
+    "매수": "차트 신호 3점 이상이 2주 연속 + 거시 신호 2점 이상",
+    "매도": "차트 신호 1점 이하가 2주 연속 + 금요일 종가가 20일선 아래",
+}
+
+
+def action_signals(history: pd.DataFrame, rules: dict | None = None) -> pd.DataFrame:
+    """주별 행동 신호. action: '매수' / '매도' / '' (조건이 처음 켜진 주에만), state: 신호 이후 상태."""
+    r = rules or ACTION_RULES
+    b, s = r["buy"], r["sell"]
+    out = history.copy()
+    chart = out["chart_score"].astype(float)
+    buy_on = (chart.rolling(b["weeks"]).min() >= b["chart_min"]) & (out["macro_score"] >= b["macro_min"])
+    above = out["above_ma20d"].map(lambda v: bool(v) if pd.notna(v) else True)
+    sell_on = (chart.rolling(s["weeks"]).max() <= s["chart_max"]) & ~above
+    out["buy_on"], out["sell_on"] = buy_on.fillna(False), sell_on.fillna(False)
+    action, state, cur = [], [], ""
+    prev_buy = prev_sell = False
+    for bo, so in zip(out["buy_on"], out["sell_on"]):
+        a = ""
+        if bo and not prev_buy and cur != "매수":
+            a, cur = "매수", "매수"
+        elif so and not prev_sell and cur != "매도":
+            a, cur = "매도", "매도"
+        action.append(a)
+        state.append(cur)
+        prev_buy, prev_sell = bool(bo), bool(so)
+    out["action"], out["state"] = action, state
+    return out
+
+
+def _action_stats(frame: pd.DataFrame, kind: str) -> pd.DataFrame:
+    rows = []
+    for hz in HORIZONS:
+        col = f"ret_{hz}w"
+        all_ret = frame[col].dropna()
+        g = frame.loc[frame["action"] == kind, col].dropna()
+        good = (g > 0) if kind == "매수" else (g < 0)
+        base_good = (all_ret > 0) if kind == "매수" else (all_ret < 0)
+        rows.append({"기간": f"{hz}주 뒤", "신호 수": int(len(g)),
+                     "적중률(%)": round(float(good.mean() * 100), 1) if len(g) else None,
+                     "평소 확률(%)": round(float(base_good.mean() * 100), 1) if len(all_ret) else None,
+                     "평균 수익(%)": round(float(g.mean()), 1) if len(g) else None,
+                     "평소 평균(%)": round(float(all_ret.mean()), 1) if len(all_ret) else None})
+    return pd.DataFrame(rows)
+
+
+def action_backtest(sig: pd.DataFrame, test_weeks: int = TEST_WEEKS, fee_bps: float = 10) -> dict:
+    """매수·매도 신호의 과거 적중률(학습/검증 분리) + '신호대로 했다면' 누적 수익."""
+    h = sig[sig["chart_valid"] >= len(CHART_SIGNALS) - 1]
+    if h.empty:
+        return {}
+    cut = h.index[-1] - pd.Timedelta(weeks=test_weeks)
+    out = {"cutoff": cut, "start": h.index[0]}
+    for name, part in (("train", h[h.index <= cut]), ("test", h[h.index > cut])):
+        out[f"{name}_buy"] = _action_stats(part, "매수")
+        out[f"{name}_sell"] = _action_stats(part, "매도")
+    # 신호 전략: 매수 신호 다음 주부터 보유, 매도 신호 다음 주부터 현금 (처음엔 보유 상태로 시작)
+    weekly_ret = h["close"].pct_change().fillna(0)
+    pos = h["state"].map({"매수": 1.0, "매도": 0.0, "": 1.0}).shift(1).fillna(1.0)
+    turn = pos.diff().abs().fillna(0)
+    strat = (1 + pos * weekly_ret - turn * fee_bps / 10_000).cumprod()
+    hold = (1 + weekly_ret).cumprod()
+
+    def mdd(eq):
+        return float(((eq / eq.cummax()) - 1).min() * 100)
+
+    out["equity"] = pd.DataFrame({"신호대로": strat, "계속 보유": hold})
+    out["summary"] = {"strategy": float((strat.iloc[-1] - 1) * 100), "hold": float((hold.iloc[-1] - 1) * 100),
+                      "strategy_mdd": mdd(strat), "hold_mdd": mdd(hold),
+                      "exposure": float(pos.mean() * 100), "trades": int((h["action"] != "").sum())}
+    return out

@@ -1560,6 +1560,95 @@ def _streak(history: pd.DataFrame, threshold: int = 3) -> int:
     return n
 
 
+def render_actions(done: pd.DataFrame, ticker: str) -> None:
+    """매수·매도 행동 신호: 현재 상태, 차트 표시, 과거 적중률, '신호대로 했다면' 비교."""
+    section("매수 · 매도 신호", f"매수: {core.ACTION_RULE_TEXT['매수']} · 매도: {core.ACTION_RULE_TEXT['매도']}. "
+                             "마감된 주봉 기준이며, 조건이 처음 켜진 주에만 표시합니다.")
+    sig = core.action_signals(done)
+    if sig.empty:
+        st.caption("신호를 계산할 데이터가 부족합니다.")
+        return
+    last = sig.iloc[-1]
+    last_act = sig[sig["action"] != ""].tail(1)
+    b, sl = core.ACTION_RULES["buy"], core.ACTION_RULES["sell"]
+    recent = sig["chart_score"].tail(b["weeks"]).tolist()
+    c = st.columns([1.3, 1, 1])
+    with c[0].container(border=True):
+        if last["action"] == "매수":
+            st.markdown(f"**이번 주 신호** {pill('매수 신호 발생', 'stop')}", unsafe_allow_html=True)
+        elif last["action"] == "매도":
+            st.markdown(f"**이번 주 신호** {pill('매도 신호 발생', 'info')}", unsafe_allow_html=True)
+        else:
+            st.markdown(f"**이번 주 신호** {pill('새 신호 없음', 'warn')}", unsafe_allow_html=True)
+        state_txt = {"매수": "매수 신호 이후 구간 (조건이 다시 켜져도 매도 신호 전까지는 새로 표시하지 않음)",
+                     "매도": "매도 신호 이후 구간 (매수 신호를 기다리는 중)"}.get(last["state"], "아직 신호 없음")
+        st.caption(f"현재 상태: {state_txt}")
+        if not last_act.empty:
+            r = last_act.iloc[0]
+            st.caption(f"마지막 신호: {r.name:%Y-%m-%d} {r['action']} (그때 종가 {fmt_usd(r['close'])}, "
+                       f"지금 {(last['close'] / r['close'] - 1) * 100:+.1f}%)")
+    c[1].metric("매수 조건 진행", f"{sum(x >= b['chart_min'] for x in recent)} / {b['weeks']}주",
+                f"거시 {int(last['macro_score'])}점 (필요 {b['macro_min']}점)", delta_color="off", delta_arrow="off",
+                border=True, help=core.ACTION_RULE_TEXT["매수"])
+    c[2].metric("매도 조건 진행", f"{sum(x <= sl['chart_max'] for x in sig['chart_score'].tail(sl['weeks']))} / {sl['weeks']}주",
+                "20일선 아래" if last["above_ma20d"] == False else "20일선 위",  # noqa: E712
+                delta_color="off", delta_arrow="off", border=True, help=core.ACTION_RULE_TEXT["매도"])
+
+    view = sig[sig.index >= sig.index[-1] - pd.Timedelta(weeks=156)]
+    fig = go.Figure(go.Scatter(x=view.index, y=view["close"], name=f"{ticker} 주봉 종가", line=dict(color=GOLD, width=2)))
+    for kind, sym, color, pos in (("매수", "triangle-up", UP, "bottom center"), ("매도", "triangle-down", DOWN, "top center")):
+        pts = view[view["action"] == kind]
+        fig.add_trace(go.Scatter(x=pts.index, y=pts["close"], mode="markers+text", name=f"{kind} 신호", text=[kind] * len(pts),
+                                 textposition=pos, textfont=dict(color=color, size=11),
+                                 marker=dict(symbol=sym, size=13, color=color, line=dict(width=1, color="#0B1220"))))
+    base_layout(fig, 360)
+    fig.update_yaxes(type="log", title_text="가격 (로그)")
+    show_chart(fig, key="act_chart")
+
+    bt = core.action_backtest(sig)
+    if not bt:
+        return
+    fmt = {"적중률(%)": st.column_config.NumberColumn(format="%.1f%%"),
+           "평소 확률(%)": st.column_config.NumberColumn(format="%.1f%%"),
+           "평균 수익(%)": st.column_config.NumberColumn(format="%+.1f%%"),
+           "평소 평균(%)": st.column_config.NumberColumn(format="%+.1f%%")}
+    t1, t2, t3 = st.tabs(["매수 신호 성적", "매도 신호 성적", "신호대로 했다면"])
+    for tab, kind, note in ((t1, "buy", "적중 = 신호 뒤 실제로 오름"), (t2, "sell", "적중 = 신호 뒤 실제로 내림 (피한 하락)")):
+        with tab:
+            st.caption(f"{note}. '평소 확률'보다 높아야 쓸모 있는 신호입니다. 학습 {bt['start']:%Y-%m}~{bt['cutoff']:%Y-%m} / 검증 = 최근 2년.")
+            a, bcol = st.columns(2)
+            a.markdown("**학습 구간**")
+            a.dataframe(bt[f"train_{kind}"], hide_index=True, width="stretch", column_config=fmt)
+            bcol.markdown("**검증 구간 (최근 2년)**")
+            bcol.dataframe(bt[f"test_{kind}"], hide_index=True, width="stretch", column_config=fmt)
+    with t3:
+        sm = bt["summary"]
+        k = st.columns(4)
+        k[0].metric("신호대로 누적", f"{sm['strategy']:+.0f}%", f"보유 {sm['hold']:+.0f}%", delta_color="off", delta_arrow="off")
+        k[1].metric("최대 낙폭", f"{sm['strategy_mdd']:.0f}%", f"보유 {sm['hold_mdd']:.0f}%", delta_color="off", delta_arrow="off")
+        k[2].metric("보유 기간 비율", f"{sm['exposure']:.0f}%")
+        k[3].metric("신호 횟수", f"{sm['trades']}회")
+        eq = bt["equity"]
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=eq.index, y=eq["신호대로"], name="신호대로 (매수→보유, 매도→현금)", line=dict(color=ACCENT, width=2.2)))
+        fig2.add_trace(go.Scatter(x=eq.index, y=eq["계속 보유"], name="계속 보유", line=dict(color=NEUTRAL, dash="dot")))
+        base_layout(fig2, 300)
+        fig2.update_yaxes(type="log", title_text="누적 자본 배수")
+        show_chart(fig2, key="act_equity")
+        st.caption("매수 신호 다음 주부터 보유, 매도 신호 다음 주부터 현금으로 가정 (편도 비용 0.1% 반영). "
+                   "과거 성과는 미래를 보장하지 않으며, 이 신호는 매수·매도 권유가 아닙니다.")
+    try:
+        th = titan_latest("theme_radar", "US") if get_titan_engine() is not None else pd.DataFrame()
+        semi = th[th["theme"] == "반도체"] if not th.empty else th
+        if not semi.empty:
+            r = semi.iloc[0]
+            st.info(f"함께 볼 것 · 반도체 테마: {int(r['rank'])}위 / {len(th)}개 {('· ' + r['status']) if r['status'] else ''} "
+                    f"(4주 전 {int(r['rank_prev']) if pd.notna(r['rank_prev']) else '—'}위). "
+                    "매수 신호가 '떠오르는 테마'와 겹치면 더 믿을 만합니다.", icon=":material/hub:")
+    except Exception:
+        LOGGER.warning("반도체 테마 상태 조회 실패")
+
+
 def page_signals() -> None:
     page_header("SIGNAL ROOM", "신호 관제",
                 "반등 신호 점수판 · 과거 같은 점수의 실제 결과 · 매주 남기는 예측과 채점",
@@ -1622,6 +1711,8 @@ def page_signals() -> None:
     fig.update_yaxes(range=[0, n_chart], dtick=1, title_text="점수", secondary_y=False)
     fig.update_yaxes(type="log", title_text="가격", secondary_y=True, showgrid=False)
     show_chart(fig, key="sig_trend")
+
+    render_actions(done, ticker)
 
     section("점수별 과거 성적", f"{bt['start']:%Y-%m} ~ {bt['cutoff']:%Y-%m}은 학습 구간, 그 뒤 최근 2년은 확률 계산에 쓰지 않은 "
                          "검증 구간입니다. 두 구간의 방향이 비슷해야 믿을 만한 신호예요.")
