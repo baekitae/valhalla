@@ -59,9 +59,30 @@ def test_job_records_once_and_grades():
     sb.db["valhalla_predictions"] = [{"id": 1, "week": week.strftime("%Y-%m-%d"), "ticker": "SOXL",
                                        "p_up_4w": 55.0, "ret_4w": None, "ret_12w": None}]
     weekly.us_asof = lambda: pd.Timestamp(end)
+    weekly.TICKERS = [("SOXL", "SOXX")]
     msg1 = weekly.run(sb, fetch)
     msg2 = weekly.run(sb, fetch)
     rows = sb.db["valhalla_predictions"]
     assert len(rows) == 2, msg1
     assert "이미 기록됨" in msg2
     assert rows[0]["ret_4w"] is not None and rows[0]["ret_12w"] is not None
+
+
+def test_default_universe_covers_all_categories():
+    cats = {c for _, c in [v for v in weekly.core.SIGNAL_UNIVERSE.values()]}
+    assert set(weekly.core.CATEGORIES) <= cats
+    assert len(weekly._DEFAULT.split(",")) == len(weekly.core.SIGNAL_UNIVERSE)
+
+
+def test_one_failing_ticker_does_not_stop_others():
+    sb = FakeSB()
+    d = _daily(n=3000)
+    weekly.us_asof = lambda: pd.Timestamp(d.index[-1])
+    weekly.TICKERS = [("BAD", "SOXX"), ("SOXL", "SOXX")]
+
+    def fetch(t, adj):
+        if t == "BAD":
+            raise RuntimeError("boom")
+        return d
+    msg = weekly.run(sb, fetch)
+    assert "BAD: 실패" in msg and len(sb.db["valhalla_predictions"]) == 1

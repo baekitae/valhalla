@@ -25,8 +25,9 @@ import valhalla_core as core  # noqa: E402
 
 KST, ET = ZoneInfo("Asia/Seoul"), ZoneInfo("America/New_York")
 TABLE = "valhalla_predictions"
+_DEFAULT = ",".join(f"{t}:{p}" for t, (p, _) in core.SIGNAL_UNIVERSE.items())   # 3배·2배·1배 ETF·개별 종목
 TICKERS = [(t.strip().upper(), p.strip().upper()) for t, p in
-           (pair.split(":") for pair in os.environ.get("SIGNAL_TICKERS", "SOXL:SOXX").split(",") if ":" in pair)]
+           (pair.split(":") for pair in (os.environ.get("SIGNAL_TICKERS") or _DEFAULT).split(",") if ":" in pair)]
 
 
 def get_client():
@@ -51,35 +52,46 @@ def us_asof() -> pd.Timestamp:
 def run(sb, fetch=download) -> str:
     macro = {t: fetch(t, False) for t in core.MACRO_TICKERS_SIGNAL.values()}
     lines = []
+    partners: dict[str, pd.DataFrame | None] = {}
     for ticker, partner in TICKERS:
-        daily = fetch(ticker, True)
-        if daily is None:
-            lines.append(f"{ticker}: 시세 없음")
-            continue
-        hist = core.complete_weeks(core.build_signal_history(daily, fetch(partner, True) if partner else None, macro),
-                                   us_asof())
-        pred = core.make_prediction(hist, ticker)
-        existing = (sb.table(TABLE).select("id").eq("ticker", ticker).eq("week", pred["week"]).execute().data or [])
-        if existing:
-            lines.append(f"{ticker} {pred['week']}: 이미 기록됨")
-        else:
-            sb.table(TABLE).insert(pred).execute()
-            lines.append(f"{ticker} {pred['week']}: 차트 {pred['chart_score']}점·거시 {pred['macro_score']}점 → "
-                         f"4주 상승확률 {pred['p_up_4w']}%")
-        ledger = pd.DataFrame(sb.table(TABLE).select("*").eq("ticker", ticker).execute().data or [])
-        if ledger.empty:
-            continue
-        graded = core.grade_predictions(ledger, hist["close"])
-        n = 0
-        for (_, old), (_, new) in zip(ledger.iterrows(), graded.iterrows()):
-            patch = {c: float(new[c]) for c in ("ret_4w", "ret_12w")
-                     if pd.notna(new.get(c)) and pd.isna(old.get(c))}
-            if patch:
-                sb.table(TABLE).update(patch).eq("id", int(old["id"])).execute()
-                n += 1
-        if n:
-            lines.append(f"{ticker}: {n}건 채점")
-    return " / ".join(lines) or "대상 종목 없음"
+        try:
+            lines.append(_run_one(sb, ticker, partner, macro, partners, fetch))
+        except Exception as exc:
+            traceback.print_exc()
+            lines.append(f"{ticker}: 실패 {exc}")
+    return " / ".join(x for x in lines if x) or "대상 종목 없음"
+
+
+def _run_one(sb, ticker, partner, macro, partners, fetch) -> str:
+    lines = []
+    daily = fetch(ticker, True)
+    if daily is None:
+        return f"{ticker}: 시세 없음"
+    if partner and partner not in partners:
+        partners[partner] = fetch(partner, True)
+    hist = core.complete_weeks(core.build_signal_history(daily, partners.get(partner), macro), us_asof())
+    pred = core.make_prediction(hist, ticker)
+    existing = (sb.table(TABLE).select("id").eq("ticker", ticker).eq("week", pred["week"]).execute().data or [])
+    if existing:
+        lines.append(f"{ticker} {pred['week']}: 이미 기록됨")
+    else:
+        sb.table(TABLE).insert(pred).execute()
+        lines.append(f"{ticker} {pred['week']}: 차트 {pred['chart_score']}점·거시 {pred['macro_score']}점 → "
+                     f"4주 상승확률 {pred['p_up_4w']}%")
+    ledger = pd.DataFrame(sb.table(TABLE).select("*").eq("ticker", ticker).execute().data or [])
+    if ledger.empty:
+        return " / ".join(lines)
+    graded = core.grade_predictions(ledger, hist["close"])
+    n = 0
+    for (_, old), (_, new) in zip(ledger.iterrows(), graded.iterrows()):
+        patch = {c: float(new[c]) for c in ("ret_4w", "ret_12w")
+                 if pd.notna(new.get(c)) and pd.isna(old.get(c))}
+        if patch:
+            sb.table(TABLE).update(patch).eq("id", int(old["id"])).execute()
+            n += 1
+    if n:
+        lines.append(f"{ticker}: {n}건 채점")
+    return " / ".join(lines)
 
 
 def main() -> int:

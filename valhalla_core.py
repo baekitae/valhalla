@@ -1257,3 +1257,65 @@ def action_backtest(sig: pd.DataFrame, test_weeks: int = TEST_WEEKS, fee_bps: fl
                       "strategy_mdd": mdd(strat), "hold_mdd": mdd(hold),
                       "exposure": float(pos.mean() * 100), "trades": int((h["action"] != "").sum())}
     return out
+
+
+# ==========================================================================
+# 12. 유형별 추적 종목 (3배 · 2배 · 1배 ETF · 개별 종목은 결과를 섞지 않고 따로 봄)
+# ==========================================================================
+CATEGORIES = ["3배 ETF", "2배 ETF", "1배 ETF", "개별 종목"]
+SIGNAL_UNIVERSE = {          # 티커: (1배 비교 지수, 유형)
+    "SOXL": ("SOXX", "3배 ETF"), "TQQQ": ("QQQ", "3배 ETF"), "TECL": ("XLK", "3배 ETF"), "UPRO": ("SPY", "3배 ETF"),
+    "USD": ("SOXX", "2배 ETF"), "QLD": ("QQQ", "2배 ETF"), "ROM": ("XLK", "2배 ETF"), "SSO": ("SPY", "2배 ETF"),
+    "SOXX": ("QQQ", "1배 ETF"), "SMH": ("QQQ", "1배 ETF"), "QQQ": ("SPY", "1배 ETF"), "XLK": ("SPY", "1배 ETF"),
+    "NVDA": ("SOXX", "개별 종목"), "AVGO": ("SOXX", "개별 종목"), "MU": ("SOXX", "개별 종목"), "MRVL": ("SOXX", "개별 종목"),
+}
+
+
+def category_of(ticker: str) -> str:
+    return SIGNAL_UNIVERSE.get(str(ticker).upper(), (None, "기타"))[1]
+
+
+def partner_of(ticker: str, default: str = "SOXX") -> str:
+    return SIGNAL_UNIVERSE.get(str(ticker).upper(), (default, None))[0]
+
+
+def ticker_summary(sig: pd.DataFrame, ticker: str) -> dict:
+    """한 종목의 매수 신호 과거 성적 요약 (유형별 비교표용). 최근 2년 검증 구간 따로."""
+    bt = action_backtest(sig)
+    if not bt:
+        return {}
+    row = {"종목": ticker, "유형": category_of(ticker)}
+    for part, label in (("train", "학습"), ("test", "검증")):
+        t = bt[f"{part}_buy"].set_index("기간")
+        r = t.loc["4주 뒤"] if "4주 뒤" in t.index else None
+        row[f"{label} 신호 수"] = int(r["신호 수"]) if r is not None else 0
+        hit, base = (r["적중률(%)"], r["평소 확률(%)"]) if r is not None else (None, None)
+        row[f"{label} 4주 적중률(%)"] = hit
+        row[f"{label} 평소(%)"] = base
+        row[f"{label} 차이(%p)"] = round(hit - base, 1) if hit is not None and base is not None else None
+    sm = bt["summary"]
+    row["신호대로 누적(%)"] = round(sm["strategy"], 1)
+    row["보유 누적(%)"] = round(sm["hold"], 1)
+    row["신호대로 MDD(%)"] = round(sm["strategy_mdd"], 1)
+    row["보유 MDD(%)"] = round(sm["hold_mdd"], 1)
+    return row
+
+
+def ledger_by_category(ledger: pd.DataFrame, horizon: int = 4) -> pd.DataFrame:
+    """실전 예측 장부를 유형별로 채점 (저장된 실제 수익률 사용)."""
+    if ledger is None or ledger.empty:
+        return pd.DataFrame()
+    d = ledger.copy()
+    d["유형"] = d["ticker"].map(category_of)
+    rows = []
+    for cat in CATEGORIES + ["기타"]:
+        g = d[d["유형"] == cat]
+        if g.empty:
+            continue
+        _, summ = calibration(g, horizon)
+        rows.append({"유형": cat, "종목 수": int(g["ticker"].nunique()), "예측 수": int(len(g)),
+                     "채점 수": summ.get("n", 0),
+                     "방향 적중률(%)": round(summ["direction_hit"], 1) if summ.get("n") else None,
+                     "브라이어": round(summ["brier"], 3) if summ.get("n") else None,
+                     "평소 확률 브라이어": round(summ["brier_base"], 3) if summ.get("n") else None})
+    return pd.DataFrame(rows)

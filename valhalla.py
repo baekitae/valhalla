@@ -1653,9 +1653,17 @@ def page_signals() -> None:
     page_header("SIGNAL ROOM", "신호 관제",
                 "반등 신호 점수판 · 과거 같은 점수의 실제 결과 · 매주 남기는 예측과 채점",
                 [("주봉 기준", ACCENT), ("확률 = 과거 실제 비율", GOLD)])
-    c = st.columns([1, 1, 3], vertical_alignment="bottom")
-    ticker = c[0].text_input("종목", "SOXL", key="sig_ticker").upper().strip()
-    partner = c[1].text_input("1배 비교 지수", "SOXX", key="sig_partner").upper().strip()
+    c = st.columns([1, 1.2, 1, 1.6], vertical_alignment="bottom")
+    cat = c[0].selectbox("유형", core.CATEGORIES + ["직접 입력"], key="sig_cat")
+    if cat == "직접 입력":
+        ticker = c[1].text_input("종목", "SOXL", key="sig_ticker").upper().strip()
+        partner = c[2].text_input("1배 비교 지수", core.partner_of(ticker), key="sig_partner").upper().strip()
+    else:
+        options = [t for t, (_, k) in core.SIGNAL_UNIVERSE.items() if k == cat]
+        ticker = c[1].selectbox("종목", options, key=f"sig_pick_{cat}")
+        partner = core.partner_of(ticker)
+        c[2].text_input("1배 비교 지수", partner, disabled=True, key=f"sig_partner_{ticker}")
+    c[3].caption("3배·2배·1배 ETF·개별 종목은 움직임이 달라서 확률과 적중률을 따로 계산하고 따로 채점합니다.")
     with st.spinner("10년 이상 주봉 데이터로 신호를 계산하는 중…"):
         hist = load_signal_history(ticker, partner)
     if hist is None or hist.empty:
@@ -1735,6 +1743,37 @@ def page_signals() -> None:
             col.markdown(f"**{name}** · 평소 {table.attrs['base']:.1f}%")
             col.dataframe(table, hide_index=True, width="stretch", column_config=fmt)
 
+    section("유형별 과거 비교", "같은 매수 규칙을 3배·2배·1배 ETF·개별 종목에 똑같이 적용했을 때의 과거 성적입니다. "
+                           "'차이(%p)'가 여러 종목에서 꾸준히 플러스여야 우연이 아닌 신호예요.")
+    if st.button("유형별 비교 계산 (16개 종목 · 1~2분)", icon=":material/compare_arrows:", key="cmp_run"):
+        rows = []
+        prog = st.progress(0.0)
+        for i, (t, (p, _)) in enumerate(core.SIGNAL_UNIVERSE.items()):
+            h = load_signal_history(t, p)
+            if h is not None and not h.empty:
+                row = core.ticker_summary(core.action_signals(core.complete_weeks(h, us_asof())), t)
+                if row:
+                    rows.append(row)
+            prog.progress((i + 1) / len(core.SIGNAL_UNIVERSE))
+        prog.empty()
+        st.session_state["sig_compare"] = pd.DataFrame(rows)
+    cmp_df = st.session_state.get("sig_compare")
+    if cmp_df is not None and not cmp_df.empty:
+        agg = (cmp_df.groupby("유형", sort=False)
+                     .agg(종목수=("종목", "count"), 학습_차이=("학습 차이(%p)", "mean"), 검증_차이=("검증 차이(%p)", "mean"),
+                          신호대로=("신호대로 누적(%)", "median"), 보유=("보유 누적(%)", "median"),
+                          신호대로_MDD=("신호대로 MDD(%)", "median"), 보유_MDD=("보유 MDD(%)", "median"))
+                     .round(1).reindex(core.CATEGORIES).dropna(how="all").reset_index())
+        st.markdown("**유형별 요약** (차이 = 매수 신호 4주 적중률 − 평소 확률, 누적·MDD는 중앙값)")
+        st.dataframe(agg.rename(columns={"학습_차이": "학습 차이(%p)", "검증_차이": "검증 차이(%p)",
+                                         "신호대로": "신호대로 누적(%)", "보유": "보유 누적(%)",
+                                         "신호대로_MDD": "신호대로 MDD(%)", "보유_MDD": "보유 MDD(%)"}),
+                     hide_index=True, width="stretch")
+        with st.expander("종목별 상세", icon=":material/table_chart:"):
+            st.dataframe(cmp_df, hide_index=True, width="stretch")
+    else:
+        st.caption("버튼을 누르면 결과가 이 화면에 유지됩니다.")
+
     section("예측 장부", "매주 토요일 아침 자동으로 그 주의 예측을 남기고, 4·12주가 지나면 실제 결과로 채점합니다. "
                      "기록된 예측은 고치지 않습니다.")
     ledger, err = load_predictions(backend())
@@ -1743,7 +1782,13 @@ def page_signals() -> None:
                    icon=":material/table_chart:")
         st.code(PRED_SQL, language="sql")
     else:
+        all_ledger = ledger
         ledger = ledger[ledger["ticker"] == ticker] if not ledger.empty else ledger
+        by_cat = core.ledger_by_category(all_ledger, 4)
+        if not by_cat.empty:
+            st.markdown("**유형별 실전 성적 (4주 예측)** · 종목 하나의 성적보다 유형 전체가 더 믿을 만한 근거예요.")
+            st.dataframe(by_cat, hide_index=True, width="stretch")
+        st.markdown(f"**{ticker} 예측 기록**")
         graded = core.grade_predictions(ledger, done["close"])
         if graded is None or graded.empty:
             st.caption("아직 기록된 예측이 없습니다. 자동 실행이 돌거나 아래 버튼으로 첫 예측을 남기면 여기에 쌓입니다.")
