@@ -29,8 +29,8 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-if not all(hasattr(core, name) for name in ("clean_ohlcv", "league_run", "rolling_validation", "judge_live", "build_scenarios",
-                                           "build_signal_history")):
+REQUIRED_CORE_VERSION = "2026.11.20-4"
+if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
 try:

@@ -89,3 +89,10 @@ def test_universe_grid_and_compare_tables():
     rows = [dict(core.ticker_summary(core.action_signals(h), t)) for t in ("SOXL", "USD", "SOXX", "NVDA", "FAS", "XLF")]
     t = core.compare_tables(pd.DataFrame(rows))
     assert set(t["grid"].index) == {"반도체", "금융"} and 0 <= t["plus_share"] <= 100
+
+
+def test_app_and_core_versions_match():
+    import re
+    from pathlib import Path
+    app = Path(__file__).resolve().parents[1].joinpath("valhalla.py").read_text(encoding="utf-8")
+    assert re.search(r'REQUIRED_CORE_VERSION = "([^"]+)"', app).group(1) == core.CORE_VERSION
