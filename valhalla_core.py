@@ -1263,20 +1263,52 @@ def action_backtest(sig: pd.DataFrame, test_weeks: int = TEST_WEEKS, fee_bps: fl
 # 12. 유형별 추적 종목 (3배 · 2배 · 1배 ETF · 개별 종목은 결과를 섞지 않고 따로 봄)
 # ==========================================================================
 CATEGORIES = ["3배 ETF", "2배 ETF", "1배 ETF", "개별 종목"]
-SIGNAL_UNIVERSE = {          # 티커: (1배 비교 지수, 유형)
-    "SOXL": ("SOXX", "3배 ETF"), "TQQQ": ("QQQ", "3배 ETF"), "TECL": ("XLK", "3배 ETF"), "UPRO": ("SPY", "3배 ETF"),
-    "USD": ("SOXX", "2배 ETF"), "QLD": ("QQQ", "2배 ETF"), "ROM": ("XLK", "2배 ETF"), "SSO": ("SPY", "2배 ETF"),
-    "SOXX": ("QQQ", "1배 ETF"), "SMH": ("QQQ", "1배 ETF"), "QQQ": ("SPY", "1배 ETF"), "XLK": ("SPY", "1배 ETF"),
-    "NVDA": ("SOXX", "개별 종목"), "AVGO": ("SOXX", "개별 종목"), "MU": ("SOXX", "개별 종목"), "MRVL": ("SOXX", "개별 종목"),
+# 섹터 × 레버리지 격자. 섹터마다 (3배, 2배, 1배, 개별 종목들, 1배 ETF의 비교 지수)
+#  - 레버리지 ETF·개별 종목의 비교 지수 = 같은 섹터의 1배 ETF
+#  - 해당 레버리지 상품이 없는 섹터는 None (예: 에너지 3배는 상장폐지)
+SECTOR_GRID = {
+    "반도체": ("SOXL", "USD", "SOXX", ["NVDA", "AVGO", "MU", "MRVL"], "QQQ"),
+    "나스닥100": ("TQQQ", "QLD", "QQQ", ["AAPL"], "SPY"),
+    "S&P500": ("UPRO", "SSO", "SPY", ["BRK-B"], "IWM"),
+    "기술": ("TECL", "ROM", "XLK", ["MSFT"], "SPY"),
+    "금융": ("FAS", "UYG", "XLF", ["JPM"], "SPY"),
+    "헬스케어": ("CURE", "RXL", "XLV", ["LLY"], "SPY"),
+    "바이오": ("LABU", "BIB", "XBI", ["VRTX"], "SPY"),
+    "소형주": ("TNA", "UWM", "IWM", ["CROX"], "SPY"),
+    "산업재": ("DUSL", "UXI", "XLI", ["CAT"], "SPY"),
+    "부동산": ("DRN", "URE", "XLRE", ["PLD"], "SPY"),
+    "유틸리티": ("UTSL", "UPW", "XLU", ["NEE"], "SPY"),
+    "에너지": (None, "ERX", "XLE", ["XOM"], "SPY"),
+    "금광": (None, "NUGT", "GDX", ["NEM"], "SPY"),
 }
 
 
+def _build_universe(grid: dict) -> dict[str, tuple[str, str, str]]:
+    uni = {}
+    for sector, (x3, x2, x1, stocks, bench) in grid.items():
+        for t, cat in ((x3, "3배 ETF"), (x2, "2배 ETF")):
+            if t:
+                uni[t] = (x1, cat, sector)
+        uni[x1] = (bench, "1배 ETF", sector)
+        for t in stocks:
+            uni[t] = (x1, "개별 종목", sector)
+    return uni
+
+
+SIGNAL_UNIVERSE = _build_universe(SECTOR_GRID)      # 티커: (비교 지수, 유형, 섹터)
+SECTORS = list(SECTOR_GRID)
+
+
 def category_of(ticker: str) -> str:
-    return SIGNAL_UNIVERSE.get(str(ticker).upper(), (None, "기타"))[1]
+    return SIGNAL_UNIVERSE.get(str(ticker).upper(), (None, "기타", "기타"))[1]
+
+
+def sector_of(ticker: str) -> str:
+    return SIGNAL_UNIVERSE.get(str(ticker).upper(), (None, "기타", "기타"))[2]
 
 
 def partner_of(ticker: str, default: str = "SOXX") -> str:
-    return SIGNAL_UNIVERSE.get(str(ticker).upper(), (default, None))[0]
+    return SIGNAL_UNIVERSE.get(str(ticker).upper(), (default, None, None))[0]
 
 
 def ticker_summary(sig: pd.DataFrame, ticker: str) -> dict:
@@ -1284,7 +1316,7 @@ def ticker_summary(sig: pd.DataFrame, ticker: str) -> dict:
     bt = action_backtest(sig)
     if not bt:
         return {}
-    row = {"종목": ticker, "유형": category_of(ticker)}
+    row = {"종목": ticker, "섹터": sector_of(ticker), "유형": category_of(ticker)}
     for part, label in (("train", "학습"), ("test", "검증")):
         t = bt[f"{part}_buy"].set_index("기간")
         r = t.loc["4주 뒤"] if "4주 뒤" in t.index else None
@@ -1319,3 +1351,41 @@ def ledger_by_category(ledger: pd.DataFrame, horizon: int = 4) -> pd.DataFrame:
                      "브라이어": round(summ["brier"], 3) if summ.get("n") else None,
                      "평소 확률 브라이어": round(summ["brier_base"], 3) if summ.get("n") else None})
     return pd.DataFrame(rows)
+
+
+def ledger_by_sector(ledger: pd.DataFrame, horizon: int = 4) -> pd.DataFrame:
+    """실전 예측 장부를 섹터별로 채점."""
+    if ledger is None or ledger.empty:
+        return pd.DataFrame()
+    d = ledger.copy()
+    d["섹터"] = d["ticker"].map(sector_of)
+    rows = []
+    for sec in SECTORS + ["기타"]:
+        g = d[d["섹터"] == sec]
+        if g.empty:
+            continue
+        _, summ = calibration(g, horizon)
+        rows.append({"섹터": sec, "예측 수": int(len(g)), "채점 수": summ.get("n", 0),
+                     "방향 적중률(%)": round(summ["direction_hit"], 1) if summ.get("n") else None,
+                     "브라이어": round(summ["brier"], 3) if summ.get("n") else None,
+                     "평소 확률 브라이어": round(summ["brier_base"], 3) if summ.get("n") else None})
+    return pd.DataFrame(rows)
+
+
+def compare_tables(cmp_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """종목별 비교표 → 유형별 요약, 섹터별 요약, 섹터×유형 격자(검증 구간 차이)."""
+    if cmp_df is None or cmp_df.empty:
+        return {}
+    agg = dict(종목수=("종목", "count"), 학습_차이=("학습 차이(%p)", "mean"), 검증_차이=("검증 차이(%p)", "mean"),
+               신호대로=("신호대로 누적(%)", "median"), 보유=("보유 누적(%)", "median"),
+               신호대로_MDD=("신호대로 MDD(%)", "median"), 보유_MDD=("보유 MDD(%)", "median"))
+    names = {"학습_차이": "학습 차이(%p)", "검증_차이": "검증 차이(%p)", "신호대로": "신호대로 누적(%)",
+             "보유": "보유 누적(%)", "신호대로_MDD": "신호대로 MDD(%)", "보유_MDD": "보유 MDD(%)"}
+    by_cat = (cmp_df.groupby("유형").agg(**agg).round(1).reindex(CATEGORIES).dropna(how="all")
+                    .reset_index().rename(columns=names))
+    by_sec = (cmp_df.groupby("섹터").agg(**agg).round(1).reindex(SECTORS).dropna(how="all")
+                    .reset_index().rename(columns=names))
+    grid = (cmp_df.pivot_table(index="섹터", columns="유형", values="검증 차이(%p)", aggfunc="mean")
+                  .reindex(index=SECTORS, columns=CATEGORIES).dropna(how="all").round(1))
+    plus_share = float((cmp_df["검증 차이(%p)"].dropna() > 0).mean() * 100) if cmp_df["검증 차이(%p)"].notna().any() else float("nan")
+    return {"by_cat": by_cat, "by_sec": by_sec, "grid": grid, "plus_share": plus_share}

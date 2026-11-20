@@ -69,7 +69,9 @@ def test_job_records_once_and_grades():
 
 
 def test_default_universe_covers_all_categories():
-    cats = {c for _, c in [v for v in weekly.core.SIGNAL_UNIVERSE.values()]}
+    cats = {c for _, c, _ in weekly.core.SIGNAL_UNIVERSE.values()}
+    secs = {s for _, _, s in weekly.core.SIGNAL_UNIVERSE.values()}
+    assert len(secs) >= 10
     assert set(weekly.core.CATEGORIES) <= cats
     assert len(weekly._DEFAULT.split(",")) == len(weekly.core.SIGNAL_UNIVERSE)
 

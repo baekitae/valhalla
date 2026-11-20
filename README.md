@@ -109,7 +109,7 @@ create table if not exists valhalla_predictions (
 ```
 
 다른 테이블에 RLS 정책을 쓰고 있다면 이 테이블에도 같은 정책을 추가하세요.
-대상 종목은 기본으로 `valhalla_core.SIGNAL_UNIVERSE`의 16개입니다 (3배 ETF: SOXL·TQQQ·TECL·UPRO / 2배 ETF: USD·QLD·ROM·SSO / 1배 ETF: SOXX·SMH·QQQ·XLK / 개별 종목: NVDA·AVGO·MU·MRVL). 유형이 다르면 확률·적중률을 섞지 않고 따로 계산합니다. 바꾸려면 워크플로에 `SIGNAL_TICKERS` 환경변수(예: `SOXL:SOXX,TQQQ:QQQ`)를 추가합니다.
+대상 종목은 기본으로 `valhalla_core.SECTOR_GRID`의 13개 섹터 × (3배·2배·1배 ETF·개별 종목) 53개입니다 (반도체·나스닥100·S&P500·기술·금융·헬스케어·바이오·소형주·산업재·부동산·유틸리티·에너지·금광). 섹터나 유형이 다르면 확률·적중률을 섞지 않고 따로 계산합니다. 바꾸려면 워크플로에 `SIGNAL_TICKERS` 환경변수(예: `SOXL:SOXX,TQQQ:QQQ`)를 추가합니다.
 
 ## 종목 발굴 (타이탄봇 결과 읽기)
 

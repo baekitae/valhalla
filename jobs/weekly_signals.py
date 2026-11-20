@@ -25,7 +25,7 @@ import valhalla_core as core  # noqa: E402
 
 KST, ET = ZoneInfo("Asia/Seoul"), ZoneInfo("America/New_York")
 TABLE = "valhalla_predictions"
-_DEFAULT = ",".join(f"{t}:{p}" for t, (p, _) in core.SIGNAL_UNIVERSE.items())   # 3배·2배·1배 ETF·개별 종목
+_DEFAULT = ",".join(f"{t}:{p}" for t, (p, _, _) in core.SIGNAL_UNIVERSE.items())   # 섹터 × (3배·2배·1배 ETF·개별 종목)
 TICKERS = [(t.strip().upper(), p.strip().upper()) for t, p in
            (pair.split(":") for pair in (os.environ.get("SIGNAL_TICKERS") or _DEFAULT).split(",") if ":" in pair)]
 

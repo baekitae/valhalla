@@ -79,3 +79,13 @@ def test_action_signals_no_future_leak():
     part = core.action_signals(core.build_signal_history(d.iloc[:2000], None, {}))
     common = part.index[:-1]
     assert (full.loc[common, "action"] == part.loc[common, "action"]).all()
+
+
+def test_universe_grid_and_compare_tables():
+    assert set(core.CATEGORIES) == {v[1] for v in core.SIGNAL_UNIVERSE.values()}
+    assert core.partner_of("SOXL") == "SOXX" and core.partner_of("SOXX") == "QQQ" and core.partner_of("JPM") == "XLF"
+    assert core.sector_of("FAS") == "금융" and core.category_of("FAS") == "3배 ETF"
+    h = core.build_signal_history(_daily(), _daily(seed=1), _macro(2))
+    rows = [dict(core.ticker_summary(core.action_signals(h), t)) for t in ("SOXL", "USD", "SOXX", "NVDA", "FAS", "XLF")]
+    t = core.compare_tables(pd.DataFrame(rows))
+    assert set(t["grid"].index) == {"반도체", "금융"} and 0 <= t["plus_share"] <= 100
