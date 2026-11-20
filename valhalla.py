@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-7"
+REQUIRED_CORE_VERSION = "2026.11.20-8"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1802,6 +1802,96 @@ def render_rule_improvement() -> None:
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_arena(backend_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(선수 비중 기록, AI 위원회 회의록)."""
+    if backend_name != "supabase":
+        return pd.DataFrame(), pd.DataFrame()
+    try:
+        pos = pd.DataFrame(_sb_fetch_all(core.POSITION_TABLE))
+    except Exception as exc:
+        LOGGER.warning("선수 기록 조회 실패: %s", exc)
+        pos = pd.DataFrame()
+    try:
+        mins = pd.DataFrame(_sb_fetch_all(core.MINUTES_TABLE))
+    except Exception:
+        mins = pd.DataFrame()
+    return pos, mins
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_player_backtest(ticker: str, partner: str, rules_key: str) -> pd.DataFrame:
+    daily = load_long(ticker, "max", True)
+    if daily is None:
+        return pd.DataFrame()
+    partner_df = load_long(partner, "max", True) if partner else None
+    hist = core.complete_weeks(load_signal_history(ticker, partner), us_asof())
+    rules = [(int(v), core.normalize_rules(r)) for v, r in json.loads(rules_key)]
+    pos = core.player_positions(hist, daily, core.trend_reference(ticker, daily, partner_df), rules)
+    return core.backtest_players(pos, hist["close"])
+
+
+def render_arena(ticker: str, partner: str) -> None:
+    section("선수 경기장", "모든 선수가 매주 종목별 비중(0~100%)을 내고, 다음 주 실제 수익률로 똑같이 채점합니다. "
+                       "'그냥 보유'보다 나아야 쓸모 있는 선수예요.")
+    state = load_rule_state(backend())
+    rules = [(state["version"], state["rules"])] + list(state.get("challengers", []))
+    pos, mins = load_arena(backend())
+    t1, t2, t3 = st.tabs(["실전 경기표", f"{ticker} 과거 성적", "AI 위원회 회의록"])
+    with t1:
+        if pos.empty:
+            st.caption("아직 실전 기록이 없습니다. 매일 아침 자동 점검이 선수별 비중을 기록하고, 1주 뒤부터 채점합니다.")
+        else:
+            scope = st.segmented_control("범위", ["AI 위원회 10개 종목", "전체 53개 종목"], default="AI 위원회 10개 종목",
+                                         key="arena_scope") or "AI 위원회 10개 종목"
+            table = core.arena_table(pos, core.COUNCIL_TICKERS if scope.startswith("AI") else None)
+            if table.empty:
+                st.caption("채점된 기록이 아직 없습니다 (비중을 낸 다음 주 금요일 종가가 나오면 채점).")
+            else:
+                st.dataframe(table.drop(columns=["id"]), hide_index=True, width="stretch",
+                             column_config={"누적(%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                                            "보유 대비(%p)": st.column_config.NumberColumn(format="%+.2f")})
+                weeks = int(table["채점 주 수"].max())
+                if weeks < 20:
+                    st.caption(f"채점 {weeks}주째입니다. 최소 20주는 지나야 순위를 믿을 수 있어요.")
+            latest = pos[(pos["ticker"] == ticker)]
+            if not latest.empty:
+                wk = latest["week"].max()
+                cur = latest[latest["week"] == wk].copy()
+                cur["선수"] = cur["player"].map(core.player_label)
+                cur["이번 주 비중"] = (cur["position"].astype(float) * 100).round(0)
+                st.markdown(f"**{ticker} · {str(wk)[:10]} 주 선수별 비중**")
+                st.dataframe(cur[["선수", "이번 주 비중", "note"]].rename(columns={"note": "메모"}), hide_index=True,
+                             width="stretch", column_config={"이번 주 비중": st.column_config.ProgressColumn(
+                                 min_value=0, max_value=100, format="%.0f%%")})
+    with t2:
+        st.caption("계산 가능한 선수(규칙·추세 필터·변동성 조절·그냥 보유)를 과거 전체에 적용한 결과입니다. "
+                   "AI 위원회와 앙상블은 과거로 검증할 수 없어 실전 기록만 봅니다.")
+        bt = cached_player_backtest(ticker, partner, json.dumps([[v, r] for v, r in rules]))
+        if bt.empty:
+            st.caption("데이터가 부족합니다.")
+        else:
+            st.dataframe(bt.drop(columns=["id"]), hide_index=True, width="stretch",
+                         column_config={c: st.column_config.NumberColumn(format="%+.1f%%")
+                                        for c in ("전체 누적(%)", "전체 MDD(%)", "최근 2년 누적(%)", "최근 2년 MDD(%)")})
+    with t3:
+        if mins.empty:
+            st.caption("아직 회의록이 없습니다. AI 위원회(Claude)가 매주 토요일 아침 10개 종목을 회의하고 여기에 기록합니다.")
+        else:
+            mins = mins.sort_values(["week", "ticker"], ascending=[False, True])
+            wk = mins["week"].max()
+            st.markdown(f"**{str(wk)[:10]} 주 회의 결과**")
+            this = mins[mins["week"] == wk]
+            st.dataframe(this[["ticker", "decision", "position", "prob_up"]].rename(columns={
+                "ticker": "종목", "decision": "결정", "position": "비중", "prob_up": "4주 상승 확률(%)"}),
+                hide_index=True, width="stretch",
+                column_config={"비중": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f")})
+            pick = st.selectbox("회의록 보기", this["ticker"].tolist(),
+                                index=this["ticker"].tolist().index(ticker) if ticker in this["ticker"].tolist() else 0,
+                                key="minutes_pick")
+            st.markdown(this[this["ticker"] == pick]["minutes"].iloc[0] or "—")
+
+
 def page_signals() -> None:
     page_header("SIGNAL ROOM", "신호 관제",
                 "반등 신호 점수판 · 과거 같은 점수의 실제 결과 · 매주 남기는 예측과 채점",
@@ -1876,6 +1966,7 @@ def page_signals() -> None:
     show_chart(fig, key="sig_trend")
 
     render_actions(done, ticker)
+    render_arena(ticker, partner)
     render_rule_improvement()
 
     section("점수별 과거 성적", f"{bt['start']:%Y-%m} ~ {bt['cutoff']:%Y-%m}은 학습 구간, 그 뒤 최근 2년은 확률 계산에 쓰지 않은 "

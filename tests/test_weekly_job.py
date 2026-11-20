@@ -18,6 +18,13 @@ class FakeQuery:
     def select(self, *_):
         return self
 
+    def order(self, *_ , **__):
+        return self
+
+    def range(self, a, b):
+        self.rng = (a, b)
+        return self
+
     def eq(self, col, val):
         self.filters.append((col, val))
         return self
@@ -37,8 +44,12 @@ class FakeQuery:
     def execute(self):
         rows = self.db.setdefault(self.table, [])
         match = [r for r in rows if all(str(r.get(c)) == str(v) for c, v in self.filters)]
+        if getattr(self, "rng", None) and self.op == "select":
+            match = match[self.rng[0]: self.rng[1] + 1]
         if self.op == "insert":
-            rows.append({"id": len(rows) + 1, **self.payload})
+            for item in (self.payload if isinstance(self.payload, list) else [self.payload]):
+                rows.append({"id": len(rows) + 1, **{"ret_1w": None, "ret_4w": None, "ret_12w": None}, **item}
+                            if self.table in ("valhalla_positions",) else {"id": len(rows) + 1, **item})
         elif self.op == "upsert":
             keys = (on_keys := ("date", "ticker"))
             for r in self.payload:
@@ -147,3 +158,26 @@ def test_champion_vs_challenger_live_signals():
     assert set(table["버전"]) <= {1, 2}
     verdicts = weekly.core.promotion_verdicts(table, 1)
     assert all("표본 부족" in v or "대기" in v or "승격" in v or "열세" in v or "접전" in v for v in verdicts.values())
+
+
+
+def test_positions_recorded_graded_and_ensemble():
+    sb = FakeSB()
+    d = _daily(n=3000)
+    weekly.TICKERS = [("SOXL", "SOXX")]
+    end = pd.Timestamp(d.index[-1])
+    # 2주 전 시점으로 한 번, 지금 시점으로 한 번 → 지난 기록이 채점되어야 함
+    weekly.us_asof = lambda: end - pd.Timedelta(days=14)
+    weekly.run(sb, lambda t, adj: d[d.index <= end - pd.Timedelta(days=14)])
+    first = pd.DataFrame(sb.db["valhalla_positions"])
+    assert {"rule_v1", "trend200", "voltarget", "hold", "ensemble"} <= set(first["player"])
+    weekly.us_asof = lambda: end
+    msg = weekly.run(sb, lambda t, adj: d)
+    allp = pd.DataFrame(sb.db["valhalla_positions"])
+    old_week = first["week"].iloc[0]
+    assert allp[allp["week"] == old_week]["ret_1w"].notna().all(), msg
+    assert "앙상블" in msg
+    # 같은 날 재실행해도 중복 기록 없음
+    n = len(sb.db["valhalla_positions"])
+    weekly.run(sb, lambda t, adj: d)
+    assert len(sb.db["valhalla_positions"]) == n

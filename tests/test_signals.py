@@ -131,3 +131,32 @@ def test_rule_review_picks_by_train_and_judges_on_test():
     txt = core.rule_text({"buy": {"chart_min": 4, "weeks": 1, "macro_min": 0},
                           "sell": {"chart_max": 2, "weeks": 3, "below_ma": False}})
     assert "4점 이상이 1주" in txt["매수"] and "거시" not in txt["매수"] and "20일선" not in txt["매도"]
+
+
+def test_player_positions_backtest_and_ensemble():
+    d, ref = _daily(), _daily(seed=1)
+    h = core.build_signal_history(d, ref, _macro(2))
+    pos = core.player_positions(h, d, ref, [(1, core.ACTION_RULES)])
+    assert {"rule_v1", "trend200", "voltarget", "hold"} == set(pos.columns)
+    assert pos["voltarget"].dropna().between(0, 1).all() and set(pos["trend200"].dropna().unique()) <= {0.0, 1.0}
+    bt = core.backtest_players(pos, h["close"])
+    assert set(bt["id"]) == set(pos.columns)
+    hold_row = bt.set_index("id").loc["hold"]
+    # 그냥 보유의 누적 = 주봉 단순 보유 (첫 매수 비용만 차이)
+    raw = (h["close"].iloc[-1] / h["close"].iloc[0] - 1) * 100
+    assert abs(hold_row["전체 누적(%)"] - raw) / max(abs(raw), 1) < 0.05
+    # 실전 기록 형태로 바꿔 채점·경기표·앙상블
+    rows = []
+    for wk in h.index[-60:-1]:
+        for pid in pos.columns:
+            rows.append({"player": pid, "ticker": "SOXL", "week": wk.strftime("%Y-%m-%d"), "position": float(pos.loc[wk, pid]) if pd.notna(pos.loc[wk, pid]) else 0.0})
+    g = core.grade_positions(pd.DataFrame(rows), h["close"])
+    assert g["ret_1w"].notna().all()
+    arena = core.arena_table(g)
+    assert "그냥 보유" in set(arena["선수"]) and abs(arena.set_index("id").loc["hold", "보유 대비(%p)"]) < 1e-9
+    w = core.ensemble_weights(g, h.index[-1])
+    assert set(w) == {"rule_v1", "trend200", "voltarget"} and abs(sum(w.values()) - 1) < 1e-6 and max(w.values()) <= 0.5 + 1e-9
+    assert 0 <= core.ensemble_position({"rule_v1": 1.0, "trend200": 0.0, "voltarget": 0.5}, w) <= 1
+    # 표본 부족이면 균등
+    w2 = core.ensemble_weights(g[g["week"] > g["week"].max()[:8] + "01"], h.index[-1])
+    assert len(set(round(v, 4) for v in w2.values())) <= 1

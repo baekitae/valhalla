@@ -89,6 +89,13 @@ def run(sb, fetch=download) -> str:
             failed.append(f"{ticker}({exc.__class__.__name__})")
     for i in range(0, len(reports), 100):
         sb.table(core.REPORT_TABLE).upsert(reports[i:i + 100], on_conflict="date,ticker").execute()
+    try:
+        n_ens, weights = update_ensemble(sb, asof)
+        lines.append(f"앙상블 {n_ens}건 · 가중치 " + ", ".join(f"{core.player_label(p)} {w:.0%}" for p, w in
+                                                         sorted(weights.items(), key=lambda x: -x[1])))
+    except Exception as exc:
+        traceback.print_exc()
+        lines.append(f"앙상블 실패: {exc}")
     rep = pd.DataFrame(reports)
     share = float((rep["test_diff"].dropna() > 0).mean() * 100) if not rep.empty and rep["test_diff"].notna().any() else None
     lines.append(f"규칙 v{rule_version} · {len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
@@ -100,9 +107,35 @@ def run(sb, fetch=download) -> str:
     return " / ".join(lines)
 
 
+def update_ensemble(sb, asof) -> tuple[int, dict]:
+    """채점 전(다음 주 결과가 나오기 전)인 주에 대해서만 앙상블 비중을 계산·갱신 → 미래 정보 누수 없음.
+    AI 위원회가 토요일에 늦게 기록해도, 다음 날 점검에서 앙상블에 반영됩니다."""
+    allp = pd.DataFrame(core.sb_fetch_all(sb, core.POSITION_TABLE))
+    if allp.empty:
+        return 0, {}
+    weights = core.ensemble_weights(allp, asof)
+    open_rows = allp[allp["ret_1w"].isna() & (allp["player"] != "ensemble")]
+    n = 0
+    for (ticker, week), g in open_rows.groupby(["ticker", "week"]):
+        members = {r["player"]: r["position"] for _, r in g.iterrows()}
+        val = core.ensemble_position(members, weights)
+        if val is None:
+            continue
+        ex = allp[(allp["player"] == "ensemble") & (allp["ticker"] == ticker) & (allp["week"] == week)]
+        note = ", ".join(f"{p}:{weights[p]:.2f}" for p in sorted(members) if p in weights)
+        if ex.empty:
+            sb.table(core.POSITION_TABLE).insert({"player": "ensemble", "ticker": ticker, "week": week, "position": val,
+                                                  "close": float(g["close"].dropna().iloc[0]) if g["close"].notna().any() else None,
+                                                  "note": note}).execute()
+        elif pd.isna(ex["ret_1w"].iloc[0]):
+            sb.table(core.POSITION_TABLE).update({"position": val, "note": note}).eq("id", int(ex["id"].iloc[0])).execute()
+        n += 1
+    return n, weights
+
+
 def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule_version=None,
              contenders=None) -> dict:
-    out = {"new": 0, "graded": 0, "report": None, "live_new": 0}
+    out = {"new": 0, "graded": 0, "report": None, "live_new": 0, "positions": 0}
     daily = fetch(ticker, True)
     if daily is None:
         raise RuntimeError("시세 없음")
@@ -140,6 +173,24 @@ def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule
                      if c in new and pd.notna(new.get(c)) and pd.isna(old.get(c))}
             if patch:
                 sb.table(core.RULE_SIGNAL_TABLE).update(patch).eq("id", int(old["id"])).execute()
+    # 선수 경기장: 계산 가능한 선수들의 이번 주 비중 기록 + 지난 기록 채점
+    ref = core.trend_reference(ticker, daily, partners.get(partner))
+    pos = core.player_positions(hist, daily, ref, contenders or [])
+    week = hist.index[-1].strftime("%Y-%m-%d")
+    have = {r["player"] for r in core.sb_fetch_all(sb, core.POSITION_TABLE, {"ticker": ticker, "week": week})}
+    new_rows = [{"player": pid, "ticker": ticker, "week": week, "position": round(float(v), 4),
+                 "close": round(float(hist["close"].iloc[-1]), 4)}
+                for pid, v in pos.iloc[-1].items() if pd.notna(v) and pid not in have]
+    if new_rows:
+        sb.table(core.POSITION_TABLE).insert(new_rows).execute()
+        out["positions"] = len(new_rows)
+    prow = pd.DataFrame(core.sb_fetch_all(sb, core.POSITION_TABLE, {"ticker": ticker}))
+    if not prow.empty:
+        todo = prow[prow["ret_1w"].isna()]
+        graded_p = core.grade_positions(todo, hist["close"])
+        for (_, old), (_, new) in zip(todo.iterrows(), graded_p.iterrows()):
+            if pd.notna(new.get("ret_1w")):
+                sb.table(core.POSITION_TABLE).update({"ret_1w": float(new["ret_1w"])}).eq("id", int(old["id"])).execute()
     out["report"] = core.report_row(core.action_signals(hist, rules), ticker, asof.strftime("%Y-%m-%d"))
     if out["report"] is not None:
         out["report"]["rule_version"] = rule_version

@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-7"
+CORE_VERSION = "2026.11.20-8"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1725,3 +1725,202 @@ def promotion_verdicts(table: pd.DataFrame, champion: int, th: dict | None = Non
         else:
             out[v] = f"접전 (매수 적중률 {r['매수 적중률(%)']:.0f}% vs 챔피언 {champ_hit:.0f}%)"
     return out
+
+
+# ==========================================================================
+# 15. 선수 경기장: 모든 선수가 매주 종목별 '비중(0~1)'을 내고, 다음 주 수익률로 똑같이 채점
+#   선수: 규칙(챔피언·도전자) · 추세 필터 · 변동성 조절 · 그냥 보유 · AI 위원회(Claude) · 앙상블
+# ==========================================================================
+POSITION_TABLE = "valhalla_positions"
+MINUTES_TABLE = "valhalla_council_minutes"
+COUNCIL_TICKERS = ["SOXL", "USD", "SOXX", "NVDA", "AVGO", "MRVL", "MU", "TQQQ", "QQQ", "SPY"]
+BASE_PLAYERS = {"trend200": "추세 필터", "voltarget": "변동성 조절", "hold": "그냥 보유"}
+LIVE_ONLY = {"ai_council": "AI 위원회", "ensemble": "앙상블"}
+ENSEMBLE_RULES = {"min_weeks": 20, "lookback": 26, "cap": 0.5, "shrink": 0.5}
+
+
+def player_label(pid: str) -> str:
+    if pid.startswith("rule_v"):
+        return f"규칙 {pid[5:]}"
+    return {**BASE_PLAYERS, **LIVE_ONLY}.get(pid, pid)
+
+
+def rule_positions(sig: pd.DataFrame) -> pd.Series:
+    """규칙 신호 → 주별 비중 (매수 이후 1, 매도 이후 0, 첫 신호 전에는 보유 1)."""
+    return sig["state"].map({"매수": 1.0, "매도": 0.0}).fillna(1.0)
+
+
+def trend_positions(index: pd.DatetimeIndex, ref_daily: pd.DataFrame | None, ma: int = 200) -> pd.Series:
+    """기준 지수 금요일 종가가 200일선 위면 1, 아래면 0 (기준 지수가 없으면 NaN)."""
+    if ref_daily is None or ref_daily.empty:
+        return pd.Series(np.nan, index=index)
+    c = ref_daily["Close"]
+    above = (c > c.rolling(ma).mean()).where(c.rolling(ma).mean().notna())
+    return above.resample("W-FRI").last().reindex(index).astype(float)
+
+
+def vol_positions(index: pd.DatetimeIndex, daily: pd.DataFrame, window: int = 20, base: int = 252) -> pd.Series:
+    """변동성 조절: 비중 = 평소(1년 중앙값) 변동성 ÷ 최근 20일 변동성 (0~1). 평소보다 출렁이면 그만큼 줄임."""
+    r = daily["Close"].pct_change()
+    vol = r.rolling(window).std()
+    normal = vol.rolling(base, min_periods=base // 2).median()
+    pos = (normal / vol).clip(0, 1).where(normal.notna() & (vol > 0))
+    return pos.resample("W-FRI").last().reindex(index)
+
+
+def player_positions(hist: pd.DataFrame, daily: pd.DataFrame, ref_daily: pd.DataFrame | None,
+                     rules: list[tuple[int, dict]]) -> pd.DataFrame:
+    """주별 × 선수 비중표 (계산 가능한 선수만: 규칙들·추세·변동성·보유)."""
+    out = pd.DataFrame(index=hist.index)
+    for version, rule in rules:
+        out[f"rule_v{version}"] = rule_positions(action_signals(hist, rule))
+    out["trend200"] = trend_positions(hist.index, ref_daily)
+    out["voltarget"] = vol_positions(hist.index, daily)
+    out["hold"] = 1.0
+    return out
+
+
+def trend_reference(ticker: str, daily: pd.DataFrame, partner_daily: pd.DataFrame | None) -> pd.DataFrame | None:
+    """추세 필터 기준: 1배 ETF는 자기 자신, 레버리지 ETF·개별 종목은 같은 섹터 1배 ETF."""
+    return daily if category_of(ticker) in ("1배 ETF", "기타") else partner_daily
+
+
+def backtest_players(positions: pd.DataFrame, close: pd.Series, test_weeks: int = TEST_WEEKS,
+                     fee_bps: float = 10) -> pd.DataFrame:
+    """선수별 과거 성적: 이번 주 비중 × 다음 주 수익률 (거래 비용 반영). 전체 기간과 최근 2년."""
+    ret = close.pct_change().shift(-1)            # 이번 주 금요일 → 다음 주 금요일
+    rows = []
+    cut = close.index[-1] - pd.Timedelta(weeks=test_weeks)
+    for pid in positions.columns:
+        pos = positions[pid].astype(float)
+        valid = pos.notna() & ret.notna()
+        if valid.sum() < 10:
+            continue
+        p, r = pos[valid], ret[valid]
+        cost = p.diff().abs().fillna(p.iloc[0]) * fee_bps / 10_000
+        wr = p * r - cost
+
+        def stats(x: pd.Series) -> tuple[float, float]:
+            eq = (1 + x).cumprod()
+            return float((eq.iloc[-1] - 1) * 100), float(((eq / eq.cummax()) - 1).min() * 100)
+
+        full_ret, full_mdd = stats(wr)
+        recent = wr[wr.index > cut]
+        rec_ret, rec_mdd = stats(recent) if len(recent) > 4 else (float("nan"), float("nan"))
+        rows.append({"선수": player_label(pid), "id": pid, "평균 비중(%)": round(float(p.mean() * 100), 0),
+                     "전체 누적(%)": round(full_ret, 1), "전체 MDD(%)": round(full_mdd, 1),
+                     "최근 2년 누적(%)": round(rec_ret, 1), "최근 2년 MDD(%)": round(rec_mdd, 1),
+                     "주 수": int(valid.sum())})
+    return pd.DataFrame(rows)
+
+
+def grade_positions(rows: pd.DataFrame, weekly_close: pd.Series) -> pd.DataFrame:
+    """비중 기록에 다음 주 수익률(ret_1w, %)을 채움."""
+    if rows is None or rows.empty:
+        return rows
+    out = rows.copy()
+    wc = weekly_close.dropna()
+    if "ret_1w" not in out:
+        out["ret_1w"] = np.nan
+    for i, row in out.iterrows():
+        if pd.notna(row.get("ret_1w")):
+            continue
+        week = pd.Timestamp(row["week"])
+        if week in wc.index:
+            pos = wc.index.get_loc(week)
+            if pos + 1 < len(wc):
+                out.at[i, "ret_1w"] = round(float((wc.iloc[pos + 1] / wc.iloc[pos] - 1) * 100), 3)
+    return out
+
+
+def ensemble_weights(graded: pd.DataFrame, asof: pd.Timestamp, rules: dict | None = None) -> dict[str, float]:
+    """앙상블 가중치: 이번 달 1일 이전 채점 기록만 사용(한 달에 한 번 바뀜).
+    최근 26주 '보유 대비 초과수익'이 클수록 무겁게. 20주 미만이면 균등, 절반은 균등과 섞고, 한 선수 최대 50%."""
+    th = {**ENSEMBLE_RULES, **(rules or {})}
+    members = [p for p in (graded["player"].unique() if graded is not None and not graded.empty else [])
+               if p not in ("ensemble", "hold")]
+    if not members:
+        return {}
+    equal = {p: 1 / len(members) for p in members}
+    month_start = pd.Timestamp(asof).to_period("M").start_time
+    d = graded[(pd.to_datetime(graded["week"]) < month_start) & graded["ret_1w"].notna()]
+    if d.empty:
+        return equal
+    hold = d[d["player"] == "hold"].set_index(["ticker", "week"])["ret_1w"]
+    scores, enough = {}, True
+    for p in members:
+        g = d[d["player"] == p]
+        weeks = sorted(g["week"].unique())[-th["lookback"]:]
+        g = g[g["week"].isin(weeks)]
+        if g["week"].nunique() < th["min_weeks"]:
+            enough = False
+        hr = hold.reindex(pd.MultiIndex.from_frame(g[["ticker", "week"]])).to_numpy()
+        excess = g["position"].astype(float).to_numpy() * g["ret_1w"].to_numpy() - np.nan_to_num(hr, nan=0.0)
+        scores[p] = float(np.nanmean(excess)) if len(excess) else 0.0
+    if not enough:
+        return equal
+    raw = {p: max(s, 0.0) + 1e-6 for p, s in scores.items()}
+    tot = sum(raw.values())
+    w = {p: th["shrink"] * equal[p] + (1 - th["shrink"]) * raw[p] / tot for p in members}
+    for _ in range(10):                                  # 상한 50% 적용 후 재분배
+        over = {p: v for p, v in w.items() if v > th["cap"]}
+        if not over:
+            break
+        extra = sum(v - th["cap"] for v in over.values())
+        rest = [p for p in w if p not in over]
+        for p in over:
+            w[p] = th["cap"]
+        for p in rest:
+            w[p] += extra / len(rest)
+    s = sum(w.values())
+    return {p: round(v / s, 4) for p, v in w.items()}
+
+
+def ensemble_position(member_positions: dict[str, float], weights: dict[str, float]) -> float | None:
+    usable = {p: v for p, v in member_positions.items() if p in weights and v is not None and pd.notna(v)}
+    if not usable:
+        return None
+    tot = sum(weights[p] for p in usable)
+    return round(sum(weights[p] * v for p, v in usable.items()) / tot, 4) if tot > 0 else None
+
+
+def arena_table(graded: pd.DataFrame, tickers: list[str] | None = None) -> pd.DataFrame:
+    """실전 경기표: 선수별 누적 수익(종목 평균), 보유 대비, 평균 비중, 들어갔을 때 오른 비율, 빠졌을 때 피한 비율."""
+    if graded is None or graded.empty:
+        return pd.DataFrame()
+    d = graded.dropna(subset=["ret_1w"]).copy()
+    if tickers:
+        d = d[d["ticker"].isin(tickers)]
+    if d.empty:
+        return pd.DataFrame()
+    d["position"] = d["position"].astype(float)
+    d["pr"] = d["position"] * d["ret_1w"] / 100
+    hold = d[d["player"] == "hold"].set_index(["ticker", "week"])["ret_1w"] / 100
+    rows = []
+    for p, g in d.groupby("player"):
+        per_ticker = g.sort_values("week").groupby("ticker")["pr"].apply(lambda x: float((1 + x).prod() - 1))
+        h = hold.reindex(pd.MultiIndex.from_frame(g[["ticker", "week"]]))
+        hold_ticker = (pd.Series(h.to_numpy(), index=g.index).groupby(g["ticker"])
+                         .apply(lambda x: float((1 + x.fillna(0)).prod() - 1)))
+        inn, out = g[g["position"] >= 0.5], g[g["position"] < 0.5]
+        rows.append({"선수": player_label(p), "id": p, "채점 주 수": int(g["week"].nunique()), "종목 수": int(g["ticker"].nunique()),
+                     "누적(%)": round(float(per_ticker.mean() * 100), 2),
+                     "보유 대비(%p)": round(float((per_ticker - hold_ticker.reindex(per_ticker.index)).mean() * 100), 2),
+                     "평균 비중(%)": round(float(g["position"].mean() * 100), 0),
+                     "들어갔을 때 오른 비율(%)": round(float((inn["ret_1w"] > 0).mean() * 100), 1) if len(inn) else None,
+                     "빠졌을 때 피한 비율(%)": round(float((out["ret_1w"] < 0).mean() * 100), 1) if len(out) else None})
+    return pd.DataFrame(rows).sort_values("누적(%)", ascending=False).reset_index(drop=True)
+
+
+def sb_fetch_all(sb, table: str, eq: dict | None = None, page: int = 1000) -> list[dict]:
+    """Supabase 1,000행 제한을 넘겨 끝까지 읽기."""
+    rows, start = [], 0
+    while True:
+        q = sb.table(table).select("*")
+        for k, v in (eq or {}).items():
+            q = q.eq(k, v)
+        batch = _rows(q.order("id").range(start, start + page - 1).execute())
+        rows.extend(batch)
+        if len(batch) < page:
+            return rows
+        start += page
