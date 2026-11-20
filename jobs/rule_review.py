@@ -1,6 +1,6 @@
 """신호 규칙 월간 점검 (GitHub Actions, 매달 1일 KST 09:10).
 
-후보 규칙 432개를 53개 종목에 적용해서
+후보 규칙 432개를 53개 종목에 적용해서 (도전자가 3개 이상이면 건너뜀)
   1) 학습 구간(최근 2년 제외)으로만 가장 좋은 후보 1개를 고르고
   2) 고를 때 쓰지 않은 최근 2년에서 지금 규칙보다 '확실히' 나을 때만
   3) valhalla_signal_rules 에 '제안'으로 기록합니다. 적용은 발할라 화면에서 사람이 승인합니다.
@@ -30,6 +30,9 @@ def run(sb, fetch=daily.download, candidates=None) -> str:
     pending = core.pending_proposal(sb)
     if pending:
         return f"규칙 v{version} 유지 · 승인 대기 중인 제안 v{pending['version']}이 있어 새 점검을 건너뜀"
+    challengers = core.load_challengers(sb)
+    if len(challengers) >= core.MAX_CHALLENGERS:
+        return f"규칙 v{version} 유지 · 도전자가 이미 {len(challengers)}개라 새 점검을 건너뜀 (경쟁 결과를 먼저 정리하세요)"
     histories = daily.load_histories(fetch)
     res = core.review_rules(histories, current, candidates)
     cur, cand = res["current_test"], res["candidate_test"] or {}

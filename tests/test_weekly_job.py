@@ -121,3 +121,29 @@ def test_rule_review_job_proposes_or_keeps():
     weekly.core.decide_proposal(sb, 99, True, "2026-11-20T00:00:00")
     status = {r["version"]: r["status"] for r in sb.db["valhalla_signal_rules"]}
     assert status[1] == "retired" and status[2] == "active"
+
+
+def test_champion_vs_challenger_live_signals():
+    sb = FakeSB()
+    d = _daily(n=3000)
+    weekly.us_asof = lambda: pd.Timestamp(d.index[-1])
+    weekly.TICKERS = [("SOXL", "SOXX")]
+    weekly.core.load_active_rule(sb)
+    # 항상 신호가 나도록 느슨한 도전자 (차트 0점 이상 1주, 거시 0점)
+    loose = {"buy": {"chart_min": 0, "weeks": 1, "macro_min": 0}, "sell": {"chart_max": -1, "weeks": 1, "below_ma": False}}
+    sb.db["valhalla_signal_rules"].append({"id": 50, "version": 2, "status": "challenger", "params": loose})
+    assert [v for v, _ in weekly.core.load_challengers(sb)] == [2]
+    # 과거 신호 하나를 넣어 두면 채점됨
+    past = pd.Timestamp(d.index[-1]).to_period("W-FRI").end_time.normalize() - pd.Timedelta(weeks=10)
+    sb.db["valhalla_rule_signals"] = [{"id": 1, "rule_version": 1, "ticker": "SOXL", "week": past.strftime("%Y-%m-%d"),
+                                       "action": "매수", "close": 1.0, "ret_4w": None, "ret_12w": None}]
+    msg = weekly.run(sb, lambda t, adj: d)
+    assert "경쟁 v1 vs v2" in msg
+    live = pd.DataFrame(sb.db["valhalla_rule_signals"])
+    assert live.loc[live["id"] == 1, "ret_4w"].notna().all()
+    weekly.run(sb, lambda t, adj: d)                       # 같은 주 재실행 → 중복 없음
+    assert len(sb.db["valhalla_rule_signals"]) == len(live)
+    table = weekly.core.rule_competition(pd.DataFrame(sb.db["valhalla_rule_signals"]), {1: "챔피언", 2: "도전자"})
+    assert set(table["버전"]) <= {1, 2}
+    verdicts = weekly.core.promotion_verdicts(table, 1)
+    assert all("표본 부족" in v or "대기" in v or "승격" in v or "열세" in v or "접전" in v for v in verdicts.values())

@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-6"
+CORE_VERSION = "2026.11.20-7"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1480,7 +1480,7 @@ def live_health(ledger: pd.DataFrame, horizon: int = 4, min_n: int = 20) -> list
 #   4) 적용은 사람이 화면에서 승인 → 버전 기록
 # ==========================================================================
 RULE_TABLE = "valhalla_signal_rules"
-ADOPT_MIN = {"plus_share_gain": 10.0, "diff_gain": 3.0, "min_signals": 30, "mdd_slack": 5.0}
+ADOPT_MIN = {"plus_share_gain": 10.0, "diff_gain": 3.0, "min_signals": 30, "mdd_slack": 5.0, "min_weeks": 8}
 
 
 def rule_text(rules: dict | None = None) -> dict[str, str]:
@@ -1519,13 +1519,16 @@ def _rule_key(rules: dict) -> tuple:
 
 def evaluate_rule(histories: dict[str, pd.DataFrame], rules: dict, part: str = "train") -> dict:
     """여러 종목에 같은 규칙을 적용한 성적. part = 'train'(최근 2년 제외) 또는 'test'(최근 2년)."""
-    diffs, signals, mdds, rets, holds = [], 0, [], [], []
+    diffs, signals, mdds, rets, holds, weeks = [], 0, [], [], [], set()
     for _, hist in histories.items():
         if hist is None or hist.empty:
             continue
-        bt = action_backtest(action_signals(hist, rules))
+        sig = action_signals(hist, rules)
+        bt = action_backtest(sig)
         if not bt:
             continue
+        buys = sig.index[(sig["action"] == "매수") & sig["ret_4w"].notna()]
+        weeks.update(buys[buys > bt["cutoff"]] if part == "test" else buys[buys <= bt["cutoff"]])
         t = bt[f"{part}_buy"].set_index("기간")
         if "4주 뒤" not in t.index:
             continue
@@ -1538,19 +1541,20 @@ def evaluate_rule(histories: dict[str, pd.DataFrame], rules: dict, part: str = "
         rets.append(sm["strategy"])
         holds.append(sm["hold"])
     if not diffs:
-        return {"n_tickers": 0, "signals": 0, "avg_diff": None, "plus_share": None,
+        return {"n_tickers": 0, "signals": 0, "weeks": 0, "avg_diff": None, "plus_share": None,
                 "median_mdd": None, "median_ret": None, "median_hold": None}
     d = np.array(diffs)
-    return {"n_tickers": int(len(d)), "signals": int(signals), "avg_diff": round(float(d.mean()), 2),
+    return {"n_tickers": int(len(d)), "signals": int(signals), "weeks": int(len(weeks)),
+            "avg_diff": round(float(d.mean()), 2),
             "plus_share": round(float((d > 0).mean() * 100), 1),
             "median_mdd": round(float(np.median(mdds)), 1) if mdds else None,
             "median_ret": round(float(np.median(rets)), 1) if rets else None,
             "median_hold": round(float(np.median(holds)), 1) if holds else None}
 
 
-def _train_score(ev: dict, min_signals: int) -> float:
-    """학습 구간 점수: 평균 차이 + 평소보다 나은 종목 비율 (신호가 너무 적으면 탈락)."""
-    if not ev or ev["avg_diff"] is None or ev["signals"] < min_signals:
+def _train_score(ev: dict, min_signals: int, min_weeks: int = 0) -> float:
+    """학습 구간 점수: 평균 차이 + 평소보다 나은 종목 비율 (신호가 너무 적거나 몰려 있으면 탈락)."""
+    if not ev or ev["avg_diff"] is None or ev["signals"] < min_signals or ev.get("weeks", 0) < min_weeks:
         return -1e9
     return ev["avg_diff"] + (ev["plus_share"] - 50) * 0.2
 
@@ -1567,7 +1571,7 @@ def review_rules(histories: dict[str, pd.DataFrame], current: dict, candidates: 
         if _rule_key(cand) == _rule_key(current):
             continue
         ev = evaluate_rule(histories, cand, "train")
-        sc = _train_score(ev, min_train_signals)
+        sc = _train_score(ev, min_train_signals, th["min_weeks"] * 3)
         if sc > best_score:
             best, best_score, best_train = cand, sc, ev
         if progress:
@@ -1588,6 +1592,9 @@ def review_rules(histories: dict[str, pd.DataFrame], current: dict, candidates: 
     if cand_test["signals"] < th["min_signals"]:
         ok = False
         reasons.append(f"검증 구간 신호 {cand_test['signals']}건 < {th['min_signals']}건")
+    if cand_test.get("weeks", 0) < th["min_weeks"]:
+        ok = False
+        reasons.append(f"신호가 난 서로 다른 주 {cand_test.get('weeks', 0)}주 < {th['min_weeks']}주 (몇 번의 순간에 몰림)")
     gain_share = cand_test["plus_share"] - cur_test["plus_share"]
     gain_diff = cand_test["avg_diff"] - cur_test["avg_diff"]
     if gain_share < th["plus_share_gain"]:
@@ -1643,9 +1650,78 @@ def save_proposal(sb, result: dict) -> int:
     return version
 
 
-def decide_proposal(sb, proposal_id: int, accept: bool, now_iso: str) -> None:
-    if accept:
+MAX_CHALLENGERS = 3
+
+
+def decide_proposal(sb, proposal_id: int, decision, now_iso: str) -> None:
+    """decision: True/'accept'(챔피언으로) · False/'reject'(거절) · 'challenge'(도전자로 경쟁) · 'retire'(경쟁 종료)."""
+    decision = {True: "accept", False: "reject"}.get(decision, decision)
+    if decision == "accept":
         for row in _rows(sb.table(RULE_TABLE).select("*").eq("status", "active").execute()):
             sb.table(RULE_TABLE).update({"status": "retired", "decided_at": now_iso}).eq("id", row["id"]).execute()
-    sb.table(RULE_TABLE).update({"status": "active" if accept else "rejected", "decided_at": now_iso}) \
-        .eq("id", proposal_id).execute()
+    status = {"accept": "active", "reject": "rejected", "challenge": "challenger", "retire": "retired"}[decision]
+    sb.table(RULE_TABLE).update({"status": status, "decided_at": now_iso}).eq("id", proposal_id).execute()
+
+
+def load_challengers(sb) -> list[tuple[int, dict]]:
+    out = []
+    for row in sorted(_rows(sb.table(RULE_TABLE).select("*").eq("status", "challenger").execute()),
+                      key=lambda r: r["version"]):
+        params = row["params"] if isinstance(row["params"], dict) else __import__("json").loads(row["params"])
+        out.append((int(row["version"]), normalize_rules(params)))
+    return out
+
+
+# ---- 챔피언 vs 도전자: 실전 신호 기록·채점 ----
+RULE_SIGNAL_TABLE = "valhalla_rule_signals"
+PROMOTE_MIN = {"graded": 20, "weeks": 8, "hit_gain": 10.0}
+
+
+def live_rule_row(sig: pd.DataFrame, ticker: str, version: int) -> dict | None:
+    """가장 최근 마감 주에 이 규칙의 신호가 났으면 기록할 행."""
+    if sig is None or sig.empty or not sig["action"].iloc[-1]:
+        return None
+    return {"rule_version": int(version), "ticker": ticker, "week": sig.index[-1].strftime("%Y-%m-%d"),
+            "action": sig["action"].iloc[-1], "close": round(float(sig["close"].iloc[-1]), 4)}
+
+
+def rule_competition(live: pd.DataFrame, versions: dict[int, str] | None = None) -> pd.DataFrame:
+    """규칙 버전별 실전 성적. 매수 적중 = 4주 뒤 상승, 매도 적중 = 4주 뒤 하락."""
+    if live is None or live.empty:
+        return pd.DataFrame()
+    rows = []
+    for v, g in live.groupby("rule_version"):
+        buy, sell = g[g["action"] == "매수"], g[g["action"] == "매도"]
+        bg, sg = buy.dropna(subset=["ret_4w"]), sell.dropna(subset=["ret_4w"])
+        rows.append({"버전": int(v), "역할": (versions or {}).get(int(v), ""),
+                     "매수 신호": int(len(buy)), "매수 채점": int(len(bg)), "매수 신호 주 수": int(bg["week"].nunique()),
+                     "매수 적중률(%)": round(float((bg["ret_4w"] > 0).mean() * 100), 1) if len(bg) else None,
+                     "매수 뒤 4주 평균(%)": round(float(bg["ret_4w"].mean()), 2) if len(bg) else None,
+                     "매도 신호": int(len(sell)), "매도 채점": int(len(sg)),
+                     "매도 적중률(%)": round(float((sg["ret_4w"] < 0).mean() * 100), 1) if len(sg) else None,
+                     "매도 뒤 4주 평균(%)": round(float(sg["ret_4w"].mean()), 2) if len(sg) else None})
+    return pd.DataFrame(rows).sort_values("버전").reset_index(drop=True)
+
+
+def promotion_verdicts(table: pd.DataFrame, champion: int, th: dict | None = None) -> dict[int, str]:
+    """도전자별 판정: 표본 부족 / 승격 추천 / 열세 / 접전."""
+    th = {**PROMOTE_MIN, **(th or {})}
+    out = {}
+    if table is None or table.empty:
+        return out
+    t = table.set_index("버전")
+    champ_hit = t.loc[champion, "매수 적중률(%)"] if champion in t.index else None
+    for v, r in t.iterrows():
+        if v == champion:
+            continue
+        if r["매수 채점"] < th["graded"] or r["매수 신호 주 수"] < th["weeks"]:
+            out[v] = f"표본 부족 (매수 채점 {r['매수 채점']}건 · {r['매수 신호 주 수']}주 / 필요 {th['graded']}건 · {th['weeks']}주)"
+        elif champ_hit is None or pd.isna(champ_hit):
+            out[v] = "챔피언 채점 기록이 없어 비교 대기"
+        elif r["매수 적중률(%)"] >= champ_hit + th["hit_gain"]:
+            out[v] = f"승격 추천 (매수 적중률 {r['매수 적중률(%)']:.0f}% vs 챔피언 {champ_hit:.0f}%)"
+        elif r["매수 적중률(%)"] <= champ_hit - th["hit_gain"]:
+            out[v] = f"열세 (매수 적중률 {r['매수 적중률(%)']:.0f}% vs 챔피언 {champ_hit:.0f}%) · 경쟁 종료 고려"
+        else:
+            out[v] = f"접전 (매수 적중률 {r['매수 적중률(%)']:.0f}% vs 챔피언 {champ_hit:.0f}%)"
+    return out

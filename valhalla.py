@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-6"
+REQUIRED_CORE_VERSION = "2026.11.20-7"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1528,13 +1528,19 @@ def load_predictions(backend_name: str) -> tuple[pd.DataFrame, str | None]:
 @st.cache_data(ttl=120, show_spinner=False)
 def load_rule_state(backend_name: str) -> dict:
     """활성 규칙·승인 대기 제안·이력 (Supabase 없으면 기본 규칙)."""
-    default = {"version": 1, "rules": core.normalize_rules(core.ACTION_RULES), "pending": None, "history": []}
+    default = {"version": 1, "rules": core.normalize_rules(core.ACTION_RULES), "pending": None, "history": [],
+               "challengers": [], "live": pd.DataFrame()}
     if backend_name != "supabase":
         return default
     try:
         sb = get_supabase()
         version, rules = core.load_active_rule(sb)
-        return {"version": version, "rules": rules, "pending": core.pending_proposal(sb), "history": core.rule_history(sb)}
+        try:
+            live = pd.DataFrame(_sb_fetch_all(core.RULE_SIGNAL_TABLE))
+        except Exception:
+            live = pd.DataFrame()
+        return {"version": version, "rules": rules, "pending": core.pending_proposal(sb), "history": core.rule_history(sb),
+                "challengers": core.load_challengers(sb), "live": live}
     except Exception as exc:
         LOGGER.warning("규칙 조회 실패 (테이블 없음?): %s", exc)
         return default
@@ -1630,6 +1636,18 @@ def render_actions(done: pd.DataFrame, ticker: str) -> None:
         fig.add_trace(go.Scatter(x=pts.index, y=pts["close"], mode="markers+text", name=f"{kind} 신호", text=[kind] * len(pts),
                                  textposition=pos, textfont=dict(color=color, size=11),
                                  marker=dict(symbol=sym, size=13, color=color, line=dict(width=1, color="#0B1220"))))
+    for i, (cv, crule) in enumerate(state.get("challengers", [])):
+        csig = core.action_signals(done, crule)
+        cview = csig[csig.index >= view.index[0]]
+        for kind, sym, color in (("매수", "triangle-up-open", UP), ("매도", "triangle-down-open", DOWN)):
+            pts = cview[cview["action"] == kind]
+            if not pts.empty:
+                fig.add_trace(go.Scatter(x=pts.index, y=pts["close"], mode="markers", name=f"도전자 v{cv} {kind}",
+                                         marker=dict(symbol=sym, size=15 + 3 * i, color=color, line=dict(width=2, color=color))))
+        last_c = csig.iloc[-1]
+        st.caption(f"도전자 v{cv} ({core.rule_text(crule)['매수']}): 이번 주 "
+                   f"{last_c['action'] + ' 신호' if last_c['action'] else '새 신호 없음'} · 현재 상태 {last_c['state'] or '신호 없음'} "
+                   "· 차트의 빈 삼각형")
     base_layout(fig, 360)
     fig.update_yaxes(type="log", title_text="가격 (로그)")
     show_chart(fig, key="act_chart")
@@ -1687,13 +1705,13 @@ def _ev_table(ev_cur: dict | None, ev_new: dict | None) -> pd.DataFrame:
 
 def render_rule_improvement() -> None:
     state = load_rule_state(backend())
-    section("규칙 개선", "매달 1일 자동 점검: 후보 432개 중 학습 구간으로 1개를 고르고, 고를 때 쓰지 않은 최근 2년에서 "
-                     "지금 규칙보다 확실히 나을 때만 제안합니다. 적용은 여기서 직접 승인해야 합니다.")
+    section("규칙 개선 · 챔피언 vs 도전자", "매달 1일 자동 점검: 후보 432개 중 학습 구간으로 1개를 고르고, 최근 2년에서 지금 규칙보다 "
+                     "확실히 나을 때만 제안합니다. 바로 적용하거나, 도전자로 등록해 실전 신호로 경쟁시킬 수 있어요.")
     if backend() != "supabase":
         st.caption("Supabase 연결이 있어야 규칙 버전 관리가 동작합니다.")
         return
     text = core.rule_text(state["rules"])
-    st.markdown(f"**지금 규칙 v{state['version']}** · 매수: {text['매수']} · 매도: {text['매도']}")
+    st.markdown(f"**챔피언 v{state['version']}** · 매수: {text['매수']} · 매도: {text['매도']}")
     p = state["pending"]
     if p:
         params = p["params"] if isinstance(p["params"], dict) else json.loads(p["params"])
@@ -1710,20 +1728,62 @@ def render_rule_improvement() -> None:
             a.dataframe(_ev_table(ev.get("current_test"), ev.get("candidate_test")), hide_index=True, width="stretch")
             b.markdown("**학습 구간 (참고)**")
             b.dataframe(_ev_table(ev.get("current_train"), ev.get("candidate_train")), hide_index=True, width="stretch")
-            c1, c2, _ = st.columns([1, 1, 3])
+            c1, c2, c3, _ = st.columns([1, 1.3, 1, 2])
             now_iso = now_kst().isoformat()
-            if c1.button("적용", type="primary", icon=":material/check:", key="rule_accept"):
-                core.decide_proposal(get_supabase(), int(p["id"]), True, now_iso)
+            if c1.button("적용", type="primary", icon=":material/check:", key="rule_accept",
+                         help="지금 규칙을 이 규칙으로 바로 교체합니다."):
+                core.decide_proposal(get_supabase(), int(p["id"]), "accept", now_iso)
                 load_rule_state.clear()
                 flash(f"규칙 v{p['version']}을 적용했습니다.")
                 st.rerun()
-            if c2.button("거절", icon=":material/close:", key="rule_reject"):
-                core.decide_proposal(get_supabase(), int(p["id"]), False, now_iso)
+            full = len(state.get("challengers", [])) >= core.MAX_CHALLENGERS
+            if c2.button("경쟁시키기", icon=":material/sports_score:", key="rule_challenge", disabled=full,
+                         help="지금 규칙은 그대로 두고, 오늘부터 실전 신호로 승부를 가립니다."):
+                core.decide_proposal(get_supabase(), int(p["id"]), "challenge", now_iso)
+                load_rule_state.clear()
+                flash(f"규칙 v{p['version']}을 도전자로 등록했습니다. 매일 실전 신호로 경쟁합니다.")
+                st.rerun()
+            if c3.button("거절", icon=":material/close:", key="rule_reject"):
+                core.decide_proposal(get_supabase(), int(p["id"]), "reject", now_iso)
                 load_rule_state.clear()
                 flash("제안을 거절했습니다. 지금 규칙을 유지합니다.")
                 st.rerun()
     else:
-        st.caption("승인 대기 중인 제안이 없습니다. 지금 규칙이 유지되고 있어요.")
+        st.caption("승인 대기 중인 제안이 없습니다.")
+    challengers = state.get("challengers", [])
+    if challengers:
+        st.markdown("**챔피언 vs 도전자 (오늘부터 쌓이는 실전 신호로만 비교)**")
+        roles = {state["version"]: "챔피언", **{v: "도전자" for v, _ in challengers}}
+        live = state.get("live", pd.DataFrame())
+        live = live[live["rule_version"].isin(list(roles))] if not live.empty else live
+        table = core.rule_competition(live, roles)
+        if table.empty:
+            st.caption("아직 실전 신호가 없습니다. 매일 아침 자동 점검이 마감된 주의 신호를 기록하고, 4주 뒤 채점합니다.")
+        else:
+            st.dataframe(table, hide_index=True, width="stretch")
+        verdicts = core.promotion_verdicts(table, state["version"]) if not table.empty else {}
+        now_iso = now_kst().isoformat()
+        for v, crule in challengers:
+            row = next((h for h in state["history"] if int(h["version"]) == v), None)
+            verdict = verdicts.get(v, "표본 부족 (실전 신호 기록 대기)")
+            kind = "ok" if verdict.startswith("승격") else "stop" if verdict.startswith("열세") else "warn"
+            with st.container(border=True):
+                st.markdown(f"**도전자 v{v}** {pill(verdict.split(' (')[0], kind)} · 매수: {core.rule_text(crule)['매수']}",
+                            unsafe_allow_html=True)
+                st.caption(verdict + f" · 승격 기준: 매수 채점 {core.PROMOTE_MIN['graded']}건·서로 다른 {core.PROMOTE_MIN['weeks']}주 이상, "
+                           f"챔피언보다 적중률 +{core.PROMOTE_MIN['hit_gain']:.0f}%p")
+                b1, b2, _ = st.columns([1, 1, 3])
+                if row and b1.button("챔피언으로 승격", key=f"promote_{v}", icon=":material/military_tech:",
+                                     type="primary" if verdict.startswith("승격") else "secondary"):
+                    core.decide_proposal(get_supabase(), int(row["id"]), "accept", now_iso)
+                    load_rule_state.clear()
+                    flash(f"v{v}을 챔피언으로 승격했습니다.")
+                    st.rerun()
+                if row and b2.button("경쟁 종료", key=f"retire_{v}", icon=":material/flag:"):
+                    core.decide_proposal(get_supabase(), int(row["id"]), "retire", now_iso)
+                    load_rule_state.clear()
+                    flash(f"v{v}의 경쟁을 종료했습니다.")
+                    st.rerun()
     runs = load_job_runs(backend())
     if not runs.empty and "source" in runs:
         last = runs[runs["source"] == "rules"].head(1)
@@ -1735,8 +1795,8 @@ def render_rule_improvement() -> None:
             for h in state["history"]:
                 prm = h["params"] if isinstance(h["params"], dict) else json.loads(h["params"])
                 t = core.rule_text(core.normalize_rules(prm))
-                rows.append({"버전": h["version"], "상태": {"active": "사용 중", "proposed": "승인 대기", "rejected": "거절",
-                                                          "retired": "이전 규칙"}.get(h["status"], h["status"]),
+                rows.append({"버전": h["version"], "상태": {"active": "챔피언(사용 중)", "proposed": "승인 대기", "rejected": "거절",
+                                                          "challenger": "도전자", "retired": "이전 규칙"}.get(h["status"], h["status"]),
                              "매수": t["매수"], "매도": t["매도"], "이유": h.get("reason"),
                              "등록": str(h.get("created_at"))[:16], "결정": str(h.get("decided_at") or "")[:16]})
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")

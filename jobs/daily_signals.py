@@ -73,11 +73,13 @@ def run(sb, fetch=download) -> str:
     partners: dict[str, pd.DataFrame | None] = {}
     asof = us_asof()
     rule_version, rules = core.load_active_rule(sb)
+    contenders = [(rule_version, rules)] + core.load_challengers(sb)
     day = asof.strftime("%Y-%m-%d")
-    reports, new_preds, graded, failed = [], 0, 0, []
+    reports, new_preds, graded, failed, live_new = [], 0, 0, [], 0
     for ticker, partner in TICKERS:
         try:
-            res = _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules, rule_version)
+            res = _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules, rule_version, contenders)
+            live_new += res.get("live_new", 0)
             new_preds += res["new"]
             graded += res["graded"]
             if res["report"]:
@@ -90,6 +92,7 @@ def run(sb, fetch=download) -> str:
     rep = pd.DataFrame(reports)
     share = float((rep["test_diff"].dropna() > 0).mean() * 100) if not rep.empty and rep["test_diff"].notna().any() else None
     lines.append(f"규칙 v{rule_version} · {len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
+    lines.append("경쟁 " + " vs ".join(f"v{v}" for v, _ in contenders) + f" · 새 실전 신호 {live_new}건")
     if share is not None:
         lines.append(f"검증 구간에서 평소보다 나은 종목 {share:.0f}%")
     if failed:
@@ -97,8 +100,9 @@ def run(sb, fetch=download) -> str:
     return " / ".join(lines)
 
 
-def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule_version=None) -> dict:
-    out = {"new": 0, "graded": 0, "report": None}
+def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule_version=None,
+             contenders=None) -> dict:
+    out = {"new": 0, "graded": 0, "report": None, "live_new": 0}
     daily = fetch(ticker, True)
     if daily is None:
         raise RuntimeError("시세 없음")
@@ -119,6 +123,23 @@ def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule
             if patch:
                 sb.table(TABLE).update(patch).eq("id", int(old["id"])).execute()
                 out["graded"] += 1
+    # 챔피언·도전자 규칙의 실전 신호 기록 (마감 주에 신호가 난 경우만, 중복 없이)
+    for version, rule in (contenders or []):
+        row = core.live_rule_row(core.action_signals(hist, rule), ticker, version)
+        if row:
+            dup = (sb.table(core.RULE_SIGNAL_TABLE).select("id").eq("rule_version", version).eq("ticker", ticker)
+                   .eq("week", row["week"]).eq("action", row["action"]).execute().data or [])
+            if not dup:
+                sb.table(core.RULE_SIGNAL_TABLE).insert(row).execute()
+                out["live_new"] += 1
+    live = pd.DataFrame(sb.table(core.RULE_SIGNAL_TABLE).select("*").eq("ticker", ticker).execute().data or [])
+    if not live.empty:
+        graded_live = core.grade_predictions(live, hist["close"])
+        for (_, old), (_, new) in zip(live.iterrows(), graded_live.iterrows()):
+            patch = {c: float(new[c]) for c in ("ret_4w", "ret_12w")
+                     if c in new and pd.notna(new.get(c)) and pd.isna(old.get(c))}
+            if patch:
+                sb.table(core.RULE_SIGNAL_TABLE).update(patch).eq("id", int(old["id"])).execute()
     out["report"] = core.report_row(core.action_signals(hist, rules), ticker, asof.strftime("%Y-%m-%d"))
     if out["report"] is not None:
         out["report"]["rule_version"] = rule_version
