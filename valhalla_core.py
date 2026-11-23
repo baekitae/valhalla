@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.24-1"
+CORE_VERSION = "2026.11.24-2"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -2291,12 +2291,17 @@ def detect_rebounds(close: pd.Series, rules: dict | None = None) -> pd.DataFrame
     day_hit = ret >= th["day_jump"]
     low_hit = (from_low >= th["from_low"]) & (from_low.shift(1) < th["from_low"])
     cond = (day_hit | low_hit) & (depth <= -th["dd_min"])
-    rows, last_week = [], None
+    rows, last_week, last_day, last_low = [], None, None, None
     for d in c.index[cond.fillna(False).to_numpy()]:
         wk = _friday(d)
-        if last_week is not None and (wk - last_week).days < 7 * th["cooldown_weeks"]:
+        if last_week is not None and wk == last_week:
             continue
-        last_week = wk
+        if last_week is not None and (wk - last_week).days < 7 * th["cooldown_weeks"]:
+            # 쉬는 기간이라도 직전 사건이 이미 저점을 깨서 '일시 반등'으로 끝났다면 새 사건으로 봄
+            between = c[(c.index > last_day) & (c.index < d)]
+            if between.empty or between.min() >= last_low:
+                continue
+        last_week, last_day, last_low = wk, d, float(low[d])
         trig = f"하루 {ret[d]:+.1f}%" if day_hit[d] else f"20일 저점 대비 {from_low[d]:+.1f}%"
         rows.append({"week": wk, "event_date": d, "trigger": trig, "jump": round(float(ret[d]), 2),
                      "prior_low": float(low[d]), "depth": round(float(depth[d]), 1)})

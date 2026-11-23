@@ -252,3 +252,13 @@ def test_rebound_scoreboard_and_base_rate():
     t = core.rebound_scoreboard(lab, calls)
     assert t.iloc[0]["id"] == "good" and t.set_index("id").loc["bad", "적중률(%)"] == 0.0
     assert t.set_index("id").loc["good", "사건 수"] == 3
+
+
+def test_rebound_new_event_after_failed_one():
+    up = list(np.linspace(100, 130, 300)) + list(np.linspace(130, 91, 15))
+    vals = up + [96.5, 95, 93, 88, 85, 84] + [84 * 1.08] + list(np.linspace(90.7, 100, 40))
+    c = pd.Series(vals, pd.bdate_range("2020-01-01", periods=len(vals)))
+    ev = core.detect_rebounds(c)
+    assert len(ev) == 2                       # 첫 반등이 저점을 깨며 실패 → 1~2주 뒤 반등도 새 사건
+    lab = core.label_rebounds(ev, c)
+    assert lab["outcome"].iloc[0] == 0.0
