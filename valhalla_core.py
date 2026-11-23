@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.20-13"
+CORE_VERSION = "2026.11.24-1"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1748,13 +1748,14 @@ MINUTES_TABLE = "valhalla_council_minutes"
 COUNCIL_TICKERS = ["SOXL", "USD", "SOXX", "NVDA", "AVGO", "MRVL", "MU", "TQQQ", "QQQ", "SPY"]
 BASE_PLAYERS = {"trend200": "추세 필터", "voltarget": "변동성 조절", "hold": "그냥 보유"}
 LIVE_ONLY = {"ai_council": "AI 위원회", "ensemble": "앙상블"}
+REBOUND_PLAYERS = {"rebound_base": "과거 확률 (기준)"}
 ENSEMBLE_RULES = {"min_weeks": 20, "lookback": 26, "cap": 0.5, "shrink": 0.5}
 
 
 def player_label(pid: str) -> str:
     if pid.startswith("rule_v"):
         return f"규칙 {pid[5:]}"
-    return {**BASE_PLAYERS, **TECHNIQUE_PLAYERS, **LIVE_ONLY}.get(pid, pid)
+    return {**BASE_PLAYERS, **TECHNIQUE_PLAYERS, **LIVE_ONLY, **REBOUND_PLAYERS}.get(pid, pid)
 
 
 def rule_positions(sig: pd.DataFrame) -> pd.Series:
@@ -2259,6 +2260,103 @@ def needed_gain_history(index_close: pd.Series, price_close: pd.Series, target: 
 def realized_vol(close: pd.Series, days: int = 252) -> float:
     r = np.log(close / close.shift(1)).dropna().tail(days)
     return float(r.std() * np.sqrt(252)) if len(r) > 20 else float("nan")
+
+
+# ==========================================================================
+# 17. 반등 판별전: 큰 반등이 '추세 전환'인지 '일시 반등'인지 가리는 경기
+#   사건: 반도체 지수(SOX)가 고점 대비 15% 이상 빠진 상태에서 하루 +5% 이상 또는 20일 저점 대비 +15% 반등
+#   판정 시점: 사건이 있는 주의 금요일 종가 (선수들의 그 주 SOXL 비중 = '추세 전환' 확률)
+#   정답: 13주 안에 직전 저점을 깨지 않고 13주 뒤 종가가 판정 시점보다 높으면 추세 전환, 아니면 일시 반등
+#        (저점을 깨는 순간 바로 '일시 반등'으로 확정)
+# ==========================================================================
+REBOUND_TABLE = "valhalla_rebound_events"
+REBOUND_RULES = {"day_jump": 5.0, "from_low": 15.0, "low_days": 20, "dd_min": 15.0,
+                 "horizon_weeks": 13, "cooldown_weeks": 4}
+REBOUND_LIVE_START = "2026-11-16"
+REBOUND_BASE_PLAYER = "rebound_base"
+
+
+def _friday(d: pd.Timestamp) -> pd.Timestamp:
+    return d.to_period("W-FRI").end_time.normalize()
+
+
+def detect_rebounds(close: pd.Series, rules: dict | None = None) -> pd.DataFrame:
+    th = {**REBOUND_RULES, **(rules or {})}
+    c = close.dropna().astype(float)
+    ret = c.pct_change() * 100
+    low = c.rolling(th["low_days"], min_periods=5).min()
+    from_low = (c / low - 1) * 100
+    high = c.rolling(252, min_periods=60).max()
+    depth = (low / high - 1) * 100
+    day_hit = ret >= th["day_jump"]
+    low_hit = (from_low >= th["from_low"]) & (from_low.shift(1) < th["from_low"])
+    cond = (day_hit | low_hit) & (depth <= -th["dd_min"])
+    rows, last_week = [], None
+    for d in c.index[cond.fillna(False).to_numpy()]:
+        wk = _friday(d)
+        if last_week is not None and (wk - last_week).days < 7 * th["cooldown_weeks"]:
+            continue
+        last_week = wk
+        trig = f"하루 {ret[d]:+.1f}%" if day_hit[d] else f"20일 저점 대비 {from_low[d]:+.1f}%"
+        rows.append({"week": wk, "event_date": d, "trigger": trig, "jump": round(float(ret[d]), 2),
+                     "prior_low": float(low[d]), "depth": round(float(depth[d]), 1)})
+    return pd.DataFrame(rows, columns=["week", "event_date", "trigger", "jump", "prior_low", "depth"])
+
+
+def label_rebounds(events: pd.DataFrame, close: pd.Series, horizon_weeks: int | None = None) -> pd.DataFrame:
+    """각 사건의 정답. outcome: 1=추세 전환, 0=일시 반등, NaN=판정 대기."""
+    h = horizon_weeks or REBOUND_RULES["horizon_weeks"]
+    c = close.dropna().astype(float)
+    out = events.copy()
+    for col in ("judge_close", "outcome", "resolved_on", "end_close"):
+        out[col] = np.nan if col != "resolved_on" else None
+    for i, r in out.iterrows():
+        upto = c[c.index <= r["week"]]
+        if upto.empty:
+            continue
+        judge_day, judge = upto.index[-1], float(upto.iloc[-1])
+        out.at[i, "judge_close"] = judge
+        end = judge_day + pd.Timedelta(weeks=h)
+        after = c[(c.index > judge_day) & (c.index <= end)]
+        broke = after[after < r["prior_low"]]
+        if not broke.empty:
+            out.at[i, "outcome"], out.at[i, "resolved_on"] = 0.0, broke.index[0]
+        elif c.index[-1] >= end and not after.empty:
+            out.at[i, "end_close"] = float(after.iloc[-1])
+            out.at[i, "outcome"] = 1.0 if after.iloc[-1] > judge else 0.0
+            out.at[i, "resolved_on"] = after.index[-1]
+    return out
+
+
+def rebound_base_rates(labeled: pd.DataFrame, prior: float = 2.0) -> pd.Series:
+    """기준 선수: 그 사건 이전에 판정이 끝난 과거 사건들의 추세 전환 비율(0.5 쪽으로 살짝 당김)."""
+    rates = []
+    for _, r in labeled.iterrows():
+        done = labeled[labeled["resolved_on"].notna() & (pd.to_datetime(labeled["resolved_on"]) <= r["week"])]
+        n, k = len(done), float(done["outcome"].sum()) if len(done) else 0.0
+        rates.append(round((k + prior) / (n + 2 * prior), 3))
+    return pd.Series(rates, index=labeled.index)
+
+
+def rebound_scoreboard(labeled: pd.DataFrame, calls: pd.DataFrame) -> pd.DataFrame:
+    """calls: week × 선수 확률표(0~1). 판정 끝난 사건만 채점. 브라이어 낮을수록, 적중률 높을수록 좋음."""
+    done = labeled.dropna(subset=["outcome"]).set_index("week")
+    rows = []
+    for pid in calls.columns:
+        p = calls[pid].reindex(done.index)
+        ok = p.notna()
+        if not ok.any():
+            continue
+        y, q = done.loc[ok, "outcome"].astype(float), p[ok].astype(float)
+        rows.append({"id": pid, "사건 수": int(ok.sum()), "브라이어": round(float(((q - y) ** 2).mean()), 3),
+                     "적중률(%)": round(float(((q >= 0.5) == (y == 1)).mean() * 100), 1),
+                     "전환 예상 평균(%)": round(float(q.mean() * 100), 0)})
+    t = pd.DataFrame(rows)
+    if t.empty:
+        return t
+    base = t.loc[t["id"] == REBOUND_BASE_PLAYER, "브라이어"]
+    t["기준 대비"] = (t["브라이어"] - (float(base.iloc[0]) if not base.empty else np.nan)).round(3)
+    return t.sort_values("브라이어").reset_index(drop=True)
 
 
 def sb_fetch_all(sb, table: str, eq: dict | None = None, page: int = 1000) -> list[dict]:

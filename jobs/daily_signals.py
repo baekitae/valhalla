@@ -96,6 +96,11 @@ def run(sb, fetch=download) -> str:
     except Exception as exc:
         traceback.print_exc()
         lines.append(f"앙상블 실패: {exc}")
+    try:
+        lines.append(update_rebounds(sb, fetch, asof))
+    except Exception as exc:
+        traceback.print_exc()
+        lines.append(f"반등 판별전 실패: {exc}")
     rep = pd.DataFrame(reports)
     share = float((rep["test_diff"].dropna() > 0).mean() * 100) if not rep.empty and rep["test_diff"].notna().any() else None
     lines.append(f"규칙 v{rule_version} · {len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
@@ -105,6 +110,37 @@ def run(sb, fetch=download) -> str:
     if failed:
         lines.append("실패: " + ", ".join(failed[:10]))
     return " / ".join(lines)
+
+
+def update_rebounds(sb, fetch, asof) -> str:
+    """반등 판별전: SOX 반등 사건을 찾아 기록하고, 13주가 지났거나 저점을 깬 사건을 채점."""
+    df = fetch("^SOX", False)
+    if df is None or df.empty:
+        df = fetch("SOXX", True)
+    close = df["Close"].dropna()
+    close = close[close.index <= asof]
+    events = core.detect_rebounds(close)
+    if events.empty:
+        return "반등 판별전 · 사건 없음"
+    lab = core.label_rebounds(events, close)
+    lab["base_rate"] = core.rebound_base_rates(lab)
+    last_done = core._friday(asof) if asof.weekday() == 4 else core._friday(asof) - pd.Timedelta(weeks=1)
+    live = lab[(lab["week"] >= pd.Timestamp(core.REBOUND_LIVE_START)) & (lab["week"] <= last_done)]
+    rows = []
+    for _, r in live.iterrows():
+        rows.append({"week": r["week"].strftime("%Y-%m-%d"), "event_date": r["event_date"].strftime("%Y-%m-%d"),
+                     "trigger": r["trigger"], "jump": r["jump"], "prior_low": round(r["prior_low"], 2),
+                     "depth": r["depth"], "judge_close": None if pd.isna(r["judge_close"]) else round(r["judge_close"], 2),
+                     "base_rate": float(r["base_rate"]),
+                     "outcome": None if pd.isna(r["outcome"]) else int(r["outcome"]),
+                     "resolved_on": None if r["resolved_on"] is None or pd.isna(r["resolved_on"])
+                     else pd.Timestamp(r["resolved_on"]).strftime("%Y-%m-%d")})
+    if rows:
+        sb.table(core.REBOUND_TABLE).upsert(rows, on_conflict="week").execute()
+    hist = lab.dropna(subset=["outcome"])
+    share = f" · 과거 {len(hist)}건 중 추세 전환 {hist['outcome'].mean() * 100:.0f}%" if len(hist) else ""
+    pending = live[live["outcome"].isna()]
+    return f"반등 판별전 · 실전 사건 {len(live)}건(대기 {len(pending)}){share}"
 
 
 def update_ensemble(sb, asof) -> tuple[int, dict]:

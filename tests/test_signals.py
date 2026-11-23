@@ -213,3 +213,42 @@ def test_position_moves_marks_only_meaningful_changes():
     wobble = pd.Series([0.5, 0.55, 0.45, 0.6, 0.8, 0.79, 0.5, 0.52], idx)   # 잔떨림은 무시
     m2 = core.position_moves(wobble)
     assert list(m2["action"]) == ["매수", "매도"] and m2["to"].iloc[0] == 0.8
+
+
+def _crash_then(path_after):
+    """300일 상승 → 30% 급락 → +6% 반등일 → 이후 경로."""
+    up = list(np.linspace(100, 130, 300))
+    down = list(np.linspace(130, 91, 15))
+    pre = up + down + [91 * 1.06]
+    vals = pre + [pre[-1] * x for x in path_after]
+    idx = pd.bdate_range("2020-01-01", periods=len(vals))
+    return pd.Series(vals, idx)
+
+
+def test_rebound_reversal_vs_temporary():
+    rise = _crash_then(list(np.linspace(1.0, 1.25, 80)))          # 저점 안 깨고 계속 상승 → 추세 전환
+    ev = core.detect_rebounds(rise)
+    assert len(ev) == 1 and ev["trigger"].iloc[0].startswith("하루")
+    lab = core.label_rebounds(ev, rise)
+    assert lab["outcome"].iloc[0] == 1.0
+    fall = _crash_then(list(np.linspace(1.0, 0.8, 80)))           # 저점(91) 다시 깸 → 일시 반등
+    lab2 = core.label_rebounds(core.detect_rebounds(fall), fall)
+    assert lab2["outcome"].iloc[0] == 0.0
+    short = _crash_then([1.01, 1.02])                               # 아직 13주 안 지남 → 대기
+    lab3 = core.label_rebounds(core.detect_rebounds(short), short)
+    assert np.isnan(lab3["outcome"].iloc[0])
+    calm = pd.Series(np.linspace(100, 200, 400), pd.bdate_range("2020-01-01", periods=400))
+    assert core.detect_rebounds(calm).empty                         # 급락 없는 장에서는 사건 없음
+
+
+def test_rebound_scoreboard_and_base_rate():
+    weeks = pd.date_range("2020-01-03", periods=4, freq="W-FRI")
+    lab = pd.DataFrame({"week": weeks, "outcome": [1.0, 0.0, 1.0, np.nan],
+                        "resolved_on": [weeks[1], weeks[2], weeks[3], None]})
+    base = core.rebound_base_rates(lab)
+    assert base.iloc[0] == 0.5 and base.iloc[2] > 0.5 - 0.2
+    calls = pd.DataFrame({"good": [0.9, 0.1, 0.8, 0.5], "bad": [0.0, 1.0, 0.0, 0.5],
+                          core.REBOUND_BASE_PLAYER: base.to_numpy()}, index=weeks)
+    t = core.rebound_scoreboard(lab, calls)
+    assert t.iloc[0]["id"] == "good" and t.set_index("id").loc["bad", "적중률(%)"] == 0.0
+    assert t.set_index("id").loc["good", "사건 수"] == 3

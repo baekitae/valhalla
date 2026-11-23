@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.20-13"
+REQUIRED_CORE_VERSION = "2026.11.24-1"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1992,6 +1992,111 @@ def load_champion_state(backend_name: str) -> dict:
         return {"champion": {"player": "rule_v1", "reason": "기본"}, "history": []}
 
 
+OUTCOME_TXT = {1.0: "추세 전환", 0.0: "일시 반등"}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_rebound_history(rules_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """SOX 반등 사건(1994~)과 정답, 그리고 사건 주의 선수별 SOXL 비중(= 추세 전환 확률)."""
+    df = load_long("^SOX", "max", False)
+    if df is None or df.empty:
+        df = load_long("SOXX", "max", True)
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    close = df["Close"].dropna()
+    lab = core.label_rebounds(core.detect_rebounds(close), close)
+    if lab.empty:
+        return lab, pd.DataFrame()
+    lab["base_rate"] = core.rebound_base_rates(lab).to_numpy()
+    pos = cached_player_positions("SOXL", core.partner_of("SOXL"), rules_key)
+    calls = pos.drop(columns=["close"]).reindex(pd.DatetimeIndex(lab["week"])) if not pos.empty else pd.DataFrame(
+        index=pd.DatetimeIndex(lab["week"]))
+    calls[core.REBOUND_BASE_PLAYER] = lab["base_rate"].to_numpy()
+    return lab, calls
+
+
+def _rebound_board(lab: pd.DataFrame, calls: pd.DataFrame) -> None:
+    board = core.rebound_scoreboard(lab, calls)
+    if board.empty:
+        st.caption("아직 채점된 사건이 없습니다.")
+        return
+    board.insert(0, "선수", [core.player_label(i) for i in board["id"]])
+    st.dataframe(board.drop(columns=["id"]), hide_index=True, width="stretch",
+                 column_config={"브라이어": st.column_config.NumberColumn(format="%.3f", help="0에 가까울수록 정확"),
+                                "기준 대비": st.column_config.NumberColumn(format="%+.3f",
+                                                                       help="음수면 '과거 확률'보다 잘 맞힘"),
+                                "적중률(%)": st.column_config.NumberColumn(format="%.0f%%"),
+                                "전환 예상 평균(%)": st.column_config.NumberColumn(format="%.0f%%")})
+
+
+def render_rebound_league(rules: list, pos: pd.DataFrame) -> None:
+    th = core.REBOUND_RULES
+    st.caption(f"반도체 지수(SOX)가 고점 대비 {th['dd_min']:.0f}% 넘게 빠진 상태에서 하루 +{th['day_jump']:.0f}% 이상 "
+               f"또는 20일 저점 대비 +{th['from_low']:.0f}% 반등하면 '반등 사건'이 열립니다. 그 주 금요일에 각 선수의 "
+               f"SOXL 비중을 '추세 전환 확률'로 보고, {th['horizon_weeks']}주 동안 직전 저점을 깨지 않고 13주 뒤 더 높으면 "
+               "추세 전환, 저점을 깨면 그 즉시 일시 반등으로 채점합니다. 기준 선수 '과거 확률'보다 잘 맞혀야 실력입니다.")
+    lab, calls = cached_rebound_history(json.dumps([[v, r] for v, r in rules]))
+    if lab.empty:
+        st.caption("지수 데이터를 불러오지 못했습니다.")
+        return
+    last = lab.iloc[-1]
+    done = lab.dropna(subset=["outcome"])
+    day = done[done["trigger"].str.startswith("하루")]
+    with st.container(border=True):
+        status = OUTCOME_TXT.get(last["outcome"]) if pd.notna(last["outcome"]) else "판정 대기"
+        st.markdown(f"**가장 최근 사건** · {last['event_date']:%Y-%m-%d} {last['trigger']} "
+                    f"(고점 대비 {last['depth']:.0f}% 빠진 뒤) · {pill(status, 'warn' if status == '판정 대기' else 'info')}",
+                    unsafe_allow_html=True)
+        if status == "판정 대기":
+            end = last["week"] + pd.Timedelta(weeks=th["horizon_weeks"])
+            st.caption(f"SOX가 {last['prior_low']:,.0f} 아래로 내려가면 바로 '일시 반등' 확정, 그렇지 않고 "
+                       f"{end:%Y-%m-%d} 무렵 {last['judge_close'] if pd.notna(last['judge_close']) else 0:,.0f}보다 높으면 '추세 전환'.")
+        live_week = last["week"]
+        mine = pos[(pos["ticker"] == "SOXL") & (pd.to_datetime(pos["week"]) == live_week)] if not pos.empty else pos
+        if mine is not None and not mine.empty:
+            pv = mine.set_index("player")["position"].astype(float)
+        elif live_week in calls.index:
+            pv = calls.loc[live_week].drop(core.REBOUND_BASE_PLAYER, errors="ignore").dropna()
+        else:
+            pv = pd.Series(dtype=float)
+        if not pv.empty:
+            pv = pd.concat([pd.Series({core.REBOUND_BASE_PLAYER: float(last["base_rate"])}), pv])
+            st.caption("이번 사건에 대한 선수별 추세 전환 확률: " + " · ".join(
+                f"{core.player_label(k)} {v * 100:.0f}%" for k, v in pv.items()))
+        else:
+            st.caption(f"선수들의 답은 그 주 금요일 마감 뒤 기록됩니다. 기준 선수(과거 확률)는 {last['base_rate'] * 100:.0f}%.")
+    m = st.columns(3)
+    m[0].metric("과거 반등 사건", f"{len(done)}건", f"{done['event_date'].min():%Y}년부터" if len(done) else None,
+                delta_color="off", delta_arrow="off")
+    m[1].metric("그중 추세 전환", f"{done['outcome'].mean() * 100:.0f}%" if len(done) else "—")
+    m[2].metric("하루 +5% 반등만 보면", f"{day['outcome'].mean() * 100:.0f}%" if len(day) else "—",
+                f"{len(day)}건", delta_color="off", delta_arrow="off")
+    a, b = st.tabs(["연습 경기 (과거 사건)", "실전 경기"])
+    with a:
+        st.caption("SOXL 상장(2010) 이후 사건으로, 계산 가능한 선수들이 그때 어떻게 판단했을지 채점합니다.")
+        _rebound_board(lab[lab["week"] >= pd.Timestamp("2010-06-01")], calls)
+        show = lab.tail(15).iloc[::-1]
+        st.dataframe(pd.DataFrame({"날짜": show["event_date"].dt.strftime("%Y-%m-%d"), "계기": show["trigger"],
+                                   "직전 낙폭": show["depth"].map(lambda v: f"{v:.0f}%"),
+                                   "결과": show["outcome"].map(lambda v: OUTCOME_TXT.get(v, "판정 대기")),
+                                   "과거 확률": show["base_rate"].map(lambda v: f"{v * 100:.0f}%")}),
+                     hide_index=True, width="stretch")
+    with b:
+        st.caption(f"{core.REBOUND_LIVE_START} 이후 사건만 실전으로 기록합니다. 사건 주의 실제 기록된 비중으로 채점해요.")
+        live_lab = lab[lab["week"] >= pd.Timestamp(core.REBOUND_LIVE_START)]
+        if live_lab.empty or pos.empty:
+            st.caption("아직 실전 사건이 없습니다.")
+        else:
+            soxl = pos[pos["ticker"] == "SOXL"].copy()
+            soxl["week"] = pd.to_datetime(soxl["week"])
+            live_calls = soxl.pivot_table(index="week", columns="player", values="position", aggfunc="last")
+            live_calls = live_calls.reindex(pd.DatetimeIndex(live_lab["week"]))
+            live_calls[core.REBOUND_BASE_PLAYER] = live_lab["base_rate"].to_numpy()
+            _rebound_board(live_lab, live_calls)
+            st.caption(f"실전 사건 {len(live_lab)}건 · 채점 완료 {int(live_lab['outcome'].notna().sum())}건. "
+                       "사건이 드물어서 실력 차이가 보이려면 몇 년이 걸려요.")
+
+
 def render_arena(ticker: str, partner: str) -> None:
     section("선수 경기장", "모든 선수가 매주 종목별 비중(0~100%)을 내고, 다음 주 실제 수익률로 똑같이 채점합니다. "
                        "규칙이든 기준 선수든 AI 위원회든 앙상블이든, 챔피언을 이기면 누구나 챔피언이 될 수 있어요.")
@@ -2013,7 +2118,9 @@ def render_arena(ticker: str, partner: str) -> None:
     if champ.startswith("rule_v") and champ not in alive:
         st.warning(f"챔피언 {core.player_label(champ)}은 경쟁이 종료되어 더 이상 기록되지 않습니다. 아래에서 새 챔피언을 정해 주세요.",
                    icon=":material/warning:")
-    t1, t2, t3 = st.tabs(["실전 경기표", f"{ticker} 과거 성적", "AI 위원회 회의록"])
+    t1, t2, t4, t3 = st.tabs(["실전 경기표", f"{ticker} 과거 성적", "반등 판별전", "AI 위원회 회의록"])
+    with t4:
+        render_rebound_league(rules, pos)
     with t1:
         if pos.empty:
             st.caption("아직 실전 기록이 없습니다. 매일 아침 자동 점검이 선수별 비중을 기록하고, 1주 뒤부터 채점합니다.")
