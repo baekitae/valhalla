@@ -1996,7 +1996,7 @@ OUTCOME_TXT = {1.0: "추세 전환", 0.0: "일시 반등"}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_rebound_history(rules_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def cached_rebound_history(rules_key: str, core_version: str = "") -> tuple[pd.DataFrame, pd.DataFrame]:
     """SOX 반등 사건(1994~)과 정답, 그리고 사건 주의 선수별 SOXL 비중(= 추세 전환 확률)."""
     df = load_long("^SOX", "max", False)
     if df is None or df.empty:
@@ -2035,7 +2035,7 @@ def render_rebound_league(rules: list, pos: pd.DataFrame) -> None:
                f"또는 20일 저점 대비 +{th['from_low']:.0f}% 반등하면 '반등 사건'이 열립니다. 그 주 금요일에 각 선수의 "
                f"SOXL 비중을 '추세 전환 확률'로 보고, {th['horizon_weeks']}주 동안 직전 저점을 깨지 않고 13주 뒤 더 높으면 "
                "추세 전환, 저점을 깨면 그 즉시 일시 반등으로 채점합니다. 기준 선수 '과거 확률'보다 잘 맞혀야 실력입니다.")
-    lab, calls = cached_rebound_history(json.dumps([[v, r] for v, r in rules]))
+    lab, calls = cached_rebound_history(json.dumps([[v, r] for v, r in rules]), core.CORE_VERSION)
     if lab.empty:
         st.caption("지수 데이터를 불러오지 못했습니다.")
         return
