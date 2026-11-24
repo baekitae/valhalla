@@ -149,6 +149,14 @@ def update_rebounds(sb, fetch, asof) -> str:
         sb.table(core.REBOUND_TABLE).upsert(rows, on_conflict="week").execute()
     hist = lab.dropna(subset=["outcome"])
     share = f" · 과거 {len(hist)}건 중 추세 전환 {hist['outcome'].mean() * 100:.0f}%" if len(hist) else ""
+    if lab["macro_prob"].notna().any():
+        calls = pd.DataFrame({core.MACRO_CHECK_PLAYER: lab["macro_prob"].to_numpy(),
+                              core.REBOUND_BASE_PLAYER: lab["base_rate"].to_numpy()}, index=pd.DatetimeIndex(lab["week"]))
+        board = core.rebound_scoreboard(lab, calls).set_index("id")
+        if core.MACRO_CHECK_PLAYER in board.index:
+            m = board.loc[core.MACRO_CHECK_PLAYER]
+            share += (f" · 거시 체크리스트 {int(m['사건 수'])}건 브라이어 {m['브라이어']:.3f}(기준 대비 {m['기준 대비']:+.3f})"
+                      f" 적중 {m['적중률(%)']:.0f}% · 최근 사건 확률 {lab['macro_prob'].iloc[-1] * 100:.0f}%")
     pending = live[live["outcome"].isna()]
     return f"반등 판별전 · 실전 사건 {len(live)}건(대기 {len(pending)}){share}"
 
