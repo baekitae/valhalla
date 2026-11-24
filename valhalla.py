@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.24-2"
+REQUIRED_CORE_VERSION = "2026.11.24-3"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1900,11 +1900,18 @@ def cached_player_positions(ticker: str, partner: str, rules_key: str) -> pd.Dat
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_player_backtest(ticker: str, partner: str, rules_key: str) -> pd.DataFrame:
+def cached_player_backtest(ticker: str, partner: str, rules_key: str, core_version: str = "") -> pd.DataFrame:
     pos = cached_player_positions(ticker, partner, rules_key)
     if pos.empty:
         return pd.DataFrame()
-    return core.backtest_players(pos.drop(columns=["close"]), pos["close"])
+    players = pos.drop(columns=["close"])
+    rules = [(int(v), core.normalize_rules(r)) for v, r in json.loads(rules_key)]
+    exps = core.experiment_rules(rules[0][1], rules[1:])
+    if exps:
+        hist = core.complete_weeks(load_signal_history(ticker, partner), us_asof())
+        for pid, rule in exps.items():
+            players[pid] = core.rule_positions(core.action_signals(hist, rule)).reindex(players.index)
+    return core.backtest_players(players, pos["close"])
 
 
 PLAYER_COLORS = ["#F04452", "#3182F6", "#F5A524", "#22C55E", "#A855F7", "#14B8A6", "#EC4899", "#94A3B8",
@@ -2182,13 +2189,32 @@ def render_arena(ticker: str, partner: str) -> None:
     with t2:
         st.caption("계산 가능한 선수(규칙·추세 필터·변동성 조절·그냥 보유, 레버리지 ETF면 연구소 기법 4개)를 과거 전체에 적용한 결과입니다. "
                    "AI 위원회와 앙상블은 과거로 검증할 수 없어 실전 기록만 봅니다.")
-        bt = cached_player_backtest(ticker, partner, json.dumps([[v, r] for v, r in rules]))
+        bt = cached_player_backtest(ticker, partner, json.dumps([[v, r] for v, r in rules]), core.CORE_VERSION)
         if bt.empty:
             st.caption("데이터가 부족합니다.")
         else:
+            sort_by = st.segmented_control("정렬", ["칼마", "연평균(%)", "전체 MDD(%)", "최근 2년 칼마"],
+                                           default="칼마", key=f"bt_sort_{ticker}") or "칼마"
+            bt = bt.sort_values(sort_by, ascending=False, na_position="last")
+            pct = {c: st.column_config.NumberColumn(format="%+.1f%%")
+                   for c in ("전체 누적(%)", "연평균(%)", "전체 MDD(%)", "최근 2년 누적(%)", "최근 2년 MDD(%)")}
             st.dataframe(bt.drop(columns=["id"]), hide_index=True, width="stretch",
-                         column_config={c: st.column_config.NumberColumn(format="%+.1f%%")
-                                        for c in ("전체 누적(%)", "전체 MDD(%)", "최근 2년 누적(%)", "최근 2년 MDD(%)")})
+                         column_config={**pct,
+                                        "칼마": st.column_config.NumberColumn(format="%.2f", help="연평균 ÷ |최대 낙폭|. 높을수록 위험 대비 수익이 좋음"),
+                                        "최근 2년 칼마": st.column_config.NumberColumn(format="%.2f"),
+                                        "최장 회복(주)": st.column_config.NumberColumn(help="고점 아래에 머문 가장 긴 기간"),
+                                        "연 매매(회)": st.column_config.NumberColumn(format="%.1f", help="비중이 25%p 이상 바뀐 횟수, 1년 평균")})
+            if "exp_v3" in set(bt["id"]):
+                v3 = bt.set_index("id").loc["exp_v3"]
+                lead = bt.set_index("id").get("최근 2년 칼마", pd.Series(dtype=float))
+                champ_id = f"rule_v{rules[0][0]}"
+                note = ""
+                if champ_id in lead.index and pd.notna(v3["최근 2년 칼마"]):
+                    better = v3["최근 2년 칼마"] > lead[champ_id] and v3["최근 2년 누적(%)"] > bt.set_index("id").loc[champ_id, "최근 2년 누적(%)"]
+                    note = (" 최근 2년(학습에 안 쓴 구간)에서 대표 규칙보다 수익과 칼마가 모두 높아요. 도전 규칙으로 올려볼 만해요."
+                            if better else " 최근 2년(학습에 안 쓴 구간)에서는 대표 규칙보다 확실히 낫지 않아요. 아직 올릴 근거가 부족해요.")
+                st.caption("🧪 실험 v3는 과거 성적 비교 전용이라 실전 장부·경기장 순위·앙상블에는 들어가지 않아요." + note)
+            st.caption("모든 선수가 같은 자금, 이번 주 비중 × 다음 주 수익률, 거래 비용 0.1%로 계산했어요.")
     with t3:
         if mins.empty:
             st.caption("아직 회의록이 없습니다. AI 위원회(Claude)가 매주 토요일 아침 10개 종목을 회의하고 여기에 기록합니다.")

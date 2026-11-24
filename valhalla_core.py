@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.24-2"
+CORE_VERSION = "2026.11.24-3"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1748,7 +1748,7 @@ MINUTES_TABLE = "valhalla_council_minutes"
 COUNCIL_TICKERS = ["SOXL", "USD", "SOXX", "NVDA", "AVGO", "MRVL", "MU", "TQQQ", "QQQ", "SPY"]
 BASE_PLAYERS = {"trend200": "추세 필터", "voltarget": "변동성 조절", "hold": "그냥 보유"}
 LIVE_ONLY = {"ai_council": "AI 위원회", "ensemble": "앙상블"}
-REBOUND_PLAYERS = {"rebound_base": "과거 확률 (기준)"}
+REBOUND_PLAYERS = {"rebound_base": "과거 확률 (기준)", "exp_v3": "🧪 실험 v3 (도전 규칙 매수 + 대표 규칙 매도)"}
 ENSEMBLE_RULES = {"min_weeks": 20, "lookback": 26, "cap": 0.5, "shrink": 0.5}
 
 
@@ -2028,18 +2028,40 @@ def backtest_players(positions: pd.DataFrame, close: pd.Series, test_weeks: int 
         cost = p.diff().abs().fillna(p.iloc[0]) * fee_bps / 10_000
         wr = p * r - cost
 
-        def stats(x: pd.Series) -> tuple[float, float]:
+        def stats(x: pd.Series) -> tuple[float, float, float, float, int]:
             eq = (1 + x).cumprod()
-            return float((eq.iloc[-1] - 1) * 100), float(((eq / eq.cummax()) - 1).min() * 100)
+            dd = eq / eq.cummax() - 1
+            years = len(x) / 52
+            cagr = float((eq.iloc[-1] ** (1 / years) - 1) * 100) if years > 0 and eq.iloc[-1] > 0 else float("nan")
+            mdd = float(dd.min() * 100)
+            calmar = cagr / abs(mdd) if mdd < 0 else float("nan")
+            under = (dd < -1e-9).astype(int)
+            longest = int(under.groupby((under == 0).cumsum()).sum().max()) if len(under) else 0
+            return float((eq.iloc[-1] - 1) * 100), mdd, cagr, calmar, longest
 
-        full_ret, full_mdd = stats(wr)
+        full_ret, full_mdd, full_cagr, full_calmar, full_under = stats(wr)
         recent = wr[wr.index > cut]
-        rec_ret, rec_mdd = stats(recent) if len(recent) > 4 else (float("nan"), float("nan"))
+        if len(recent) > 4:
+            rec_ret, rec_mdd, rec_cagr, rec_calmar, _ = stats(recent)
+        else:
+            rec_ret = rec_mdd = rec_cagr = rec_calmar = float("nan")
+        trades = len(position_moves(p)) / max(len(p) / 52, 1e-9)
         rows.append({"선수": player_label(pid), "id": pid, "평균 비중(%)": round(float(p.mean() * 100), 0),
-                     "전체 누적(%)": round(full_ret, 1), "전체 MDD(%)": round(full_mdd, 1),
+                     "전체 누적(%)": round(full_ret, 1), "연평균(%)": round(full_cagr, 1),
+                     "전체 MDD(%)": round(full_mdd, 1), "칼마": round(full_calmar, 2),
+                     "최장 회복(주)": full_under, "연 매매(회)": round(trades, 1),
                      "최근 2년 누적(%)": round(rec_ret, 1), "최근 2년 MDD(%)": round(rec_mdd, 1),
-                     "주 수": int(valid.sum())})
+                     "최근 2년 칼마": round(rec_calmar, 2), "주 수": int(valid.sum())})
     return pd.DataFrame(rows)
+
+
+def experiment_rules(active: dict, challengers: list[tuple[int, dict]]) -> dict[str, dict]:
+    """과거 성적 비교 전용 실험 규칙 (실전 장부에는 기록하지 않음).
+    v3 = 도전 규칙(첫 번째)의 매수 조건 + 대표 규칙의 매도 조건."""
+    if not challengers:
+        return {}
+    cv, crule = challengers[0]
+    return {"exp_v3": {"buy": dict(crule["buy"]), "sell": dict(active["sell"])}}
 
 
 def grade_positions(rows: pd.DataFrame, weekly_close: pd.Series) -> pd.DataFrame:

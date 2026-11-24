@@ -262,3 +262,19 @@ def test_rebound_new_event_after_failed_one():
     assert len(ev) == 2                       # 첫 반등이 저점을 깨며 실패 → 1~2주 뒤 반등도 새 사건
     lab = core.label_rebounds(ev, c)
     assert lab["outcome"].iloc[0] == 0.0
+
+
+def test_backtest_metrics_and_experiment_rule():
+    daily = _daily(seed=5, n=1500)
+    hist = core.complete_weeks(core.build_signal_history(daily, daily, {}), daily.index[-1])
+    v2 = {"buy": {"chart_min": 2, "weeks": 3, "macro_min": 3}, "sell": {"chart_max": 0, "weeks": 3, "below_ma": True}}
+    exps = core.experiment_rules(core.ACTION_RULES, [(2, v2)])
+    assert exps["exp_v3"]["buy"] == v2["buy"] and exps["exp_v3"]["sell"] == core.ACTION_RULES["sell"]
+    assert core.experiment_rules(core.ACTION_RULES, []) == {}
+    pos = core.player_positions(hist, daily, daily, [(1, core.ACTION_RULES)])
+    pos["exp_v3"] = core.rule_positions(core.action_signals(hist, exps["exp_v3"]))
+    bt = core.backtest_players(pos, hist["close"]).set_index("id")
+    for col in ("연평균(%)", "칼마", "최장 회복(주)", "연 매매(회)", "최근 2년 칼마"):
+        assert col in bt.columns
+    assert bt.loc["hold", "연 매매(회)"] == 0 and bt.loc["hold", "최장 회복(주)"] > 0
+    assert "실험" in core.player_label("exp_v3")
