@@ -124,6 +124,15 @@ def update_rebounds(sb, fetch, asof) -> str:
         return "반등 판별전 · 사건 없음"
     lab = core.label_rebounds(events, close)
     lab["base_rate"] = core.rebound_base_rates(lab)
+    lab["macro_prob"] = np.nan
+    try:
+        tnx, vix = fetch("^TNX", False), fetch("^VIX", False)
+        credit = pd.read_csv(core.FRED_CSV.format(sid=core.FRED_SERIES["baa"]), na_values=".")
+        credit = pd.to_numeric(credit.set_index(pd.to_datetime(credit.iloc[:, 0])).iloc[:, 1], errors="coerce").dropna()
+        ck = core.check_conditions(tnx["Close"], vix["Close"], credit)
+        lab["macro_prob"] = core.check_calls_at(ck, lab["week"]).to_numpy()
+    except Exception:
+        traceback.print_exc()
     last_done = core._friday(asof) if asof.weekday() == 4 else core._friday(asof) - pd.Timedelta(weeks=1)
     live = lab[(lab["week"] >= pd.Timestamp(core.REBOUND_LIVE_START)) & (lab["week"] <= last_done)]
     rows = []
@@ -132,6 +141,7 @@ def update_rebounds(sb, fetch, asof) -> str:
                      "trigger": r["trigger"], "jump": r["jump"], "prior_low": round(r["prior_low"], 2),
                      "depth": r["depth"], "judge_close": None if pd.isna(r["judge_close"]) else round(r["judge_close"], 2),
                      "base_rate": float(r["base_rate"]),
+                     "macro_prob": None if pd.isna(r["macro_prob"]) else round(float(r["macro_prob"]), 3),
                      "outcome": None if pd.isna(r["outcome"]) else int(r["outcome"]),
                      "resolved_on": None if r["resolved_on"] is None or pd.isna(r["resolved_on"])
                      else pd.Timestamp(r["resolved_on"]).strftime("%Y-%m-%d")})

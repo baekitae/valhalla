@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.24-3"
+REQUIRED_CORE_VERSION = "2026.11.25-1"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -408,6 +408,59 @@ def load_recent(ticker: str) -> pd.DataFrame | None:
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_long(ticker: str, period: str = "5y", adjusted: bool = False) -> pd.DataFrame | None:
     return _download(ticker, period, adjusted)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_fred(series_id: str) -> pd.Series | None:
+    """미국 연준(FRED) 공개 CSV. 실패하면 None."""
+    try:
+        df = pd.read_csv(core.FRED_CSV.format(sid=series_id), na_values=".")
+        df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
+        return pd.to_numeric(df.set_index(df.columns[0]).iloc[:, 0], errors="coerce").dropna()
+    except Exception:
+        LOGGER.exception("FRED %s 불러오기 실패", series_id)
+        return None
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def load_check_inputs() -> dict:
+    """반등 체크리스트 입력: 10년물·VIX(야후), 신용 스프레드·하이일드·근원 PCE(FRED)."""
+    def close(t):
+        d = load_long(t, "max", False)
+        return d["Close"].dropna() if d is not None and not d.empty else pd.Series(dtype=float)
+    return {"tnx": close("^TNX"), "vix": close("^VIX"),
+            "credit": load_fred(core.FRED_SERIES["baa"]), "hy": load_fred(core.FRED_SERIES["hy"]),
+            "core_pce": load_fred(core.FRED_SERIES["core_pce"])}
+
+
+def render_rebound_checklist() -> None:
+    section("반등 체크리스트", "반도체 반등이 '진짜'인지 볼 때 함께 확인할 거시 지표입니다. 기준선은 고정해 두고 매일 자동으로 갱신돼요. "
+                        "이 체크리스트는 선수 경기장의 반등 판별전에 '거시 체크리스트' 선수로도 참가해 실력을 검증받습니다.")
+    data = load_check_inputs()
+    if data["tnx"].empty or data["vix"].empty:
+        st.caption("지표 데이터를 불러오지 못했습니다.")
+        return
+    credit = data["credit"] if data["credit"] is not None else pd.Series(dtype=float)
+    rows = core.checklist_snapshot(data["tnx"], data["vix"], credit, data["hy"], data["core_pce"])
+    label = {"ok": "🟢 좋음", "warn": "🟡 주의", "stop": "🔴 부담"}
+    st.dataframe(pd.DataFrame([{**r, "상태": label[r["상태"]]} for r in rows])[["지표", "상태", "현재", "기준", "변화", "설명"]],
+                 hide_index=True, width="stretch")
+    if not credit.empty:
+        ck = core.check_conditions(data["tnx"], data["vix"], credit).dropna(subset=["prob"])
+        if not ck.empty:
+            last = ck.iloc[-1]
+            st.caption(f"거시 체크리스트 선수의 지금 판단: 4개 조건 중 {int(last['met'])}개 충족 → 추세 전환 확률 "
+                       f"{last['prob'] * 100:.0f}% (조건: 10년물 4.5% 아래 · 10년물 한 달 전보다 낮음 · VIX 30 아래 · "
+                       "신용 스프레드 3개월 전보다 좁음). 하이일드 스프레드와 PCE는 참고 표시만 하고 선수 계산에는 넣지 않아요.")
+    ev = core.upcoming_events(pd.Timestamp(now_kst().replace(tzinfo=None)))
+    if not ev.empty:
+        st.markdown("**다가오는 일정 (한국 시간)**")
+        st.dataframe(pd.DataFrame({"날짜": ev["when"].dt.strftime("%m/%d(%a) %H:%M").str.replace("Mon", "월").str.replace(
+            "Tue", "화").str.replace("Wed", "수").str.replace("Thu", "목").str.replace("Fri", "금").str.replace(
+            "Sat", "토").str.replace("Sun", "일"),
+            "일정": ev["일정"], "확정": ev["확정"].map({True: "확정", False: "미확정"}), "메모": ev["메모"]}),
+            hide_index=True, width="stretch")
+        st.caption("미확정 일정은 요청·예정 단계라 바뀔 수 있어요. 바뀌면 Claude에게 알려주시면 고쳐 둘게요.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -943,6 +996,7 @@ def render_breakeven(ticker: str, journal_avg: float | None) -> None:
 # ==========================================================================
 def page_radar() -> None:
     page_header("MARKET RADAR", "시장 레이더", "미국 10년물 금리 · 반도체 핵심 종목 · 매크로 뉴스 센티먼트")
+    render_rebound_checklist()
     section("미국 10년물 국채 금리", "레버리지 성장주의 할인율·차입비용과 관련된 핵심 거시 변수입니다.")
     tnx = load_treasury()
     if tnx is None:
@@ -2019,6 +2073,10 @@ def cached_rebound_history(rules_key: str, core_version: str = "") -> tuple[pd.D
     calls = pos.drop(columns=["close"]).reindex(pd.DatetimeIndex(lab["week"])) if not pos.empty else pd.DataFrame(
         index=pd.DatetimeIndex(lab["week"]))
     calls[core.REBOUND_BASE_PLAYER] = lab["base_rate"].to_numpy()
+    data = load_check_inputs()
+    if data["credit"] is not None and not data["tnx"].empty and not data["vix"].empty:
+        ck = core.check_conditions(data["tnx"], data["vix"], data["credit"])
+        calls[core.MACRO_CHECK_PLAYER] = core.check_calls_at(ck, lab["week"]).to_numpy()
     return lab, calls
 
 
@@ -2066,6 +2124,9 @@ def render_rebound_league(rules: list, pos: pd.DataFrame) -> None:
             pv = calls.loc[live_week].drop(core.REBOUND_BASE_PLAYER, errors="ignore").dropna()
         else:
             pv = pd.Series(dtype=float)
+        if core.MACRO_CHECK_PLAYER in calls.columns and live_week in calls.index and pd.notna(calls.loc[live_week, core.MACRO_CHECK_PLAYER]):
+            pv = pd.concat([pd.Series({core.MACRO_CHECK_PLAYER: float(calls.loc[live_week, core.MACRO_CHECK_PLAYER])}),
+                            pv.drop(core.MACRO_CHECK_PLAYER, errors="ignore")])
         if not pv.empty:
             pv = pd.concat([pd.Series({core.REBOUND_BASE_PLAYER: float(last["base_rate"])}), pv])
             st.caption("이번 사건에 대한 선수별 추세 전환 확률: " + " · ".join(
@@ -2082,6 +2143,14 @@ def render_rebound_league(rules: list, pos: pd.DataFrame) -> None:
     with a:
         st.caption("SOXL 상장(2010) 이후 사건으로, 계산 가능한 선수들이 그때 어떻게 판단했을지 채점합니다.")
         _rebound_board(lab[lab["week"] >= pd.Timestamp("2010-06-01")], calls)
+        if core.MACRO_CHECK_PLAYER in calls.columns:
+            long_board = core.rebound_scoreboard(lab, calls[[core.MACRO_CHECK_PLAYER, core.REBOUND_BASE_PLAYER]])
+            if not long_board.empty:
+                lb = long_board.set_index("id")
+                if core.MACRO_CHECK_PLAYER in lb.index:
+                    m = lb.loc[core.MACRO_CHECK_PLAYER]
+                    st.caption(f"거시 체크리스트는 1994년부터 채점할 수 있어요: {int(m['사건 수'])}건 · 브라이어 {m['브라이어']:.3f} "
+                               f"(과거 확률 대비 {m['기준 대비']:+.3f}, 음수면 더 잘 맞힘) · 적중률 {m['적중률(%)']:.0f}%.")
         show = lab.tail(15).iloc[::-1]
         st.dataframe(pd.DataFrame({"날짜": show["event_date"].dt.strftime("%Y-%m-%d"), "계기": show["trigger"],
                                    "직전 낙폭": show["depth"].map(lambda v: f"{v:.0f}%"),
@@ -2099,6 +2168,8 @@ def render_rebound_league(rules: list, pos: pd.DataFrame) -> None:
             live_calls = soxl.pivot_table(index="week", columns="player", values="position", aggfunc="last")
             live_calls = live_calls.reindex(pd.DatetimeIndex(live_lab["week"]))
             live_calls[core.REBOUND_BASE_PLAYER] = live_lab["base_rate"].to_numpy()
+            if core.MACRO_CHECK_PLAYER in calls.columns:
+                live_calls[core.MACRO_CHECK_PLAYER] = calls[core.MACRO_CHECK_PLAYER].reindex(live_calls.index).to_numpy()
             _rebound_board(live_lab, live_calls)
             st.caption(f"실전 사건 {len(live_lab)}건 · 채점 완료 {int(live_lab['outcome'].notna().sum())}건. "
                        "사건이 드물어서 실력 차이가 보이려면 몇 년이 걸려요.")

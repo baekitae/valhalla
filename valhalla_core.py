@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.24-3"
+CORE_VERSION = "2026.11.25-1"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1748,7 +1748,7 @@ MINUTES_TABLE = "valhalla_council_minutes"
 COUNCIL_TICKERS = ["SOXL", "USD", "SOXX", "NVDA", "AVGO", "MRVL", "MU", "TQQQ", "QQQ", "SPY"]
 BASE_PLAYERS = {"trend200": "추세 필터", "voltarget": "변동성 조절", "hold": "그냥 보유"}
 LIVE_ONLY = {"ai_council": "AI 위원회", "ensemble": "앙상블"}
-REBOUND_PLAYERS = {"rebound_base": "과거 확률 (기준)", "exp_v3": "🧪 실험 v3 (도전 규칙 매수 + 대표 규칙 매도)"}
+REBOUND_PLAYERS = {"rebound_base": "과거 확률 (기준)", "macro_check": "거시 체크리스트", "exp_v3": "🧪 실험 v3 (도전 규칙 매수 + 대표 규칙 매도)"}
 ENSEMBLE_RULES = {"min_weeks": 20, "lookback": 26, "cap": 0.5, "shrink": 0.5}
 
 
@@ -2384,6 +2384,111 @@ def rebound_scoreboard(labeled: pd.DataFrame, calls: pd.DataFrame) -> pd.DataFra
     base = t.loc[t["id"] == REBOUND_BASE_PLAYER, "브라이어"]
     t["기준 대비"] = (t["브라이어"] - (float(base.iloc[0]) if not base.empty else np.nan)).round(3)
     return t.sort_values("브라이어").reset_index(drop=True)
+
+
+# ==========================================================================
+# 18. 반등 체크리스트 (거시 지표) + 일정 달력 + 반등 판별전 선수 '거시 체크리스트'
+#   조건 4개: ① 10년물 금리 4.5% 미만 ② 10년물 금리가 한 달 전보다 낮음
+#            ③ VIX 30 미만 ④ 신용 스프레드(무디스 BAA - 10년물)가 3개월 전보다 넓어지지 않음
+#   선수 확률 = 0.2 + 0.6 × (충족 수 / 4)  → 0개 20%, 4개 80%
+#   하이일드 스프레드(4% 기준)와 근원 PCE는 화면 표시용 (FRED의 하이일드 시계열은 최근 3년만 제공)
+# ==========================================================================
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+FRED_SERIES = {"hy": "BAMLH0A0HYM2", "baa": "BAA10Y", "core_pce": "PCEPILFE"}
+MACRO_CHECK_PLAYER = "macro_check"
+CHECK_RULES = {"tnx_max": 4.5, "vix_max": 30.0, "hy_max": 4.0, "tnx_days": 21, "credit_days": 63}
+
+# 날짜는 한국 시간. confirmed=False는 요청·예정 단계(바뀔 수 있음).
+EVENT_CALENDAR = [
+    ("2026-11-25 22:30", "미국 10월 PCE 물가 · 3분기 GDP 수정치", "연준이 가장 중시하는 물가. 높으면 금리 인상 우려", True),
+    ("2026-11-27 03:00", "추수감사절 휴장(26일) 뒤 반나절 장", "27일 금요일은 오후 1시(미국 동부) 조기 폐장", True),
+    ("2026-12-01 00:00", "하원 위원회, 젠슨 황 출석 요청일 (12/1~2)", "비공개 증언 요청 단계 · 날짜 바뀔 수 있음", False),
+    ("2026-12-03 00:00", "상원 은행위원회 청문회 (젠슨 황 출석 요청)", "출석 동의 보도는 있으나 날짜 미확정", False),
+    ("2026-12-10 04:00", "FOMC 금리 결정 (12/8~9 회의)", "12월 금리 인상 여부 · 경제전망 발표", True),
+    ("2026-12-10 06:00", "브로드컴 4분기 실적 (12/9 장 마감 뒤)", "맞춤형 AI 칩 수요 확인", True),
+    ("2026-12-10 15:00", "TSMC 11월 매출 (무렵)", "AI 칩 생산 수요의 월간 확인", False),
+    ("2026-12-18 06:00", "마이크론 실적 (12/17 장 마감 뒤)", "2027년 AI 메모리 가격 반영 첫 전망", True),
+    ("2026-12-23 22:30", "미국 11월 PCE 물가", "연말 마지막 물가 지표", True),
+]
+
+
+def upcoming_events(now: pd.Timestamp, days: int = 45) -> pd.DataFrame:
+    rows = []
+    for when, name, note, ok in EVENT_CALENDAR:
+        t = pd.Timestamp(when)
+        if now - pd.Timedelta(hours=12) <= t <= now + pd.Timedelta(days=days):
+            rows.append({"when": t, "일정": name, "메모": note, "확정": ok})
+    return pd.DataFrame(rows, columns=["when", "일정", "메모", "확정"])
+
+
+def check_conditions(tnx: pd.Series, vix: pd.Series, credit: pd.Series, rules: dict | None = None) -> pd.DataFrame:
+    """날짜별 체크리스트 4조건(참/거짓)과 '거시 체크리스트' 선수 확률. 입력은 일별 시계열(%)."""
+    th = {**CHECK_RULES, **(rules or {})}
+    idx = tnx.dropna().index.union(vix.dropna().index)
+    t = tnx.reindex(idx).ffill()
+    v = vix.reindex(idx).ffill()
+    c = credit.reindex(idx.union(credit.dropna().index)).ffill().reindex(idx)
+    out = pd.DataFrame(index=idx)
+    out["tnx_low"] = t < th["tnx_max"]
+    out["tnx_falling"] = t < t.shift(th["tnx_days"])
+    out["vix_calm"] = v < th["vix_max"]
+    out["credit_ok"] = c <= c.shift(th["credit_days"])
+    valid = t.notna() & v.notna() & c.notna() & t.shift(th["tnx_days"]).notna() & c.shift(th["credit_days"]).notna()
+    k = out[["tnx_low", "tnx_falling", "vix_calm", "credit_ok"]].sum(axis=1)
+    out["met"] = k.where(valid)
+    out["prob"] = (0.2 + 0.6 * k / 4).where(valid)
+    return out
+
+
+def check_calls_at(checks: pd.DataFrame, weeks: pd.Series) -> pd.Series:
+    """반등 사건 주(금요일)마다 그날까지의 마지막 체크리스트 확률."""
+    p = checks["prob"].dropna()
+    vals = []
+    for wk in weeks:
+        upto = p[p.index <= wk]
+        vals.append(float(upto.iloc[-1]) if not upto.empty else np.nan)
+    return pd.Series(vals, index=pd.DatetimeIndex(weeks))
+
+
+def checklist_snapshot(tnx: pd.Series, vix: pd.Series, credit: pd.Series, hy: pd.Series | None,
+                       core_pce: pd.Series | None) -> list[dict]:
+    """화면용 현재 상태. status: ok / warn / stop."""
+    th = CHECK_RULES
+    rows = []
+    t = tnx.dropna()
+    if len(t) > th["tnx_days"]:
+        now, before = float(t.iloc[-1]), float(t.iloc[-1 - th["tnx_days"]])
+        rows.append({"지표": "미국 10년물 금리", "현재": f"{now:.2f}%", "기준": f"{th['tnx_max']}% 아래",
+                     "상태": "ok" if now < th["tnx_max"] else ("warn" if now < 5.0 else "stop"),
+                     "변화": f"{now - before:+.2f}%p (한 달)", "설명": "금리가 내려와야 성장주·레버리지 ETF 부담이 줄어요"})
+        rows.append({"지표": "10년물 금리 방향", "현재": "하락" if now < before else "상승",
+                     "기준": "한 달 전보다 낮음", "상태": "ok" if now < before else "stop",
+                     "변화": f"{before:.2f}% → {now:.2f}%", "설명": "수준보다 방향이 먼저 바뀌는 경우가 많아요"})
+    v = vix.dropna()
+    if len(v):
+        now = float(v.iloc[-1])
+        rows.append({"지표": "VIX (공포 지수)", "현재": f"{now:.1f}", "기준": f"{th['vix_max']:.0f} 아래",
+                     "상태": "ok" if now < 20 else ("warn" if now < th["vix_max"] else "stop"),
+                     "변화": f"{now - float(v.iloc[max(0, len(v) - 6)]):+.1f} (5일)", "설명": "30 위는 패닉 구간"})
+    c = credit.dropna()
+    if len(c) > th["credit_days"]:
+        now, before = float(c.iloc[-1]), float(c.iloc[-1 - th["credit_days"]])
+        rows.append({"지표": "신용 스프레드 (BAA−10년물)", "현재": f"{now:.2f}%p", "기준": "3개월 전보다 좁거나 같음",
+                     "상태": "ok" if now <= before else "warn", "변화": f"{now - before:+.2f}%p (3개월)",
+                     "설명": "회사채 시장 불안이 번지는지 보는 지표"})
+    if hy is not None and len(hy.dropna()):
+        now = float(hy.dropna().iloc[-1])
+        rows.append({"지표": "하이일드 스프레드", "현재": f"{now:.2f}%", "기준": f"{th['hy_max']}% 아래",
+                     "상태": "ok" if now < 3.5 else ("warn" if now < th["hy_max"] else "stop"),
+                     "변화": f"{hy.dropna().index[-1]:%m/%d} 기준", "설명": "4%를 넘으면 2018년 말 같은 신용 불안 경계"})
+    if core_pce is not None and len(core_pce.dropna()) > 12:
+        x = core_pce.dropna()
+        yoy = float((x.iloc[-1] / x.iloc[-13] - 1) * 100)
+        prev = float((x.iloc[-2] / x.iloc[-14] - 1) * 100)
+        rows.append({"지표": "근원 PCE 물가 (전년 대비)", "현재": f"{yoy:.1f}%", "기준": "낮아지는 중",
+                     "상태": "ok" if yoy < prev else ("warn" if yoy == prev else "stop"),
+                     "변화": f"{prev:.1f}% → {yoy:.1f}% ({x.index[-1]:%Y-%m})", "설명": "연준이 가장 중시하는 물가"})
+    return rows
 
 
 def sb_fetch_all(sb, table: str, eq: dict | None = None, page: int = 1000) -> list[dict]:

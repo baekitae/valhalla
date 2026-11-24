@@ -278,3 +278,24 @@ def test_backtest_metrics_and_experiment_rule():
         assert col in bt.columns
     assert bt.loc["hold", "연 매매(회)"] == 0 and bt.loc["hold", "최장 회복(주)"] > 0
     assert "실험" in core.player_label("exp_v3")
+
+
+def test_macro_checklist_player():
+    idx = pd.bdate_range("2020-01-01", periods=200)
+    tnx = pd.Series(np.linspace(5.2, 4.0, 200), idx)          # 금리 하락 → 4.5 아래로
+    vix = pd.Series(np.r_[np.full(100, 35.0), np.full(100, 18.0)], idx)
+    credit = pd.Series(np.linspace(2.5, 2.0, 200), idx)        # 스프레드 축소
+    ck = core.check_conditions(tnx, vix, credit)
+    assert np.isnan(ck["prob"].iloc[10])                       # 비교할 과거가 없으면 판단 보류
+    assert ck["met"].iloc[-1] == 4 and abs(ck["prob"].iloc[-1] - 0.8) < 1e-9
+    assert ck["met"].iloc[80] == 2                             # 금리 높고 VIX 35 → 하락·스프레드만 충족
+    wk = pd.Series(pd.to_datetime(["2020-06-05", "2020-10-02"]))
+    calls = core.check_calls_at(ck, wk)
+    assert calls.iloc[-1] == ck["prob"].dropna().iloc[-1]
+    snap = core.checklist_snapshot(tnx, vix, credit, pd.Series([3.2], [idx[-1]]),
+                                   pd.Series(np.linspace(100, 104, 20), pd.date_range("2019-01-01", periods=20, freq="MS")))
+    names = [r["지표"] for r in snap]
+    assert "하이일드 스프레드" in names and "근원 PCE 물가 (전년 대비)" in names
+    assert {r["상태"] for r in snap} <= {"ok", "warn", "stop"}
+    ev = core.upcoming_events(pd.Timestamp("2026-11-25 01:00"))
+    assert ev["일정"].iloc[0].startswith("미국 10월 PCE") and (~ev["확정"]).any()
