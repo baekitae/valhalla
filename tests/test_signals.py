@@ -501,8 +501,11 @@ def test_scenario_engine():
     assert any("발표" in a for a in acts)
     cyc = pd.DataFrame([{"계좌": "a", "보유 수량": 38, "평단($)": 164.23}])
     acc = core.scenario_accounts(cyc, s, 33.0, 1350, 250_000)
-    assert set(acc["다시 사기"]) == {"전부", "절반"}
+    assert set(acc["다시 사기"]) == {"전부", "절반", "70%", "현금 100만 원 남기기"}
     whole, half = acc.set_index("다시 사기").loc["전부"], acc.set_index("다시 사기").loc["절반"]
+    goal = acc.set_index("다시 사기").loc["현금 100만 원 남기기"]
+    assert goal["예수금(원)"] >= 1_000_000 and goal["보유(주)"] == 38 - 12    # 50만 부족분 → 12주(주당 44,550원)
+    assert acc.set_index("다시 사기").loc["70%"]["보유(주)"] == 26
     assert whole["남은 총알(발)"] == 2 and half["남은 총알(발)"] > 2
     snap = core.scenario_snapshot(df, 8500.0, 8409.0, s, False, None, pd.Timestamp("2026-11-25 13:00"))
     assert snap["code"] in "ABCD" and len(snap["checks"]) >= 6

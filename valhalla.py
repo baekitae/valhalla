@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-13"
+REQUIRED_CORE_VERSION = "2026.11.25-14"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1146,8 +1146,9 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
             st.dataframe(acc, hide_index=True, width="stretch",
                          column_config={"예수금(원)": st.column_config.NumberColumn(format="%d"),
                                         "지금 평가(원)": st.column_config.NumberColumn(format="%d")})
-            st.caption(("12월 다시 사기 전이라 '전부 다시 사기'와 '절반만 다시 사기'를 나란히 보여 줘요. 절반이면 판 돈이 예수금에 더해져요. "
-                        if not s.get("rebought") else "") +
+            st.caption(("12월 다시 사기 방식이 미정이라 전부·절반·비율·현금 목표를 나란히 보여 줘요. 덜 다시 산 만큼 판 돈이 예수금에 더해져요. "
+                        if s.get("rebuy") not in core.REBUY_MODES[1:] else
+                        ("" if s.get("rebought") else f"다시 사기 방식: {core.rebuy_label(s['rebuy'], s)}. ")) +
                        f"새 평단은 {'다시 산 가격' if s.get('rebought') else '지금 가격(다시 산다고 가정)'} 기준, "
                        f"총알 1발 = {int(plan['buy_target_krw']):,}원(원칙).")
 
@@ -1161,8 +1162,14 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
                                      "직접 넣으면 그 값이 띠 아래쪽, +3%가 위쪽이 돼요.") if pd.notna(ab[0]) else None)
         f = st.columns(3)
         cash = f[0].number_input("키움 계좌당 예수금 (원)", 0, 100_000_000, int(s["cash_per_account_krw"]), 50_000, key="sc_cash")
-        rb = f[1].selectbox("12월 다시 사기 방식", ["미정", "전부", "절반"], ["미정", "전부", "절반"].index(s["rebuy"]), key="sc_rb")
+        modes = core.REBUY_MODES
+        rb = f[1].selectbox("12월 다시 사기 방식", modes, modes.index(s["rebuy"]) if s["rebuy"] in modes else 0, key="sc_rb",
+                            help="미정이면 네 가지를 나란히 비교해요. 손실 실현(세금 상쇄)은 다시 사는 양과 상관없이 판 순간 확정돼요.")
         tp = f[2].number_input("새 사이클 익절 (%)", 1.0, 100.0, float(s["take_profit"]) * 100, 1.0, key="sc_tp")
+        f = st.columns(3)
+        rpct = f[0].number_input("비율 직접: 다시 살 비율 (%)", 0.0, 100.0, float(s["rebuy_pct"]), 5.0, key="sc_rpct")
+        cgoal = f[1].number_input("현금 목표: 계좌마다 남길 현금 (원)", 0, 100_000_000, int(s["cash_goal_krw"]), 100_000, key="sc_cgoal")
+        f[2].caption("'비율 직접'은 보유 주식 중 그 비율만 다시 사고, '현금 목표'는 예수금이 목표 금액이 되도록 그만큼만 덜 다시 사요.")
         f = st.columns(3)
         done = f[0].checkbox("12월 다시 사기 완료", bool(s.get("rebought")), key="sc_done")
         rp = f[1].number_input("다시 산 가격 ($)", 0.0, 1000.0, float(s["rebuy_price"] or 0.0), 0.01, key="sc_rp")
@@ -1173,7 +1180,7 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
         if f[2].button("시나리오 설정 저장", type="primary", key="sc_save") and backend() == "supabase":
             try:
                 new = {**s, "exit_target": ex, "tranches": sorted(float(x) for x in tr.split(",") if x.strip()),
-                       "resistance": rs or None, "cash_per_account_krw": cash, "rebuy": rb, "take_profit": tp / 100,
+                       "resistance": rs or None, "cash_per_account_krw": cash, "rebuy": rb, "rebuy_pct": rpct, "cash_goal_krw": cgoal, "take_profit": tp / 100,
                        "rebought": done, "rebuy_price": rp or None,
                        "dip_steps": sorted(float(x) / 100 for x in dips.split(",") if x.strip()),
                        "wait_before_h": wb, "settle_after_h": sa}
