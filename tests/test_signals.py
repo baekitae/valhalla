@@ -299,3 +299,15 @@ def test_macro_checklist_player():
     assert {r["상태"] for r in snap} <= {"ok", "warn", "stop"}
     ev = core.upcoming_events(pd.Timestamp("2026-11-25 01:00"))
     assert ev["일정"].iloc[0].startswith("미국 10월 PCE") and (~ev["확정"]).any()
+
+
+def test_fill_missing_day_from_intraday():
+    daily = pd.DataFrame({"Open": [1.0, 2.0], "High": [1.0, 2.0], "Low": [1.0, 2.0], "Close": [1.0, 43.21],
+                          "Volume": [1, 1]}, index=pd.to_datetime(["2026-11-20", "2026-11-23"]))
+    idx = pd.to_datetime(["2026-11-23 15:30", "2026-11-24 09:30", "2026-11-24 12:00", "2026-11-24 15:30"])
+    intr = pd.DataFrame({"Open": [43, 39, 37, 35.5], "High": [44, 40, 38, 36], "Low": [42, 38, 34, 35],
+                         "Close": [43.21, 38, 35, 35.33], "Volume": [5, 1, 2, 3]}, index=idx)
+    out = core.fill_missing_days(daily, core.intraday_to_daily(intr))
+    assert out.index[-1] == pd.Timestamp("2026-11-24") and out["Close"].iloc[-1] == 35.33
+    assert out["Low"].iloc[-1] == 34 and out["Volume"].iloc[-1] == 6 and len(out) == 3
+    assert core.fill_missing_days(daily, None) is daily

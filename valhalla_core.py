@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-1"
+CORE_VERSION = "2026.11.25-2"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -815,6 +815,23 @@ def clean_ohlcv(raw: pd.DataFrame | None) -> pd.DataFrame | None:
     for col in ("Open", "High", "Low"):
         df[col] = df[col].fillna(df["Close"])
     return None if df.empty else df
+
+
+def intraday_to_daily(intraday: pd.DataFrame | None) -> pd.DataFrame | None:
+    """분·시간봉 → 날짜별 일봉 (정규장 봉만 들어온다고 가정)."""
+    if intraday is None or intraday.empty:
+        return None
+    g = intraday.groupby(intraday.index.normalize())
+    return pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(),
+                         "Close": g["Close"].last(), "Volume": g["Volume"].sum()})
+
+
+def fill_missing_days(daily: pd.DataFrame, patch: pd.DataFrame | None) -> pd.DataFrame:
+    """일봉 끝에 빠진 날(야후가 마감 직후 종가를 비워 보내는 경우)을 분봉으로 만든 일봉으로 채움."""
+    if patch is None or patch.empty or daily is None or daily.empty:
+        return daily
+    extra = patch[patch.index > daily.index[-1]]
+    return pd.concat([daily, extra[daily.columns]]) if not extra.empty else daily
 
 
 def league_period(start: str, today: pd.Timestamp | None = None) -> str:

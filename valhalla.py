@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-1"
+REQUIRED_CORE_VERSION = "2026.11.25-2"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -390,6 +390,17 @@ def _clean_ohlcv(raw: pd.DataFrame | None) -> pd.DataFrame | None:
     return core.clean_ohlcv(raw)
 
 
+def _expected_session() -> pd.Timestamp:
+    """지금 기준으로 일봉이 있어야 하는 마지막 미국 거래일(주말 제외, 휴장일은 모름)."""
+    now = dt.datetime.now(ET)
+    day = pd.Timestamp(now.date())
+    if now.hour < 16 or (now.hour == 16 and now.minute < 15):
+        day -= pd.Timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= pd.Timedelta(days=1)
+    return day
+
+
 def _download(ticker: str, period: str, adjusted: bool) -> pd.DataFrame | None:
     try:
         raw = yf.download(ticker, period=period, interval="1d", auto_adjust=adjusted,
@@ -397,7 +408,16 @@ def _download(ticker: str, period: str, adjusted: bool) -> pd.DataFrame | None:
     except Exception:
         LOGGER.exception("시세 다운로드 실패: %s", ticker)
         return None
-    return _clean_ohlcv(raw)
+    df = _clean_ohlcv(raw)
+    # 야후는 장 마감 뒤 몇 시간 동안 그날 일봉 종가를 비워 보내기도 함 → 30분봉으로 빠진 날을 채움
+    if df is not None and not adjusted and df.index[-1] < _expected_session():
+        try:
+            intr = _clean_ohlcv(yf.download(ticker, period="5d", interval="30m", prepost=False,
+                                            auto_adjust=False, progress=False, threads=False))
+            df = core.fill_missing_days(df, core.intraday_to_daily(intr))
+        except Exception:
+            LOGGER.exception("분봉 보정 실패: %s", ticker)
+    return df
 
 
 @st.cache_data(ttl=60, show_spinner=False)
