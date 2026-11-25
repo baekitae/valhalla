@@ -1177,6 +1177,16 @@ def page_portfolio() -> None:
     st.caption(f"환율 {fx:,.0f}원 기준. 제안일 뿐이고 실제 주문은 직접 판단해서 하세요. 손실 중인 종목을 팔면 그해 손실로 잡혀요 "
                "(12월 손실 실현 계획과 함께 고려).")
 
+    _, mins = load_arena(backend())
+    pm = mins[mins["ticker"] == "PORTFOLIO"].sort_values("week") if not mins.empty else mins
+    with st.expander("AI 위원회 포트폴리오 회의록 (매주 토요일 아침)", icon=":material/groups:", expanded=not pm.empty):
+        if pm.empty:
+            st.caption("아직 회의록이 없어요. 이번 주 토요일 아침 회의부터 이 계좌의 리밸런싱을 논의해 기록합니다.")
+        else:
+            last = pm.iloc[-1]
+            st.markdown(f"**{str(last['week'])[:10]} 주 · {last['decision']}**")
+            st.markdown(last["minutes"] or "—")
+
     section("포트폴리오 선수 · 리밸런싱 선수 성적",
             f"{core.PORTFOLIO_START[:4]}년부터 매주 금요일에 위 규칙대로 했다면? 같은 목표 비중을 리밸런싱 방식만 바꿔 비교해요. "
             f"실전 기록은 {core.PORTFOLIO_LIVE_START}부터 이어서 쌓여요.")
