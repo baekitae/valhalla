@@ -208,9 +208,9 @@ def update_scenario(sb, fetch, asof, rule) -> str:
     now = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None)
     snap = core.scenario_snapshot(soxl, sox_close, sox_line, s, v1_on, reb.get("outcome"), now)
     INSIGHT["scenario"] = {"code": snap["code"], "why": snap["why"], "price": snap["price"], "low": snap["low"],
-                           "resistance": snap["resistance"], "week_close": snap["week_close"], "gate": snap["gate"]["state"],
+                           "resistance": snap["resistance"], "res_low": snap["res_low"], "week_close": snap["week_close"], "gate": snap["gate"]["state"],
                            "event": snap["gate"]["event"], "v1_on": v1_on}
-    return (f"시나리오 {core.SCENARIO_NAMES[snap['code']]} ({snap['why']}) · 매물대 ${snap['resistance']:.2f} · "
+    return (f"시나리오 {core.SCENARIO_NAMES[snap['code']]} ({snap['why']}) · 매물대 띠 ${snap['res_low']:.2f}~{snap['resistance']:.2f}(중심 {snap['res_peak']:.2f}) · "
             f"이벤트 관문 {snap['gate']['state']}{' ' + snap['gate']['event'] if snap['gate']['event'] else ''}")
 
 

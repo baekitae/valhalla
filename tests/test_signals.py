@@ -481,13 +481,15 @@ def test_scenario_engine():
     vol = pd.Series(np.r_[np.full(100, 1e6), np.full(100, 9e6), np.full(100, 1e6)], index=idx)
     df = pd.DataFrame({"Open": close, "High": close * 1.01, "Low": close * 0.99, "Close": close, "Volume": vol})
     vr = core.volume_resistance(df, 33.0)
-    assert 45 < vr["resistance"] < 51           # 거래가 몰린 48 근처가 매물대
+    assert 47 < vr["resistance"] < 49            # 거래가 몰린 48 근처가 매물대 중심
+    assert vr["res_low"] < 48 < vr["res_high"] and vr["res_high"] - vr["res_low"] < 4   # 좁은 띠
     s = core.scenario_settings({})
     assert core.pick_scenario(33, 30, 8500, 8409, 48, 34, 70)[0] == "B"
     assert core.pick_scenario(29, 30, 8500, 8409, 48, 34, 70)[0] == "A"
     assert core.pick_scenario(33, 30, 8300, 8409, 48, 34, 70)[0] == "A"
     assert core.pick_scenario(50, 30, 9000, 8409, 48, 49, 70)[0] == "C"
     assert core.pick_scenario(50, 30, 9000, 8409, 48, 46, 70)[0] == "B"   # 주간 종가 확인 전
+    assert "띠" in core.pick_scenario(47, 30, 9000, 8409, 48, 46, 70, 46.5)[1]
     assert core.pick_scenario(75, 30, 9900, 8409, 48, 74, 70)[0] == "D"
     cal = [("2026-12-10 04:00", "FOMC 금리 결정", "", True), ("2026-12-10 15:00", "TSMC 매출", "", False)]
     g = core.event_gate(pd.Timestamp("2026-12-09 10:00"), 24, 12, cal)

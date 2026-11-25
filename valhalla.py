@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-12"
+REQUIRED_CORE_VERSION = "2026.11.25-13"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1113,12 +1113,17 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
     c = st.columns(4)
     c[0].metric("지금 시나리오", core.SCENARIO_NAMES[code], border=True)
     c[1].metric("SOXL", f"${snap['price']:.2f}", f"최근 저점 ${snap['low']:.2f}", delta_color="off", delta_arrow="off", border=True)
-    c[2].metric("매물대 (저항)", f"${snap['resistance']:.2f}" if pd.notna(snap["resistance"]) else "—",
-                f"+{(snap['resistance'] / snap['price'] - 1) * 100:.0f}% 위" if pd.notna(snap["resistance"]) else None,
+    c[2].metric("매물대 띠 (저항)", f"${snap['res_low']:.2f}~{snap['resistance']:.2f}" if pd.notna(snap["resistance"]) else "—",
+                f"아래쪽까지 +{(snap['res_low'] / snap['price'] - 1) * 100:.0f}%" if pd.notna(snap["res_low"]) else None,
                 delta_color="off", delta_arrow="off", border=True)
     c[3].metric("탈출 목표", f"${float(s['exit_target']):.0f}", f"+{snap['exit_gap']:.0f}% 필요", delta_color="off",
                 delta_arrow="off", border=True)
     st.markdown(f"**판정 이유:** {snap['why']}")
+    sb_ = snap["sup_band"]
+    st.caption(f"매물대 띠 = 최근 1년 가격대별 거래량이 가장 두꺼운 구간 (중심 ${snap['res_peak']:.2f}). 띠 아래쪽부터 물량이 나오고, "
+               f"주간 종가가 띠 위쪽을 넘어야 C로 판정해요."
+               + (f" 아래 지지 띠는 ${sb_[0]:.2f}~{sb_[1]:.2f}." if pd.notna(sb_[0]) else "")
+               if pd.notna(snap["res_peak"]) else "매물대를 계산하지 못했어요.")
 
     left, right = st.columns([1.1, 1])
     with left:
@@ -1150,8 +1155,10 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
         f = st.columns(3)
         ex = f[0].number_input("탈출 목표가 ($)", 1.0, 1000.0, float(s["exit_target"]), 1.0, key="sc_ex")
         tr = f[1].text_input("단계적 탈출 가격 (쉼표)", ", ".join(f"{x:g}" for x in s["tranches"]), key="sc_tr")
-        rs = f[2].number_input("매물대 직접 입력 ($, 0 = 자동)", 0.0, 1000.0, float(s["resistance"] or 0.0), 0.25, key="sc_rs",
-                               help=f"자동 계산값 ${snap['resistance_auto']:.2f} (최근 1년 가격대별 거래량)" if pd.notna(snap["resistance_auto"]) else None)
+        ab = snap["auto_band"]
+        rs = f[2].number_input("매물대 띠 아래쪽 직접 입력 ($, 0 = 자동)", 0.0, 1000.0, float(s["resistance"] or 0.0), 0.25, key="sc_rs",
+                               help=(f"자동 계산 띠 ${ab[0]:.2f}~{ab[1]:.2f} (최근 1년, 가격의 0.5% 단위, 하루 거래량을 저가~고가에 나눠 담음). "
+                                     "직접 넣으면 그 값이 띠 아래쪽, +3%가 위쪽이 돼요.") if pd.notna(ab[0]) else None)
         f = st.columns(3)
         cash = f[0].number_input("키움 계좌당 예수금 (원)", 0, 100_000_000, int(s["cash_per_account_krw"]), 50_000, key="sc_cash")
         rb = f[1].selectbox("12월 다시 사기 방식", ["미정", "전부", "절반"], ["미정", "전부", "절반"].index(s["rebuy"]), key="sc_rb")
