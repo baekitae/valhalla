@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-16"
+CORE_VERSION = "2026.11.25-17"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -1832,6 +1832,8 @@ ENSEMBLE_RULES = {"min_weeks": 20, "lookback": 26, "cap": 0.5, "shrink": 0.5}
 def player_label(pid: str) -> str:
     if pid.startswith("rule_v"):
         return f"규칙 {pid[5:]}"
+    if pid.startswith("agent_"):
+        return AGENT_PLAYERS.get(pid, {}).get("label") or f"🤖 AI 요원 {pid[6:]}위"
     return {**BASE_PLAYERS, **TECHNIQUE_PLAYERS, **LIVE_ONLY, **REBOUND_PLAYERS}.get(pid, pid)
 
 
@@ -2044,6 +2046,95 @@ def charles_exposure(daily: pd.DataFrame, sig_daily: pd.DataFrame | None, rules:
     return pd.Series(raw, index=close.index).shift(1).fillna(0.0)   # 신호 다음 날 종가 체결
 
 
+# ---- AI 요원 선수: 훈련된 유전자 그대로 (원칙을 덮어씌우지 않음) ----
+#  simulate()와 같은 규칙: t일 주문은 t-1일 지표로 결정, 지정가 매수(전일 종가×(1-할인)), 평단×(1+목표) 지정가 매도,
+#  1회분 = 예산 ÷ 분할 × 공포 매수배수(최대 3배), 분할 횟수·잔여 현금 한도. 매도하면 사이클 새로 시작.
+AGENT_PLAYERS: dict[str, dict] = {}
+
+
+def set_agents(models: list[dict], top: int = 3) -> None:
+    """앱·자동 점검이 DB의 요원(순위순)을 선수로 등록. pid = agent_<순위>."""
+    AGENT_PLAYERS.clear()
+    for m in sorted(models or [], key=lambda m: int(m.get("rank") or 99))[:top]:
+        r = int(m.get("rank") or 0)
+        AGENT_PLAYERS[f"agent_{r}"] = {"genes": pad_genes(m.get("genes") or []), "label": f"🤖 AI 요원 {r}위",
+                                       "ticker": str(m.get("ticker") or "SOXL").upper(),
+                                       "trained_at": m.get("trained_at"), "years": m.get("years")}
+
+
+def agents_for(ticker: str | None) -> dict[str, dict]:
+    return {k: v for k, v in AGENT_PLAYERS.items() if ticker and v["ticker"] == str(ticker).upper()}
+
+
+def agent_exposure(daily: pd.DataFrame, genes, start: str = TECHNIQUE_START, capital: float = 10_000.0,
+                   fee: float = _FEE) -> pd.Series:
+    """AI 요원 한 명의 날짜별 투자 비중(주식 평가액 ÷ 계좌 총액)."""
+    d = daily.dropna(subset=["Close"])
+    feats = compute_features(d["Close"], d["Volume"] if "Volume" in d else pd.Series(1.0, index=d.index))
+    o = (d["Open"] if "Open" in d else d["Close"]).fillna(d["Close"]).to_numpy(float)
+    h = (d["High"] if "High" in d else d["Close"]).fillna(d["Close"]).to_numpy(float)
+    l = (d["Low"] if "Low" in d else d["Close"]).fillna(d["Close"]).to_numpy(float)
+    c = d["Close"].to_numpy(float)
+    g = pad_genes(genes)
+    first = int(np.searchsorted(d.index.values, np.datetime64(pd.Timestamp(start))))
+    first = max(first, 21)
+    cash, qty, cost, buys = capital, 0.0, 0.0, 0
+    out = np.full(len(c), np.nan)
+    for t in range(first, len(c)):
+        p = {k: float(v[0]) for k, v in action_params(g, feats[t - 1]).items()}
+        sold = False
+        if qty > 1e-12:
+            target = cost / qty * (1 + p["target_r"] / 100)
+            if h[t] >= target:
+                cash += qty * max(target, o[t]) * (1 - fee)
+                qty = cost = 0.0
+                buys, sold = 0, True
+        limit = c[t - 1] * (1 - p["discount"] / 100)
+        amount = min(capital / p["split"] * p["buy_mult"], cash)
+        if not sold and buys < p["split"] and amount >= 1.0 and l[t] <= limit:
+            fill = min(limit, o[t])
+            qty += amount * (1 - fee) / fill
+            cost += amount
+            cash -= amount
+            buys += 1
+        eq = cash + qty * c[t]
+        out[t] = qty * c[t] / eq if eq > 0 else 0.0
+    return pd.Series(out, index=d.index)
+
+
+def agent_segments(meta: dict, today: pd.Timestamp | None = None) -> list[tuple[str, pd.Timestamp, pd.Timestamp]]:
+    """요원 성적을 나눠 볼 구간: 훈련 전(본 적 없는 과거) / 훈련에 쓴 기간 / 훈련 뒤(실전)."""
+    today = today or pd.Timestamp.today().normalize()
+    try:
+        tr = pd.Timestamp(meta.get("trained_at"))
+    except Exception:
+        tr = pd.NaT
+    if pd.isna(tr):
+        return [("전체", pd.Timestamp(TECHNIQUE_START), today)]
+    yrs = float(meta.get("years") or 5)
+    t0 = tr - pd.DateOffset(days=int(yrs * 365.25))
+    segs = [("훈련 전 (본 적 없는 과거)", pd.Timestamp(TECHNIQUE_START), t0), ("훈련에 쓴 기간", t0, tr)]
+    if today > tr:
+        segs.append(("훈련 뒤 (실전)", tr, today))
+    return segs
+
+
+def segment_compare(positions: pd.DataFrame, close: pd.Series, pids: list[str],
+                    segments: list[tuple[str, pd.Timestamp, pd.Timestamp]], fee_bps: float = 10) -> pd.DataFrame:
+    """같은 구간·같은 잣대(주별 비중 × 다음 주 수익률)로 선수 비교."""
+    rows = []
+    for name, a, b in segments:
+        m = (positions.index >= a) & (positions.index < b)
+        if m.sum() < 12:
+            continue
+        bt = backtest_players(positions.loc[m, [p for p in pids if p in positions]], close[m], test_weeks=0, fee_bps=fee_bps)
+        for _, r in bt.iterrows():
+            rows.append({"구간": f"{name} {a:%Y-%m}~{b:%Y-%m}", "선수": r["선수"], "id": r["id"],
+                         "누적(%)": r["전체 누적(%)"], "연평균(%)": r["연평균(%)"], "MDD(%)": r["전체 MDD(%)"],
+                         "칼마": r["칼마"], "평균 비중(%)": r["평균 비중(%)"], "주 수": r["주 수"]})
+    return pd.DataFrame(rows)
+
+
 def technique_positions(index: pd.DatetimeIndex, daily: pd.DataFrame,
                         ref_daily: pd.DataFrame | None = None) -> pd.DataFrame:
     """연구소 기법 4개 + 찰스 시스템의 주별 비중 (금요일 종가 시점의 투자 비중)."""
@@ -2054,6 +2145,14 @@ def technique_positions(index: pd.DatetimeIndex, daily: pd.DataFrame,
               "charles": charles_exposure(daily, ref_daily)}
     return pd.DataFrame({k: v.resample("W-FRI").last().reindex(index).round(4) for k, v in series.items()},
                         index=index)
+
+
+def agent_positions(index: pd.DatetimeIndex, daily: pd.DataFrame, ticker: str | None, weekly: bool = True) -> pd.DataFrame:
+    out = {}
+    for pid, a in agents_for(ticker).items():
+        e = agent_exposure(daily, a["genes"])
+        out[pid] = (e.resample("W-FRI").last() if weekly else e).reindex(index).round(4)
+    return pd.DataFrame(out, index=index)
 
 
 def player_positions(hist: pd.DataFrame, daily: pd.DataFrame, ref_daily: pd.DataFrame | None,
@@ -2067,6 +2166,8 @@ def player_positions(hist: pd.DataFrame, daily: pd.DataFrame, ref_daily: pd.Data
     out["hold"] = 1.0
     if ticker is not None and category_of(ticker) in TECHNIQUE_CATEGORIES:
         out = out.join(technique_positions(hist.index, daily, ref_daily))
+    if agents_for(ticker):
+        out = out.join(agent_positions(hist.index, daily, ticker))
     return out
 
 
@@ -2162,6 +2263,8 @@ def daily_player_positions(daily: pd.DataFrame, ref_daily: pd.DataFrame | None, 
         out["inf_v2_safe"] = infinite_exposure(daily, star=True, quarter_cut=True, trend_filter=True).reindex(idx)
         out["rebal50"] = rebalance_exposure(daily).reindex(idx)
         out["charles"] = charles_exposure(daily, ref_daily).reindex(idx)
+    if agents_for(ticker):
+        out = out.join(agent_positions(idx, daily, ticker, weekly=False))
     return out.round(4)
 
 

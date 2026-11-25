@@ -512,3 +512,27 @@ def test_scenario_engine():
     assert snap["code"] in "ABCD" and len(snap["checks"]) >= 6
     gr = core.grade_scenarios(pd.Series({idx[100]: "B", idx[200]: "A"}), close)
     assert gr["맞음"].tolist() == [True, True]
+
+
+def test_agent_players():
+    import numpy as np
+    import pandas as pd
+    import valhalla_core as core
+    rng = np.random.default_rng(1)
+    idx = pd.bdate_range("2016-01-01", periods=900)
+    c = pd.Series(30 * np.exp(np.cumsum(rng.normal(0, 0.04, len(idx)))), index=idx)
+    d = pd.DataFrame({"Open": c, "High": c * 1.03, "Low": c * 0.97, "Close": c, "Volume": 1e6}, index=idx)
+    core.set_agents([{"rank": 1, "genes": core.DEFAULT_GENES, "ticker": "SOXL", "trained_at": "2018-06-01", "years": 1}])
+    assert core.player_label("agent_1") == "🤖 AI 요원 1위"
+    e = core.agent_exposure(d, core.DEFAULT_GENES)
+    assert e.dropna().between(0, 1).all() and e.dropna().max() > 0
+    hist = pd.DataFrame({"close": c.resample("W-FRI").last()})
+    wk = core.agent_positions(hist.index, d, "SOXL")
+    assert "agent_1" in wk and wk["agent_1"].notna().sum() > 50
+    assert core.agent_positions(hist.index, d, "TQQQ").empty
+    pos = pd.DataFrame({"agent_1": wk["agent_1"], "hold": 1.0}, index=hist.index)
+    segs = core.agent_segments(core.AGENT_PLAYERS["agent_1"], pd.Timestamp("2019-06-01"))
+    assert [s_[0][:2] for s_ in segs] == ["훈련", "훈련", "훈련"]
+    cmp_ = core.segment_compare(pos, hist["close"], ["agent_1", "hold"], segs)
+    assert set(cmp_["id"]) == {"agent_1", "hold"} and cmp_["구간"].nunique() >= 2
+    core.set_agents([])

@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-16"
+REQUIRED_CORE_VERSION = "2026.11.25-17"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -2799,6 +2799,19 @@ def cached_player_positions(ticker: str, partner: str, rules_key: str) -> pd.Dat
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def cached_agent_compare(ticker: str, partner: str, rules_key: str, champ: str, agents_key: str,
+                         core_version: str = "") -> pd.DataFrame:
+    """AI 요원 vs 챔피언 vs 무한매수 원칙(① 40분할): 훈련 전·훈련 기간·훈련 뒤 구간별 같은 잣대."""
+    pos = cached_player_positions(ticker, partner, rules_key)
+    ags = core.agents_for(ticker)
+    if pos.empty or not ags:
+        return pd.DataFrame()
+    meta = next(iter(ags.values()))
+    pids = [champ, "inf_mine", *ags.keys()]
+    return core.segment_compare(pos.drop(columns=["close"]), pos["close"], pids, core.agent_segments(meta))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def cached_player_backtest(ticker: str, partner: str, rules_key: str, core_version: str = "") -> pd.DataFrame:
     pos = cached_player_positions(ticker, partner, rules_key)
     if pos.empty:
@@ -3150,6 +3163,25 @@ def render_arena(ticker: str, partner: str) -> None:
                             if better else " 최근 2년(학습에 안 쓴 구간)에서는 대표 규칙보다 확실히 낫지 않아요. 아직 올릴 근거가 부족해요.")
                 st.caption("🧪 실험 v3는 과거 성적 비교 전용이라 실전 장부·경기장 순위·앙상블에는 들어가지 않아요." + note)
             st.caption("모든 선수가 같은 자금, 이번 주 비중 × 다음 주 수익률, 거래 비용 0.1%로 계산했어요.")
+        if core.agents_for(ticker):
+            champ_pid = load_champion_state(backend())["champion"]["player"]
+            ags = core.agents_for(ticker)
+            akey = json.dumps({k: v["genes"] for k, v in ags.items()})
+            cmp_ = cached_agent_compare(ticker, partner, json.dumps([[v, r] for v, r in rules]), champ_pid, akey,
+                                        core.CORE_VERSION)
+            st.markdown(f"**🤖 AI 요원 vs 👑 {core.player_label(champ_pid)} vs 무한매수 원칙 · 구간별 대결**")
+            if cmp_.empty:
+                st.caption("비교할 데이터가 부족해요.")
+            else:
+                st.dataframe(cmp_.drop(columns=["id"]), hide_index=True, width="stretch",
+                             column_config={c: st.column_config.NumberColumn(format="%+.1f%%")
+                                            for c in ("누적(%)", "연평균(%)", "MDD(%)")} |
+                                           {"칼마": st.column_config.NumberColumn(format="%.2f")})
+                meta = next(iter(ags.values()))
+                st.caption(f"요원은 {meta.get('trained_at') or '—'}에 최근 {meta.get('years') or '?'}년 차트로 훈련됐어요. "
+                           "'훈련에 쓴 기간' 성적은 시험 문제를 미리 본 셈이라 부풀려져 있어요. 진짜 실력은 '훈련 전(본 적 없는 과거)'과 "
+                           "'훈련 뒤(실전)' 구간으로 보세요. 무한매수 원칙 = ① 40분할·평단 +10%(하루 1회분 고정). "
+                           "요원은 유전자 그대로(분할·공포 매수배수 최대 3배·지정가·익절을 스스로 결정). 셋 다 같은 자금으로 계산.")
         st.markdown("**일봉 리그 과거 성적 · 모든 선수를 매일 판단하면? (주봉 규칙과 비교)**")
         dvw = cached_daily_vs_weekly(ticker, partner, json.dumps([[v, r] for v, r in rules]),
                                      f"{us_asof():%Y-%m-%d}", core.CORE_VERSION)
@@ -3633,6 +3665,10 @@ def main() -> None:
                          "계좌 · 원칙": [PAGES["principles"], PAGES["ledger"]],
                          "연구 · 관리": [PAGES["research"], PAGES["journal"]],
                          "보관함": [PAGES["league"], PAGES["training"], PAGES["validation"]]})
+    try:
+        core.set_agents(load_models())          # AI 요원을 선수 경기장 선수로 등록 (유전자 그대로)
+    except Exception:
+        LOGGER.exception("요원 선수 등록 실패")
     render_sidebar()
     show_flash()
     nav.run()

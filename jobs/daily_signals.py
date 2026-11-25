@@ -95,7 +95,32 @@ def _jsonable(x):
     return x
 
 
+def load_agents(sb) -> list[dict]:
+    """AI 요원(valhalla_ai_models)을 읽어 선수로 등록할 형태로."""
+    import json
+    import re
+    out = []
+    try:
+        rows = sb.table("valhalla_ai_models").select("*").execute().data or []
+    except Exception:
+        traceback.print_exc()
+        return out
+    for i, r in enumerate(rows):
+        v = r.get("genes")
+        try:
+            for _ in range(2):
+                if isinstance(v, str):
+                    v = json.loads(v)
+            meta = v if isinstance(v, dict) else {"genes": v}
+            m = re.search(r"Rank_(\d+)", str(r.get("agent_name")))
+            out.append({**meta, "rank": int(meta.get("rank") or (m.group(1) if m else i + 1))})
+        except Exception:
+            continue
+    return out
+
+
 def run(sb, fetch=download) -> str:
+    core.set_agents(load_agents(sb))
     macro = {t: fetch(t, False) for t in core.MACRO_TICKERS_SIGNAL.values()}
     lines = []
     partners: dict[str, pd.DataFrame | None] = {}
@@ -150,7 +175,7 @@ def run(sb, fetch=download) -> str:
         traceback.print_exc()
     lines.append(f"규칙 v{rule_version} · {len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
     lines.append("경쟁 " + " vs ".join(f"v{v}" for v, _ in contenders) + f" · 새 실전 신호 {live_new}건")
-    lines.append(f"일봉 리그 새 기록 {daily_new}건")
+    lines.append(f"일봉 리그 새 기록 {daily_new}건 · 요원 선수 {len(core.AGENT_PLAYERS)}명")
     if share is not None:
         lines.append(f"검증 구간에서 평소보다 나은 종목 {share:.0f}%")
     if failed:
