@@ -434,3 +434,14 @@ def test_harvest_rebalancing():
     o = core.harvest_orders(hold, {"A": 10.0, "B": 10.0, "OLD": 50.0}, {"A": 0.4, "B": 0.4, "CASH": 0.2},
                             cash=0, new_cash=200).set_index("종목")
     assert o.loc["A", "주문"] == "매도" and o.loc["B", "주문"] == "매수" and o.loc["OLD", "주문"] == "유지"
+
+
+def test_portfolio_method_champion():
+    idx = pd.date_range("2026-11-27", periods=60, freq="W-FRI")
+    curves = pd.DataFrame({"pf_harvest": np.linspace(1, 1.1, 60), "pf_month": np.linspace(1, 1.3, 60),
+                           "bm_soxl": np.linspace(1, 2, 60)}, index=idx)
+    v = core.portfolio_verdicts(curves, "pf_harvest")
+    assert v["pf_month"][0] == "promote" and "bm_soxl" not in v
+    short = core.portfolio_verdicts(curves.iloc[:10], "pf_harvest")
+    assert short["pf_month"][0] == "short"
+    assert core.PORTFOLIO_MODE[core.PORTFOLIO_CHAMPION] == "수익 실현형"

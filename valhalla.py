@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-9"
+REQUIRED_CORE_VERSION = "2026.11.25-10"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1134,8 +1134,11 @@ def page_portfolio() -> None:
 
     section("리밸런싱 제안", "많이 오른 종목은 일부 팔아 현금으로 챙기고, 많이 떨어진 종목은 그 현금으로 다시 사는 방식이 기본이에요. "
                          "토스는 소수점 매매가 돼서 주식 수를 소수로 보여줘요.")
-    mode = st.segmented_control("방식", ["수익 실현형", "새 돈으로만", "목표에 정확히"], default="수익 실현형",
-                                key="pf_mode") or "수익 실현형"
+    champ = settings.get("champion", core.PORTFOLIO_CHAMPION)
+    st.markdown(f"👑 **지금 쓰는 리밸런싱 방식: {core.PORTFOLIO_PLAYERS[champ]}** · {core.PORTFOLIO_TIMING[champ]}")
+    default_mode = core.PORTFOLIO_MODE.get(champ, "수익 실현형")
+    mode = st.segmented_control("주문 계산 방식", ["수익 실현형", "새 돈으로만", "목표에 정확히"], default=default_mode,
+                                key="pf_mode") or default_mode
     c = st.columns(4)
     cash_krw = c[0].number_input("계좌의 현금 (원)", min_value=0, value=int(settings.get("cash_krw", 0) or 0), step=10000,
                                  key="pf_cash")
@@ -1178,10 +1181,33 @@ def page_portfolio() -> None:
     section("포트폴리오 선수 · 리밸런싱 선수 성적",
             f"{core.PORTFOLIO_START[:4]}년부터 매주 금요일에 위 규칙대로 했다면? 같은 목표 비중을 리밸런싱 방식만 바꿔 비교해요. "
             f"실전 기록은 {core.PORTFOLIO_LIVE_START}부터 이어서 쌓여요.")
-    tbl = lab["table"].sort_values("칼마", ascending=False)
+    tbl = lab["table"].sort_values("칼마", ascending=False).copy()
+    verdicts = core.portfolio_verdicts(lab["curves"], champ)
+    tbl["선수"] = [("👑 " if i == champ else "") + n for i, n in zip(tbl["id"], tbl["선수"])]
+    tbl["교체 판정"] = [("현재 방식" if i == champ else "기준선" if i.startswith("bm_") else verdicts.get(i, ("short", "—"))[1])
+                    for i in tbl["id"]]
     st.dataframe(tbl.drop(columns=["id"]), hide_index=True, width="stretch",
-                 column_config={c_: st.column_config.NumberColumn(format="%+.1f%%")
-                                for c_ in ("연평균(%)", "최대 낙폭(%)", "최근 2년(%)", "실전(%)")})
+                 column_config={**{c_: st.column_config.NumberColumn(format="%+.1f%%")
+                                   for c_ in ("연평균(%)", "최대 낙폭(%)", "최근 2년(%)", "실전(%)")},
+                                "교체 판정": st.column_config.TextColumn(width="large")})
+    th_ = core.PORTFOLIO_PROMOTE
+    st.caption(f"교체 기준: {core.PORTFOLIO_LIVE_START}부터의 실전 기록만으로, {th_['weeks']}주 이상 지나고 칼마가 지금 방식보다 높고 "
+               f"최대 낙폭이 {th_['mdd_slack']:.0f}%p 넘게 나쁘지 않으면 '교체 추천'. 바꿀지는 직접 결정해요. 과거 성적은 참고만 해요.")
+    for pid, (code, text) in verdicts.items():
+        if code != "promote":
+            continue
+        cc = st.columns([3, 1], vertical_alignment="center")
+        cc[0].success(f"**{core.PORTFOLIO_PLAYERS[pid]}** — {text}", icon=":material/emoji_events:")
+        if cc[1].button("이 방식으로 바꾸기", key=f"pf_crown_{pid}", type="primary", width="stretch") and backend() == "supabase":
+            hist_ = list(settings.get("champion_history") or [])
+            hist_.append({"from": champ, "to": pid, "at": f"{now_kst():%Y-%m-%d %H:%M}", "why": text})
+            save_portfolio_settings({**settings, "champion": pid, "champion_history": hist_})
+            st.rerun()
+    if settings.get("champion_history"):
+        with st.expander("방식 교체 이력"):
+            st.dataframe(pd.DataFrame([{"날짜": h["at"], "이전": core.PORTFOLIO_PLAYERS.get(h["from"], h["from"]),
+                                        "새 방식": core.PORTFOLIO_PLAYERS.get(h["to"], h["to"]), "이유": h["why"]}
+                                       for h in settings["champion_history"]]), hide_index=True, width="stretch")
     curves = lab["curves"]
     fig = go.Figure()
     for i, pid in enumerate(curves.columns):

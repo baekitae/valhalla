@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-9"
+CORE_VERSION = "2026.11.25-10"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -3020,6 +3020,54 @@ def harvest_orders(holdings: pd.DataFrame, prices: dict[str, float], target: dic
                  "목표 비중(%)": round(target.get("CASH", 0.0) * 100, 1), "주문": "",
                  "금액($)": round(left, 2), "주식 수": np.nan, "이유": "주문 뒤 남는 현금"})
     return pd.DataFrame(rows)
+
+
+PORTFOLIO_CHAMPION = "pf_harvest"
+PORTFOLIO_PROMOTE = {"weeks": 52, "mdd_slack": 5.0}
+PORTFOLIO_MODE = {"pf_harvest": "수익 실현형", "pf_month": "목표에 정확히", "pf_week": "목표에 정확히",
+                  "pf_band": "목표에 정확히", "pf_none": "목표에 정확히", "pf_trend": "목표에 정확히"}
+PORTFOLIO_TIMING = {"pf_harvest": "매주 확인: 목표보다 많이 커진 종목만 팔고, 많이 작아진 종목만 다시 삼",
+                    "pf_month": "매달 첫 금요일에 목표 비중으로 맞춤 (그 사이엔 테마가 바뀐 칸만 교체)",
+                    "pf_week": "매주 금요일 목표 비중으로 맞춤", "pf_band": "어느 종목이든 목표와 5%p 넘게 벌어지면 전체를 맞춤",
+                    "pf_none": "테마가 바뀐 칸만 교체, 나머지는 그대로", "pf_trend": "매달 맞추되 200일선 아래 테마는 현금"}
+
+
+def portfolio_verdicts(curves: pd.DataFrame, champion: str, live_start: str = PORTFOLIO_LIVE_START,
+                       th: dict | None = None) -> dict[str, tuple[str, str]]:
+    """리밸런싱 방식 교체 판정: 실전 기간(live_start 이후)만으로 챔피언과 비교.
+    52주 이상 + 칼마가 더 높고 + 최대 낙폭이 5%p 넘게 나쁘지 않으면 '교체 추천'."""
+    th = {**PORTFOLIO_PROMOTE, **(th or {})}
+    live = curves[curves.index >= pd.Timestamp(live_start)]
+    out = {}
+    if champion not in live.columns:
+        return out
+    weeks = len(live) - 1
+
+    def stat(v):
+        v = v.dropna()
+        if len(v) < 3:
+            return np.nan, np.nan, np.nan
+        yrs = (len(v) - 1) / 52
+        cagr = (v.iloc[-1] / v.iloc[0]) ** (1 / yrs) - 1 if yrs > 0 else np.nan
+        mdd = float((v / v.cummax() - 1).min() * 100)
+        cal = cagr * 100 / abs(mdd) if mdd < 0 else (np.inf if cagr > 0 else np.nan)
+        return cagr * 100, mdd, cal
+
+    c_cagr, c_mdd, c_cal = stat(live[champion])
+    for pid in live.columns:
+        if pid == champion or pid.startswith("bm_"):
+            continue
+        if weeks < th["weeks"]:
+            out[pid] = ("short", f"실전 {max(weeks, 0)}주 / 필요 {th['weeks']}주")
+            continue
+        cagr, mdd, cal = stat(live[pid])
+        detail = f"실전 칼마 {cal:.2f} vs {c_cal:.2f} · 낙폭 {mdd:.1f}% vs {c_mdd:.1f}%"
+        better = (cal > c_cal) or (np.isinf(cal) and np.isinf(c_cal) and cagr > c_cagr)
+        if pd.notna(cal) and pd.notna(c_cal) and better and mdd >= c_mdd - th["mdd_slack"]:
+            out[pid] = ("promote", "교체 추천 · " + detail)
+        else:
+            out[pid] = ("hold", "챔피언 유지 · " + detail)
+    return out
 
 
 def rebalance_orders(holdings: pd.DataFrame, prices: dict[str, float], target: dict[str, float],
