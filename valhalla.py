@@ -867,8 +867,19 @@ def page_dashboard() -> None:
         long = load_long(ticker, "5y", False)
         hist = long if long is not None else data
         cols = st.columns(min(len(models), 3))
+        prin = {**core.DEFAULT_PRINCIPLES, **load_settings(core.SETTINGS_KEY_PLAN, backend())}
+        cap_usd = float(prin["buy_max_krw"]) / fx_rate()
+        far = pos.qty > 0 and pos.avg > price * 2
+        if far:
+            st.warning(f"지금 매도 목표는 평단 ${pos.avg:,.2f} 기준이라 현재가 ${price:,.2f}에서 +{(pos.avg / price - 1) * 100:.0f}% 넘게 "
+                       "떨어져 있어요. 사이클을 새로 시작(12월 손실 실현 뒤 다시 사기)하기 전까지는 참고용이에요.",
+                       icon=":material/info:")
         for i, model in enumerate(models[:3]):
             plan = agent_plan(model, last, price, pos, budget_usd)
+            raw_amount = plan["amount"]
+            if raw_amount > cap_usd:
+                plan["amount"] = cap_usd
+                plan["status"] = (f"원칙 상한 적용 (요원 제안 {md_usd(raw_amount)} → 최대 {int(prin['buy_max_krw']):,}원)", "warn")
             prob, n_obs = core.touch_probability(hist["High"], hist["Close"],
                                                  (plan["target"] / price - 1) * 100, 20)
             with cols[i].container(border=True):
@@ -879,7 +890,7 @@ def page_dashboard() -> None:
                 m2.metric("20일 도달률", f"{prob:.0f}%" if np.isfinite(prob) else "—",
                           help=f"과거 {n_obs:,}개 시점 기준")
                 kv_rows([("매수 지정가", f"{md_usd(plan['limit'])} (−{plan['discount']:.1f}%)"),
-                         ("금일 투입", f"{md_usd(plan['amount'])} · 1회분 ×{plan['buy_mult']:.2f}"),
+                         ("금일 투입", f"{md_usd(plan['amount'])} (≈{plan['amount'] * fx_rate():,.0f}원) · 1회분 ×{plan['buy_mult']:.2f}"),
                          ("분할 / 진행", f"{plan['split']}분할 / {pos.buy_count}회"),
                          ("잔여 예산", md_usd(plan["remaining"]))])
                 st.markdown(pill(plan["status"][0], plan["status"][1]), unsafe_allow_html=True)
