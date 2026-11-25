@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-7"
+REQUIRED_CORE_VERSION = "2026.11.25-8"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1011,49 +1011,18 @@ def render_breakeven(ticker: str, journal_avg: float | None) -> None:
 def cached_portfolio_lab(rule_key: str, target_key: str, core_version: str = "") -> dict:
     """테마 순위 재현 → 주별 목표 비중 → 리밸런싱 방식별 시뮬레이션. 그날까지의 데이터만 사용."""
     rule = core.normalize_rules(json.loads(rule_key))
-    target = json.loads(target_key)
-    tickers = {"SOXL", "SPY"} | {base for base, _ in core.THEME_ETFS.values()} | {
-        t for _, levs in core.THEME_ETFS.values() for t, _ in levs}
     daily = {}
-    for t in sorted(tickers):
+    for t in core.PORTFOLIO_TICKERS:
         d = load_long(t, "max", True)
         if d is not None and not d.empty:
             daily[t] = d["Close"].dropna()
     if "SOXL" not in daily:
         return {}
     asof = us_asof()
-    weeks = pd.date_range(core.PORTFOLIO_START, asof, freq="W-FRI")
-    weeks = weeks[weeks <= asof]
-    ranks = core.theme_rank_history({th: daily[b] for th, (b, _) in core.THEME_ETFS.items() if b in daily}, weeks)
     hist = load_signal_history("SOXL", "SOXX")
     core_state = core.rule_positions(core.action_signals(core.complete_weeks(hist, asof), rule)) if hist is not None \
-        else pd.Series(1.0, index=weeks)
-    core_state = core_state.reindex(core_state.index.union(weeks)).ffill().reindex(weeks).fillna(1.0)
-    weekly = pd.DataFrame({t: s_.resample("W-FRI").last() for t, s_ in daily.items()}).reindex(weeks)
-    sched = core.theme_schedule(weeks, ranks)
-    th_of = {d: (sched.at[d, "lead"], sched.at[d, "rising"]) for d in weeks}
-    base_t = {d: core.portfolio_targets(d, ranks, daily, float(core_state.loc[d]), target, themes=th_of[d]) for d in weeks}
-    trend_t = {d: core.portfolio_targets(d, ranks, daily, float(core_state.loc[d]), target, trend=True, themes=th_of[d])
-               for d in weeks}
-    runs = {"pf_month": (base_t, "month"), "pf_week": (base_t, "week"), "pf_band": (base_t, "band"),
-            "pf_none": (base_t, "none"), "pf_trend": (trend_t, "month"),
-            "bm_soxl": ({d: {"SOXL": 1.0} for d in weeks}, "none"), "bm_spy": ({d: {"SPY": 1.0} for d in weeks}, "none")}
-    curves, rows = {}, []
-    for pid, (tg, pol) in runs.items():
-        sim = core.simulate_portfolio(weekly, tg, pol)
-        curves[pid] = sim["value"]
-        st_ = core.portfolio_stats(sim["value"], core.PORTFOLIO_LIVE_START)
-        rows.append({"id": pid, "선수": core.PORTFOLIO_PLAYERS[pid], **st_,
-                     "연 회전율(%)": round(float(sim["turnover"].sum() / max(len(sim) / 52, 1e-9) * 100), 0)})
-    last = weeks[-1]
-    lead, rising = th_of[last]
-    raw_lead, raw_rising = core.pick_themes(ranks["rank"].loc[last], ranks["rank_prev"].loc[last], ranks["above50"].loc[last])
-    return {"table": pd.DataFrame(rows), "curves": pd.DataFrame(curves), "week": last,
-            "base": base_t[last], "trend": trend_t[last], "lead": lead, "rising": rising,
-            "core_on": float(core_state.loc[last]),
-            "vehicles": {th: core.theme_vehicle(th, daily, last) for th in (lead, rising) if th},
-            "ranks": ranks["rank"].loc[last].dropna().sort_values(), "raw": (raw_lead, raw_rising),
-            "switches": int((sched["lead"] != sched["lead"].shift()).sum() + (sched["rising"] != sched["rising"].shift()).sum())}
+        else pd.Series(dtype=float)
+    return core.portfolio_lab(daily, core_state, asof, json.loads(target_key))
 
 
 @st.cache_data(ttl=60, show_spinner=False)

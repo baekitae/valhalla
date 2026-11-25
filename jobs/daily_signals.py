@@ -111,6 +111,11 @@ def run(sb, fetch=download) -> str:
     except Exception as exc:
         traceback.print_exc()
         lines.append(f"반등 판별전 실패: {exc}")
+    try:
+        lines.append(portfolio_summary(sb, fetch, asof, rules))
+    except Exception as exc:
+        traceback.print_exc()
+        lines.append(f"포트폴리오 점검 실패: {exc}")
     rep = pd.DataFrame(reports)
     share = float((rep["test_diff"].dropna() > 0).mean() * 100) if not rep.empty and rep["test_diff"].notna().any() else None
     lines.append(f"규칙 v{rule_version} · {len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
@@ -121,6 +126,26 @@ def run(sb, fetch=download) -> str:
     if failed:
         lines.append("실패: " + ", ".join(failed[:10]))
     return " / ".join(lines)
+
+
+def portfolio_summary(sb, fetch, asof, rule) -> str:
+    """토스 포트폴리오 선수·리밸런싱 선수를 실제 시세로 계산해 요약 한 줄."""
+    daily = {}
+    for t in core.PORTFOLIO_TICKERS:
+        d = fetch(t, True)
+        if d is not None and not d.empty:
+            daily[t] = d["Close"].dropna()
+    soxl = fetch("SOXL", True)
+    soxx = fetch("SOXX", True)
+    macro = {t: fetch(t, False) for t in core.MACRO_TICKERS_SIGNAL.values()}
+    hist = core.complete_weeks(core.build_signal_history(soxl, soxx, macro), asof)
+    lab = core.portfolio_lab(daily, core.rule_positions(core.action_signals(hist, rule)), asof)
+    t = lab["table"].set_index("id")
+    tg = ", ".join(f"{k} {v * 100:.0f}%" for k, v in sorted(lab["base"].items(), key=lambda x: -x[1]))
+    parts = [f"{t.loc[p, '선수']} 연 {t.loc[p, '연평균(%)']}%·MDD {t.loc[p, '최대 낙폭(%)']}%·칼마 {t.loc[p, '칼마']}·회전 {t.loc[p, '연 회전율(%)']:.0f}%"
+             for p in ("pf_month", "pf_week", "pf_band", "pf_none", "pf_trend", "bm_soxl", "bm_spy")]
+    return (f"포트폴리오 {lab['week']:%m/%d} 주도 {lab['lead']}·떠오르는 {lab['rising']} (순위만 보면 {lab['raw'][0]}·{lab['raw'][1]}) "
+            f"테마 교체 {lab['switches']}번 · 목표 {tg} · " + " | ".join(parts))
 
 
 def update_rebounds(sb, fetch, asof) -> str:

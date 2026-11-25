@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-7"
+CORE_VERSION = "2026.11.25-8"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -2899,6 +2899,43 @@ def portfolio_stats(value: pd.Series, live_start: str | None = None) -> dict:
         lv = v[v.index >= pd.Timestamp(live_start)]
         out["실전(%)"] = round(float((lv.iloc[-1] / lv.iloc[0] - 1) * 100), 2) if len(lv) > 1 else np.nan
     return out
+
+
+PORTFOLIO_TICKERS = sorted({"SOXL", "SPY"} | {b for b, _ in THEME_ETFS.values()} |
+                           {t for _, levs in THEME_ETFS.values() for t, _ in levs})
+
+
+def portfolio_lab(daily: dict[str, pd.Series], core_state: pd.Series, asof: pd.Timestamp,
+                  target: dict | None = None) -> dict:
+    """테마 순위 재현 → 유지 규칙 → 주별 목표 비중 → 선수별 시뮬레이션. daily = {티커: 일별 종가}."""
+    weeks = pd.date_range(PORTFOLIO_START, asof, freq="W-FRI")
+    weeks = weeks[weeks <= asof]
+    ranks = theme_rank_history({th: daily[b] for th, (b, _) in THEME_ETFS.items() if b in daily}, weeks)
+    cs = core_state.reindex(core_state.index.union(weeks)).ffill().reindex(weeks).fillna(1.0)
+    weekly = pd.DataFrame({t: s_.resample("W-FRI").last() for t, s_ in daily.items()}).reindex(weeks)
+    sched = theme_schedule(weeks, ranks)
+    th_of = {d: (sched.at[d, "lead"], sched.at[d, "rising"]) for d in weeks}
+    base_t = {d: portfolio_targets(d, ranks, daily, float(cs.loc[d]), target, themes=th_of[d]) for d in weeks}
+    trend_t = {d: portfolio_targets(d, ranks, daily, float(cs.loc[d]), target, trend=True, themes=th_of[d])
+               for d in weeks}
+    runs = {"pf_month": (base_t, "month"), "pf_week": (base_t, "week"), "pf_band": (base_t, "band"),
+            "pf_none": (base_t, "none"), "pf_trend": (trend_t, "month"),
+            "bm_soxl": ({d: {"SOXL": 1.0} for d in weeks}, "none"), "bm_spy": ({d: {"SPY": 1.0} for d in weeks}, "none")}
+    curves, rows = {}, []
+    for pid, (tg, pol) in runs.items():
+        sim = simulate_portfolio(weekly, tg, pol)
+        curves[pid] = sim["value"]
+        rows.append({"id": pid, "선수": PORTFOLIO_PLAYERS[pid], **portfolio_stats(sim["value"], PORTFOLIO_LIVE_START),
+                     "연 회전율(%)": round(float(sim["turnover"].sum() / max(len(sim) / 52, 1e-9) * 100), 0)})
+    last = weeks[-1]
+    lead, rising = th_of[last]
+    raw = pick_themes(ranks["rank"].loc[last], ranks["rank_prev"].loc[last], ranks["above50"].loc[last])
+    return {"table": pd.DataFrame(rows), "curves": pd.DataFrame(curves), "week": last,
+            "base": base_t[last], "trend": trend_t[last], "lead": lead, "rising": rising, "raw": raw,
+            "core_on": float(cs.loc[last]),
+            "vehicles": {th: theme_vehicle(th, daily, last) for th in (lead, rising) if th},
+            "ranks": ranks["rank"].loc[last].dropna().sort_values(),
+            "switches": int((sched["lead"] != sched["lead"].shift()).sum() + (sched["rising"] != sched["rising"].shift()).sum())}
 
 
 def rebalance_orders(holdings: pd.DataFrame, prices: dict[str, float], target: dict[str, float],
