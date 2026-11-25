@@ -2140,7 +2140,7 @@ def page_training() -> None:
     ok = c1.checkbox(f"{len(chosen)}명 배치 · 기존 요원 교체와 AI 장부 초기화에 동의합니다.", key="deploy_ok")
     if c2.button(f"{len(chosen)}명 배치", type="primary", disabled=not ok, icon=":material/rocket_launch:", width="stretch"):
         models = [{"name": f"Agent_Rank_{i + 1} ({result['ticker']})", "rank": i + 1, "genes": r["genes"],
-                   "ticker": result["ticker"], "trained_at": result["trained_at"],
+                   "ticker": result["ticker"], "trained_at": result["trained_at"], "years": result.get("years"),
                    "train_ret": round(r["train_ret"], 2), "test_ret": round(r["test_ret"], 2),
                    "test_mdd": round(r["test_mdd"], 2), "passed": r["passed"],
                    "league_ticker": result["ticker"], "league_start": today_kst().isoformat(),
@@ -3178,7 +3178,8 @@ def render_arena(ticker: str, partner: str) -> None:
                                             for c in ("누적(%)", "연평균(%)", "MDD(%)")} |
                                            {"칼마": st.column_config.NumberColumn(format="%.2f")})
                 meta = next(iter(ags.values()))
-                st.caption(f"요원은 {meta.get('trained_at') or '—'}에 최근 {meta.get('years') or '?'}년 차트로 훈련됐어요. "
+                yrs_txt = f"최근 {meta['years']}년" if meta.get("years") else "최근 몇 년인지 기록이 없어 가장 긴 5년으로 가정한"
+                st.caption(f"요원은 {meta.get('trained_at') or '—'}에 {yrs_txt} 차트로 훈련됐어요. "
                            "'훈련에 쓴 기간' 성적은 시험 문제를 미리 본 셈이라 부풀려져 있어요. 진짜 실력은 '훈련 전(본 적 없는 과거)'과 "
                            "'훈련 뒤(실전)' 구간으로 보세요. 무한매수 원칙 = ① 40분할·평단 +10%(하루 1회분 고정). "
                            "요원은 유전자 그대로(분할·공포 매수배수 최대 3배·지정가·익절을 스스로 결정). 셋 다 같은 자금으로 계산.")

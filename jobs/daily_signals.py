@@ -161,6 +161,19 @@ def run(sb, fetch=download) -> str:
         traceback.print_exc()
         lines.append(f"포트폴리오 점검 실패: {exc}")
     try:
+        if core.agents_for("SOXL"):
+            soxl, soxx = fetch("SOXL", True), fetch("SOXX", True)
+            hist = core.complete_weeks(core.build_signal_history(soxl, soxx, macro), asof)
+            pos = core.player_positions(hist, soxl, soxx, contenders, "SOXL")
+            meta = next(iter(core.agents_for("SOXL").values()))
+            cmp_ = core.segment_compare(pos, hist["close"], [f"rule_v{rule_version}", "inf_mine", *core.agents_for("SOXL")],
+                                        core.agent_segments(meta))
+            lines.append("요원 대결 " + " | ".join(f"{r['구간'][:6]} {r['선수']} 연{r['연평균(%)']}% MDD{r['MDD(%)']}% 칼마{r['칼마']}"
+                                                  for _, r in cmp_.iterrows()))
+    except Exception as exc:
+        traceback.print_exc()
+        lines.append(f"요원 대결 실패: {exc}")
+    try:
         lines.append(update_scenario(sb, fetch, asof, rules))
     except Exception as exc:
         traceback.print_exc()
