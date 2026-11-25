@@ -771,8 +771,19 @@ def page_dashboard() -> None:
     first_date = dt.date.fromisoformat(valid_dates.min()) if not valid_dates.empty else today_kst()
     since = top[2].date_input("집계 시작일", value=first_date, key=f"since_{ticker}",
                               help="이 날짜 이후 체결로 평단을 계산합니다. 전량 매도하면 사이클은 자동으로 새로 시작됩니다.")
-    budget_krw = top[3].number_input("총 작전 예산 (₩)", min_value=1_000_000, value=10_000_000,
-                                     step=1_000_000, format="%d", key="budget_krw")
+    _plan = load_settings(core.SETTINGS_KEY_PLAN, backend())
+    _saved = int((_plan.get("agent_budget") or {}).get(ticker, 10_000_000))
+
+    def _save_budget():
+        if backend() == "supabase":
+            cur = load_settings(core.SETTINGS_KEY_PLAN, backend())
+            save_settings(core.SETTINGS_KEY_PLAN, {**cur, "agent_budget": {**(cur.get("agent_budget") or {}),
+                                                                           ticker: int(st.session_state[f"budget_krw_{ticker}"])}})
+
+    budget_krw = top[3].number_input("총 작전 예산 (₩)", min_value=100_000, value=_saved, step=100_000, format="%d",
+                                     key=f"budget_krw_{ticker}", on_change=_save_budget,
+                                     help="고른 계좌들에 이번 사이클에 쓸 돈 전체(이미 산 금액 + 남은 현금). 바꾸면 저장돼요. "
+                                          "그 안에서 언제·얼마를 살지는 AI 요원이 정해요.")
     budget_usd = budget_krw / fx_rate()
 
     data = load_recent(ticker)
@@ -876,10 +887,7 @@ def page_dashboard() -> None:
                        icon=":material/info:")
         for i, model in enumerate(models[:3]):
             plan = agent_plan(model, last, price, pos, budget_usd)
-            raw_amount = plan["amount"]
-            if raw_amount > cap_usd:
-                plan["amount"] = cap_usd
-                plan["status"] = (f"원칙 상한 적용 (요원 제안 {md_usd(raw_amount)} → 최대 {int(prin['buy_max_krw']):,}원)", "warn")
+            over_rule = plan["amount"] > cap_usd
             prob, n_obs = core.touch_probability(hist["High"], hist["Close"],
                                                  (plan["target"] / price - 1) * 100, 20)
             with cols[i].container(border=True):
@@ -894,6 +902,9 @@ def page_dashboard() -> None:
                          ("분할 / 진행", f"{plan['split']}분할 / {pos.buy_count}회"),
                          ("잔여 예산", md_usd(plan["remaining"]))])
                 st.markdown(pill(plan["status"][0], plan["status"][1]), unsafe_allow_html=True)
+                if over_rule:
+                    st.caption(f"요원 판단(1회분 ×{plan['buy_mult']:.2f})으로 오늘은 하루 원칙 {int(prin['buy_max_krw']):,}원보다 많이 사요. "
+                               "총예산 안에서 요원이 배분한 금액이에요.")
                 with st.popover("유전자 보기", icon=":material/genetics:", width="stretch"):
                     st.dataframe(pd.DataFrame({"항목": core.GENE_NAMES, "값": model["genes"]}),
                                  hide_index=True, column_config={"값": st.column_config.NumberColumn(format="%.3f")})
