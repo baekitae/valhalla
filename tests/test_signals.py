@@ -418,3 +418,19 @@ def test_theme_schedule_holds():
     ranks = {"rank": rk, "rank_prev": rk.shift(1).fillna(rk), "above50": rk.notna()}
     sch = core.theme_schedule(weeks, ranks)
     assert sch["lead"].nunique() == 1                      # 5위 안이면 주도 테마 유지
+
+
+def test_harvest_rebalancing():
+    wk = pd.DataFrame({"A": [10, 15, 15, 9, 9.0], "B": [10, 10, 10, 10, 10.0]},
+                      index=pd.date_range("2020-01-03", periods=5, freq="W-FRI"))
+    t = {d: core.with_cash_buffer({"A": 0.5, "B": 0.5}, 0.2) for d in wk.index}
+    assert abs(t[wk.index[0]]["CASH"] - 0.2) < 1e-9 and abs(t[wk.index[0]]["A"] - 0.4) < 1e-9
+    sim = core.simulate_portfolio(wk, t, "harvest", band=0.25)
+    w1 = sim["weights"].iloc[1]
+    assert abs(w1["A"] - 0.4) < 1e-9 and w1["CASH"] > 0.2          # A가 50% 올라 초과분을 현금화
+    w3 = sim["weights"].iloc[3]
+    assert w3["A"] >= 0.4 - 1e-9                                       # 40% 떨어진 뒤 현금으로 다시 채움
+    hold = pd.DataFrame({"ticker": ["A", "OLD"], "shares": [100.0, 1.0]})
+    o = core.harvest_orders(hold, {"A": 10.0, "B": 10.0, "OLD": 50.0}, {"A": 0.4, "B": 0.4, "CASH": 0.2},
+                            cash=0, new_cash=200).set_index("종목")
+    assert o.loc["A", "주문"] == "매도" and o.loc["B", "주문"] == "매수" and o.loc["OLD", "주문"] == "유지"

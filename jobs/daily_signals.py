@@ -143,7 +143,7 @@ def portfolio_summary(sb, fetch, asof, rule) -> str:
     t = lab["table"].set_index("id")
     tg = ", ".join(f"{k} {v * 100:.0f}%" for k, v in sorted(lab["base"].items(), key=lambda x: -x[1]))
     parts = [f"{t.loc[p, '선수']} 연 {t.loc[p, '연평균(%)']}%·MDD {t.loc[p, '최대 낙폭(%)']}%·칼마 {t.loc[p, '칼마']}·회전 {t.loc[p, '연 회전율(%)']:.0f}%"
-             for p in ("pf_month", "pf_week", "pf_band", "pf_none", "pf_trend", "bm_soxl", "bm_spy")]
+             for p in ("pf_harvest", "pf_month", "pf_week", "pf_band", "pf_none", "pf_trend", "bm_soxl", "bm_spy")]
     return (f"포트폴리오 {lab['week']:%m/%d} 주도 {lab['lead']}·떠오르는 {lab['rising']} (순위만 보면 {lab['raw'][0]}·{lab['raw'][1]}) "
             f"테마 교체 {lab['switches']}번 · 목표 {tg} · " + " | ".join(parts))
 

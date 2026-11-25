@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-8"
+REQUIRED_CORE_VERSION = "2026.11.25-9"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1132,19 +1132,38 @@ def page_portfolio() -> None:
         st.dataframe(view.rename(columns={"ticker": "티커", "shares": "주식 수", "avg_price": "평균 단가"}),
                      hide_index=True, width="stretch")
 
-    section("리밸런싱 제안", "목표 포트폴리오에 맞추려면 무엇을 얼마나 사고팔지. 토스는 소수점 매매가 돼서 주식 수를 소수로 보여줘요.")
-    c = st.columns([1, 1])
-    new_krw = c[0].number_input("이번에 넣을 돈 (원, 주식 모으기·예수금)", min_value=0, value=int(settings.get("monthly_krw", 0) or 0),
+    section("리밸런싱 제안", "많이 오른 종목은 일부 팔아 현금으로 챙기고, 많이 떨어진 종목은 그 현금으로 다시 사는 방식이 기본이에요. "
+                         "토스는 소수점 매매가 돼서 주식 수를 소수로 보여줘요.")
+    mode = st.segmented_control("방식", ["수익 실현형", "새 돈으로만", "목표에 정확히"], default="수익 실현형",
+                                key="pf_mode") or "수익 실현형"
+    c = st.columns(4)
+    cash_krw = c[0].number_input("계좌의 현금 (원)", min_value=0, value=int(settings.get("cash_krw", 0) or 0), step=10000,
+                                 key="pf_cash")
+    new_krw = c[1].number_input("이번에 넣을 돈 (원)", min_value=0, value=int(settings.get("monthly_krw", 0) or 0),
                                 step=10000, key="pf_newcash")
-    buy_only = c[1].toggle("팔지 않고 새 돈으로만 맞추기", value=True, key="pf_buyonly",
-                           help="매도하면 해외주식 양도세 계산에 들어가요. 장기 계좌는 새 돈으로 천천히 맞추는 걸 기본으로 했어요.")
-    orders = core.rebalance_orders(edited.dropna(subset=["ticker"]).assign(ticker=lambda d: d["ticker"].str.upper()),
-                                   prices, tgt, new_cash=new_krw / fx, buy_only=buy_only)
+    buf = c[2].slider("현금 완충 비율", 0, 50, int(settings.get("cash_buffer", core.HARVEST["cash"]) * 100), 5,
+                      key="pf_buf", help="수익 실현형에서 떨어질 때 다시 살 돈으로 늘 남겨 두는 현금 비율", format="%d%%")
+    band = c[3].slider("매매 기준 (목표 대비)", 10, 50, int(settings.get("band", core.HARVEST["band"]) * 100), 5,
+                       key="pf_band", help="목표 비중보다 이만큼(상대 %) 커지면 초과분을 팔고, 이만큼 작아지면 다시 사요",
+                       format="±%d%%")
+    if st.button("이 설정 저장", key="pf_save_reb") and backend() == "supabase":
+        save_portfolio_settings({**settings, "cash_krw": cash_krw, "monthly_krw": new_krw,
+                                 "cash_buffer": buf / 100, "band": band / 100})
+        st.rerun()
+    hold_now = edited.dropna(subset=["ticker"]).assign(ticker=lambda d: d["ticker"].str.upper())
+    if mode == "수익 실현형":
+        tgt_h = core.with_cash_buffer({k: v for k, v in tgt.items()}, buf / 100)
+        orders = core.harvest_orders(hold_now, prices, tgt_h, cash=cash_krw / fx, new_cash=new_krw / fx, band=band / 100)
+        st.caption(f"목표 비중에 현금 {buf}%를 남겨 두고, 각 종목이 목표보다 {band}% 넘게 커지면 초과분을 팔아 현금으로, "
+                   f"{band}% 넘게 작아지면 현금으로 다시 사요. 목표에 없는 기존 종목(예: 장기로 모은 종목)은 자동으로 팔지 않아요.")
+    else:
+        orders = core.rebalance_orders(hold_now, prices, tgt, new_cash=(cash_krw + new_krw) / fx,
+                                       buy_only=(mode == "새 돈으로만"))
     st.dataframe(orders, hide_index=True, width="stretch",
                  column_config={"금액($)": st.column_config.NumberColumn(format="$%.2f"),
                                 "지금 금액($)": st.column_config.NumberColumn(format="$%.2f")})
-    st.caption(f"환율 {fx:,.0f}원 기준. 제안일 뿐이고 실제 주문은 직접 판단해서 하세요. 손실 중인 종목을 팔면 그해 손실로 잡혀요 "
-               "(12월 손실 실현 계획과 함께 고려).")
+    st.caption(f"환율 {fx:,.0f}원 기준. 제안일 뿐이고 실제 주문은 직접 판단해서 하세요. 이익 난 종목을 팔면 해외주식 양도세(연 250만 원 공제 뒤 22%) "
+               "계산에 들어가고, 손실 종목을 팔면 그해 손실로 잡혀요(12월 손실 실현 계획과 함께 고려).")
 
     _, mins = load_arena(backend())
     pm = mins[mins["ticker"] == "PORTFOLIO"].sort_values("week") if not mins.empty else mins

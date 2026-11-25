@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-8"
+CORE_VERSION = "2026.11.25-9"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -2720,7 +2720,9 @@ PORTFOLIO_START = "2018-06-01"
 PORTFOLIO_LIVE_START = "2026-11-27"
 PORTFOLIO_TABLE = "valhalla_portfolio_holdings"
 PORTFOLIO_SETTINGS = "valhalla_portfolio_settings"
+HARVEST = {"cash": 0.20, "band": 0.25}
 PORTFOLIO_PLAYERS = {
+    "pf_harvest": "리밸런싱 · 수익 실현형 (오르면 팔아 현금, 떨어지면 다시 삼)",
     "pf_month": "포트폴리오 · 월간 리밸런싱", "pf_week": "리밸런싱 · 매주", "pf_band": "리밸런싱 · 밴드 ±5%p",
     "pf_none": "리밸런싱 · 안 함(테마 바뀔 때만)", "pf_trend": "포트폴리오 + 추세 필터 (월간)",
     "bm_soxl": "기준 · SOXL 그냥 보유", "bm_spy": "기준 · S&P500 그냥 보유",
@@ -2858,7 +2860,31 @@ def simulate_portfolio(weekly: pd.DataFrame, targets: dict[pd.Timestamp, dict], 
                 or (policy == "month" and d.month != prev_month)
                 or (policy == "band" and drift > band))
         before = dict(hold)
-        if full:
+        if policy == "harvest" and hold:
+            # 수익 실현형: 목표보다 band(상대 25%) 넘게 커진 종목은 초과분을 팔아 현금으로,
+            # 목표보다 band 넘게 작아진 종목은 현금으로 목표까지 다시 삼 (현금이 모자라면 있는 만큼)
+            removed = {k: w for k, w in hold.items() if k not in tgt}
+            if removed:          # 테마·핵심 상태 교체는 그 칸만 바꿈
+                freed = sum(removed.values())
+                hold = {k: w for k, w in hold.items() if k in tgt}
+                added = [k for k in tgt if k not in hold and k != "CASH"]
+                tw = sum(tgt[k] for k in added)
+                for k in added:
+                    hold[k] = freed * tgt[k] / tw
+                if not added:
+                    hold["CASH"] = hold.get("CASH", 0.0) + freed
+            for k in [k for k in tgt if k != "CASH"]:
+                w, t_ = hold.get(k, 0.0), tgt[k]
+                if w > t_ * (1 + band):
+                    hold["CASH"] = hold.get("CASH", 0.0) + (w - t_)
+                    hold[k] = t_
+            for k in [k for k in tgt if k != "CASH"]:
+                w, t_ = hold.get(k, 0.0), tgt[k]
+                if w < t_ * (1 - band) and hold.get("CASH", 0.0) > 1e-9:
+                    buy = min(t_ - w, hold["CASH"])
+                    hold[k] = w + buy
+                    hold["CASH"] -= buy
+        elif full:
             hold = dict(tgt)
         else:
             # 테마·핵심 상태가 바뀐 칸만 교체: 빠진 종목을 팔아 새 종목을 목표 비율대로 삼 (나머지는 그대로)
@@ -2918,12 +2944,13 @@ def portfolio_lab(daily: dict[str, pd.Series], core_state: pd.Series, asof: pd.T
     base_t = {d: portfolio_targets(d, ranks, daily, float(cs.loc[d]), target, themes=th_of[d]) for d in weeks}
     trend_t = {d: portfolio_targets(d, ranks, daily, float(cs.loc[d]), target, trend=True, themes=th_of[d])
                for d in weeks}
-    runs = {"pf_month": (base_t, "month"), "pf_week": (base_t, "week"), "pf_band": (base_t, "band"),
-            "pf_none": (base_t, "none"), "pf_trend": (trend_t, "month"),
+    harvest_t = {d: with_cash_buffer(t, HARVEST["cash"]) for d, t in base_t.items()}
+    runs = {"pf_harvest": (harvest_t, "harvest"), "pf_month": (base_t, "month"), "pf_week": (base_t, "week"),
+            "pf_band": (base_t, "band"), "pf_none": (base_t, "none"), "pf_trend": (trend_t, "month"),
             "bm_soxl": ({d: {"SOXL": 1.0} for d in weeks}, "none"), "bm_spy": ({d: {"SPY": 1.0} for d in weeks}, "none")}
     curves, rows = {}, []
     for pid, (tg, pol) in runs.items():
-        sim = simulate_portfolio(weekly, tg, pol)
+        sim = simulate_portfolio(weekly, tg, pol, band=HARVEST["band"] if pol == "harvest" else 0.05)
         curves[pid] = sim["value"]
         rows.append({"id": pid, "선수": PORTFOLIO_PLAYERS[pid], **portfolio_stats(sim["value"], PORTFOLIO_LIVE_START),
                      "연 회전율(%)": round(float(sim["turnover"].sum() / max(len(sim) / 52, 1e-9) * 100), 0)})
@@ -2931,11 +2958,68 @@ def portfolio_lab(daily: dict[str, pd.Series], core_state: pd.Series, asof: pd.T
     lead, rising = th_of[last]
     raw = pick_themes(ranks["rank"].loc[last], ranks["rank_prev"].loc[last], ranks["above50"].loc[last])
     return {"table": pd.DataFrame(rows), "curves": pd.DataFrame(curves), "week": last,
-            "base": base_t[last], "trend": trend_t[last], "lead": lead, "rising": rising, "raw": raw,
+            "base": base_t[last], "trend": trend_t[last], "harvest": harvest_t[last], "lead": lead, "rising": rising, "raw": raw,
             "core_on": float(cs.loc[last]),
             "vehicles": {th: theme_vehicle(th, daily, last) for th in (lead, rising) if th},
             "ranks": ranks["rank"].loc[last].dropna().sort_values(),
             "switches": int((sched["lead"] != sched["lead"].shift()).sum() + (sched["rising"] != sched["rising"].shift()).sum())}
+
+
+def with_cash_buffer(target: dict[str, float], cash: float) -> dict[str, float]:
+    """목표 비중에 현금 완충(예: 20%)을 넣음: 나머지 비중을 그만큼 줄이고 현금에 더함."""
+    out = {k: v * (1 - cash) for k, v in target.items()}
+    out["CASH"] = out.get("CASH", 0.0) + cash
+    return out
+
+
+def harvest_orders(holdings: pd.DataFrame, prices: dict[str, float], target: dict[str, float],
+                   cash: float = 0.0, new_cash: float = 0.0, band: float | None = None) -> pd.DataFrame:
+    """수익 실현형 리밸런싱 주문: 목표보다 band(상대) 넘게 커진 종목은 초과분 매도 → 현금,
+    목표보다 band 넘게 작아진 종목(또는 아직 없는 목표 종목)은 현금+새 돈으로 목표까지 매수."""
+    band = HARVEST["band"] if band is None else band
+    cur = {r["ticker"]: float(r["shares"]) * prices.get(r["ticker"], np.nan) for _, r in holdings.iterrows()}
+    cur = {k: v for k, v in cur.items() if pd.notna(v)}
+    pool = cash + new_cash
+    total = sum(cur.values()) + pool
+    keys = sorted(set(cur) | {k for k in target if k != "CASH"})
+    rows, sells = [], {}
+    for k in keys:
+        t_ = target.get(k, 0.0) * total
+        v = cur.get(k, 0.0)
+        if t_ == 0 and v > 0:
+            sells[k] = 0.0          # 목표에 없는 종목은 자동으로 팔지 않음(장기 보유분) → 표시만
+        elif v > t_ * (1 + band):
+            sells[k] = v - t_
+    pool += sum(sells.values())
+    buys = {}
+    need = {k: target.get(k, 0.0) * total - cur.get(k, 0.0) for k in keys
+            if target.get(k, 0.0) > 0 and cur.get(k, 0.0) < target.get(k, 0.0) * total * (1 - band)}
+    s_ = sum(need.values())
+    scale = min(1.0, pool / s_) if s_ > 0 else 0.0
+    for k, n in need.items():
+        buys[k] = n * scale
+    for k in keys:
+        px = prices.get(k)
+        v, tw = cur.get(k, 0.0), target.get(k, 0.0)
+        amt = sells.get(k, 0.0) or buys.get(k, 0.0)
+        if k in sells and sells[k] > 1:
+            act, why = "매도", f"목표보다 {(v / (tw * total) - 1) * 100:.0f}% 커짐 → 초과분 현금화"
+        elif k in buys and buys[k] > 1:
+            act, why = "매수", "목표보다 많이 작아짐 → 현금으로 다시 채움" if v > 0 else "목표 종목 새로 담기"
+        elif tw == 0 and v > 0:
+            act, why = "유지", "목표에 없는 종목(장기 보유) · 자동 매도하지 않음"
+        else:
+            act, why = "유지", f"목표 ±{band * 100:.0f}% 안"
+        rows.append({"종목": k, "지금 금액($)": round(v, 2), "지금 비중(%)": round(v / total * 100, 1) if total else 0,
+                     "목표 비중(%)": round(tw * 100, 1), "주문": act if amt > 1 or act == "유지" else "유지",
+                     "금액($)": round(amt, 2) if amt > 1 else np.nan,
+                     "주식 수": round(amt / px, 4) if amt > 1 and px else np.nan, "이유": why})
+    left = pool - sum(buys.values())
+    rows.append({"종목": "현금", "지금 금액($)": round(cash + new_cash, 2),
+                 "지금 비중(%)": round((cash + new_cash) / total * 100, 1) if total else 0,
+                 "목표 비중(%)": round(target.get("CASH", 0.0) * 100, 1), "주문": "",
+                 "금액($)": round(left, 2), "주식 수": np.nan, "이유": "주문 뒤 남는 현금"})
+    return pd.DataFrame(rows)
 
 
 def rebalance_orders(holdings: pd.DataFrame, prices: dict[str, float], target: dict[str, float],
