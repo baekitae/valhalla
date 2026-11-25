@@ -333,3 +333,22 @@ def test_daily_version_of_rules():
     bt = core.backtest_daily(pd.DataFrame({"daily": pos_d, "weekly": pos_w, "hold": 1.0}, index=daily.index),
                              daily["Close"]).set_index("전략")
     assert {"daily", "weekly", "hold"} <= set(bt.index) and bt.loc["hold", "연 매매(회)"] == 0
+
+
+def test_daily_league_players_and_grading():
+    daily = _daily(seed=9, n=1500)
+    dh = core.build_daily_signal_history(daily, daily, {})
+    lev = core.daily_player_positions(daily, daily, dh, [(1, core.ACTION_RULES)], "SOXL")
+    stk = core.daily_player_positions(daily, daily, dh, [(1, core.ACTION_RULES)], "NVDA")
+    for pid in ("rule_v1", "trend200", "voltarget", "hold", "inf_mine", "charles"):
+        assert pid in lev.columns and lev[pid].dropna().between(0, 1).all()
+    assert "inf_mine" not in stk.columns
+    today = core.daily_today(lev).set_index("id")
+    assert today.loc["hold", "오늘 비중"] == 1.0 and today.loc["hold", "오늘 신호"] == ""
+    days = daily.index[-3:]
+    rows = pd.DataFrame([{"player": p, "ticker": "SOXL", "day": d.strftime("%Y-%m-%d"), "position": pos}
+                         for d in days for p, pos in (("hold", 1.0), ("cash", 0.0))])
+    g = core.grade_daily(rows, daily["Close"])
+    assert g["ret_1d"].notna().sum() == 4                       # 마지막 날은 다음 날이 없어 대기
+    t = core.daily_league_table(g).set_index("id")
+    assert t.loc["cash", "누적(%)"] == 0 and "보유 대비(%p)" in t.columns

@@ -75,11 +75,12 @@ def run(sb, fetch=download) -> str:
     rule_version, rules = core.load_active_rule(sb)
     contenders = [(rule_version, rules)] + core.load_challengers(sb)
     day = asof.strftime("%Y-%m-%d")
-    reports, new_preds, graded, failed, live_new = [], 0, 0, [], 0
+    reports, new_preds, graded, failed, live_new, daily_new = [], 0, 0, [], 0, 0
     for ticker, partner in TICKERS:
         try:
             res = _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules, rule_version, contenders)
             live_new += res.get("live_new", 0)
+            daily_new += res.get("daily", 0) or 0
             new_preds += res["new"]
             graded += res["graded"]
             if res["report"]:
@@ -105,6 +106,7 @@ def run(sb, fetch=download) -> str:
     share = float((rep["test_diff"].dropna() > 0).mean() * 100) if not rep.empty and rep["test_diff"].notna().any() else None
     lines.append(f"규칙 v{rule_version} · {len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
     lines.append("경쟁 " + " vs ".join(f"v{v}" for v, _ in contenders) + f" · 새 실전 신호 {live_new}건")
+    lines.append(f"일봉 리그 새 기록 {daily_new}건")
     if share is not None:
         lines.append(f"검증 구간에서 평소보다 나은 종목 {share:.0f}%")
     if failed:
@@ -187,6 +189,32 @@ def update_ensemble(sb, asof) -> tuple[int, dict]:
     return n, weights
 
 
+def _record_daily(sb, ticker, daily, partner_daily, macro, ref, contenders, asof) -> int:
+    """일봉 리그: 실전 시작일 이후 장 마감된 날마다 선수별 비중을 기록(없는 날만), 다음 날 수익률로 채점."""
+    d = daily[daily.index <= asof]
+    start = pd.Timestamp(core.DAILY_LIVE_START)
+    if d.empty or d.index[-1] < start:
+        return 0
+    dh = core.build_daily_signal_history(d, partner_daily, macro)
+    pos = core.daily_player_positions(d, ref, dh, contenders, ticker)
+    pos = pos[pos.index >= start].tail(10)
+    have = {(r["player"], str(r["day"])[:10]) for r in core.sb_fetch_all(sb, core.DAILY_TABLE, {"ticker": ticker})}
+    rows = [{"player": pid, "ticker": ticker, "day": day.strftime("%Y-%m-%d"), "position": float(v),
+             "close": round(float(d["Close"].loc[day]), 4)}
+            for day, r in pos.iterrows() for pid, v in r.items()
+            if pd.notna(v) and (pid, day.strftime("%Y-%m-%d")) not in have]
+    if rows:
+        sb.table(core.DAILY_TABLE).insert(rows).execute()
+    allrows = pd.DataFrame(core.sb_fetch_all(sb, core.DAILY_TABLE, {"ticker": ticker}))
+    if not allrows.empty:
+        todo = allrows[allrows["ret_1d"].isna()]
+        graded = core.grade_daily(todo, d["Close"])
+        for (_, old), (_, new) in zip(todo.iterrows(), graded.iterrows()):
+            if pd.notna(new.get("ret_1d")):
+                sb.table(core.DAILY_TABLE).update({"ret_1d": float(new["ret_1d"])}).eq("id", int(old["id"])).execute()
+    return len(rows)
+
+
 def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule_version=None,
              contenders=None) -> dict:
     out = {"new": 0, "graded": 0, "report": None, "live_new": 0, "positions": 0}
@@ -245,6 +273,10 @@ def _run_one(sb, ticker, partner, macro, partners, fetch, asof, rules=None, rule
         for (_, old), (_, new) in zip(todo.iterrows(), graded_p.iterrows()):
             if pd.notna(new.get("ret_1w")):
                 sb.table(core.POSITION_TABLE).update({"ret_1w": float(new["ret_1w"])}).eq("id", int(old["id"])).execute()
+    try:
+        out["daily"] = _record_daily(sb, ticker, daily, partners.get(partner), macro, ref, contenders or [], asof)
+    except Exception:
+        traceback.print_exc()
     out["report"] = core.report_row(core.action_signals(hist, rules), ticker, asof.strftime("%Y-%m-%d"))
     if out["report"] is not None:
         out["report"]["rule_version"] = rule_version

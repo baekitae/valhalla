@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-3"
+REQUIRED_CORE_VERSION = "2026.11.25-4"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -410,7 +410,7 @@ def _download(ticker: str, period: str, adjusted: bool) -> pd.DataFrame | None:
         return None
     df = _clean_ohlcv(raw)
     # 야후는 장 마감 뒤 몇 시간 동안 그날 일봉 종가를 비워 보내기도 함 → 30분봉으로 빠진 날을 채움
-    if df is not None and not adjusted and df.index[-1] < _expected_session():
+    if df is not None and df.index[-1] < _expected_session():
         try:
             intr = _clean_ohlcv(yf.download(ticker, period="5d", interval="30m", prepost=False,
                                             auto_adjust=False, progress=False, threads=False))
@@ -1671,55 +1671,80 @@ def load_daily_signal_history(ticker: str, partner: str, asof: str) -> pd.DataFr
     return core.build_daily_signal_history(daily, partner_df, macro)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_daily_positions(ticker: str, partner: str, rules_key: str, asof: str, core_version: str = "") -> pd.DataFrame:
+    """일봉 리그 선수들의 날짜별 비중 (+ close 열)."""
+    rules = [(int(v), core.normalize_rules(r)) for v, r in json.loads(rules_key)]
+    daily = load_long(ticker, "max", True)
+    if daily is None or len(daily) < 300:
+        return pd.DataFrame()
+    daily = daily[daily.index <= pd.Timestamp(asof)]
+    partner_df = load_long(partner, "max", True) if partner else None
+    dh = load_daily_signal_history(ticker, partner, asof)
+    ref = core.trend_reference(ticker, daily, partner_df)
+    pos = core.daily_player_positions(daily, ref, dh, rules, ticker)
+    pos["close"] = daily["Close"]
+    return pos
+
+
 def render_daily_rules(ticker: str, partner: str, rules: list[tuple[int, dict]]) -> None:
-    """같은 규칙을 매일 판단하는 일봉 버전의 오늘 상태."""
-    dh = load_daily_signal_history(ticker, partner, f"{us_asof():%Y-%m-%d}")
-    if dh.empty:
+    """일봉 리그: 모든 선수의 오늘 비중과 오늘 신호."""
+    asof = f"{us_asof():%Y-%m-%d}"
+    pos = cached_daily_positions(ticker, partner, json.dumps([[v, r] for v, r in rules]), asof, core.CORE_VERSION)
+    if pos.empty:
         return
+    players = pos.drop(columns=["close"])
+    today = core.daily_today(players)
+    if today.empty:
+        return
+    day = players.index[-1]
     with st.container(border=True):
-        st.markdown("**일봉 버전 (매일 판단)** · 같은 규칙을 '오늘로 끝나는 최근 5거래일'에 매일 적용해요. "
-                    "빠른 대신 잦은 신호가 나와요. 주봉 버전과 성적 비교는 선수 경기장 → 과거 성적 탭에 있어요.")
-        cols = st.columns(len(rules))
-        for col, (v, rule) in zip(cols, rules):
-            sig = core.action_signals(dh, rule, step=5)
-            last = sig.iloc[-1]
-            last_act = sig[sig["action"] != ""].tail(1)
-            role = "대표" if v == rules[0][0] else "도전"
-            if last["action"]:
-                head = pill(f"오늘 {last['action']} 신호", "stop" if last["action"] == "매수" else "info")
-            else:
-                head = pill("오늘 새 신호 없음", "warn")
-            col.markdown(f"**규칙 v{v} ({role}) · {sig.index[-1]:%m/%d}** {head}", unsafe_allow_html=True)
-            tail = ""
-            if not last_act.empty:
-                r = last_act.iloc[0]
-                tail = f" · 마지막 {r['action']} {r.name:%m/%d} (${r['close']:.2f} → ${last['close']:.2f})"
-            col.caption(f"상태 {last['state'] or '신호 없음'} · 최근 5거래일 차트 {int(last['chart_score'])}점 · "
-                        f"거시 {int(last['macro_score'])}점{tail}")
+        st.markdown(f"**일봉 리그 · {day:%m/%d} 장 마감 기준** · 모든 선수가 매일 비중을 냅니다. 규칙은 '오늘로 끝나는 최근 "
+                    "5거래일'로 매일 판단하고, 무한매수 기법·찰스 시스템은 원래 방식대로 매일 매매해요. "
+                    f"비중이 25%p 이상 바뀐 날을 매수·매도로 표시해요. ({ticker} ${pos['close'].iloc[-1]:.2f})")
+        today.insert(0, "선수", [core.player_label(i) for i in today["id"]])
+        today["오늘 비중"] = (today["오늘 비중"] * 100).round(0)
+        fired = today[today["오늘 신호"] != ""]
+        if not fired.empty:
+            st.markdown("오늘 신호: " + " · ".join(
+                pill(f"{r['선수']} {r['오늘 신호']}", "stop" if r["오늘 신호"] == "매수" else "info")
+                for _, r in fired.iterrows()), unsafe_allow_html=True)
+        st.dataframe(today.drop(columns=["id"]), hide_index=True, width="stretch",
+                     column_config={"오늘 비중": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+                                    "어제 대비(%p)": st.column_config.NumberColumn(format="%+.0f")})
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_daily_vs_weekly(ticker: str, partner: str, rules_key: str, asof: str, core_version: str = "") -> pd.DataFrame:
-    """같은 규칙의 주봉 버전 vs 일봉 버전을 일 단위로 비교."""
+    """일봉 리그 모든 선수 + 주봉 규칙(금요일에 정한 비중을 다음 주 내내 유지)을 일 단위로 비교."""
     rules = [(int(v), core.normalize_rules(r)) for v, r in json.loads(rules_key)]
-    dh = load_daily_signal_history(ticker, partner, asof)
+    pos = cached_daily_positions(ticker, partner, rules_key, asof, core_version)
     hist = load_signal_history(ticker, partner)
-    wk = core.complete_weeks(hist, us_asof()) if hist is not None else None
-    if dh.empty or wk is None or wk.empty:
+    if pos.empty or hist is None:
         return pd.DataFrame()
-    close = dh["close"]
-    pos = pd.DataFrame(index=close.index)
-    names = {}
-    for v, rule in rules:
-        pos[f"w{v}"] = core.weekly_to_daily_positions(core.rule_positions(core.action_signals(wk, rule)), close.index)
-        pos[f"d{v}"] = core.rule_positions(core.action_signals(dh, rule, step=5))
-        names[f"w{v}"], names[f"d{v}"] = f"규칙 v{v} · 주봉", f"규칙 v{v} · 일봉"
-    pos["hold"] = 1.0
+    wk = core.complete_weeks(hist, us_asof())
+    close = pos["close"]
+    players = pos.drop(columns=["close"])
+    names = {c: core.player_label(c) + " · 일봉" for c in players.columns}
     names["hold"] = "그냥 보유"
-    start = max(pos[c].first_valid_index() for c in pos.columns)
-    bt = core.backtest_daily(pos[pos.index >= start], close[close.index >= start])
+    for v, rule in rules:
+        players[f"w{v}"] = core.weekly_to_daily_positions(core.rule_positions(core.action_signals(wk, rule)), close.index)
+        names[f"w{v}"] = f"규칙 v{v} · 주봉"
+    start = max(players[c].first_valid_index() for c in [f"rule_v{rules[0][0]}", f"w{rules[0][0]}"])
+    bt = core.backtest_daily(players[players.index >= start], close[close.index >= start])
     bt["전략"] = bt["전략"].map(names)
     return bt
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_daily_ledger(backend_name: str) -> pd.DataFrame:
+    if backend_name != "supabase":
+        return pd.DataFrame()
+    try:
+        return pd.DataFrame(core.sb_fetch_all(get_supabase(), core.DAILY_TABLE, {}))
+    except Exception as exc:
+        LOGGER.warning("일봉 리그 기록 조회 실패: %s", exc)
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -2280,7 +2305,26 @@ def render_arena(ticker: str, partner: str) -> None:
     if champ.startswith("rule_v") and champ not in alive:
         st.warning(f"챔피언 {core.player_label(champ)}은 경쟁이 종료되어 더 이상 기록되지 않습니다. 아래에서 새 챔피언을 정해 주세요.",
                    icon=":material/warning:")
-    t1, t2, t4, t3 = st.tabs(["실전 경기표", f"{ticker} 과거 성적", "반등 판별전", "AI 위원회 회의록"])
+    t1, t2, t5, t4, t3 = st.tabs(["실전 경기표", f"{ticker} 과거 성적", "일봉 리그", "반등 판별전", "AI 위원회 회의록"])
+    with t5:
+        st.caption(f"모든 선수가 매일 장 마감 비중을 내고, 다음 거래일 수익률로 채점합니다 ({core.DAILY_LIVE_START}부터). "
+                   "매일 아침 자동 점검이 기록해요. 과거 성적은 옆 탭 아래쪽 표에 있어요.")
+        led = load_daily_ledger(backend())
+        if led.empty:
+            st.caption("아직 일봉 리그 기록이 없습니다. 다음 자동 점검부터 쌓여요.")
+        else:
+            lev = [t for t in core.SIGNAL_UNIVERSE if core.category_of(t) in core.TECHNIQUE_CATEGORIES]
+            dscope = st.segmented_control("범위", ["이 종목", f"레버리지 ETF {len(lev)}개", "전체"], default="이 종목",
+                                          key="daily_scope") or "이 종목"
+            tick = [ticker] if dscope == "이 종목" else (lev if dscope.startswith("레버리지") else None)
+            tbl = core.daily_league_table(led, tick)
+            if tbl.empty:
+                st.caption("채점된 기록이 아직 없습니다 (기록 다음 거래일에 채점).")
+            else:
+                st.dataframe(tbl.drop(columns=["id"]), hide_index=True, width="stretch",
+                             column_config={"누적(%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                                            "보유 대비(%p)": st.column_config.NumberColumn(format="%+.2f")})
+                st.caption(f"채점 {int(tbl['채점 일수'].max())}거래일째. 몇 주는 지나야 순위가 의미 있어요.")
     with t4:
         render_rebound_league(rules, pos)
     with t1:
@@ -2370,7 +2414,7 @@ def render_arena(ticker: str, partner: str) -> None:
                             if better else " 최근 2년(학습에 안 쓴 구간)에서는 대표 규칙보다 확실히 낫지 않아요. 아직 올릴 근거가 부족해요.")
                 st.caption("🧪 실험 v3는 과거 성적 비교 전용이라 실전 장부·경기장 순위·앙상블에는 들어가지 않아요." + note)
             st.caption("모든 선수가 같은 자금, 이번 주 비중 × 다음 주 수익률, 거래 비용 0.1%로 계산했어요.")
-        st.markdown("**주봉 vs 일봉 · 같은 규칙을 일주일에 한 번 vs 매일 판단하면?**")
+        st.markdown("**일봉 리그 과거 성적 · 모든 선수를 매일 판단하면? (주봉 규칙과 비교)**")
         dvw = cached_daily_vs_weekly(ticker, partner, json.dumps([[v, r] for v, r in rules]),
                                      f"{us_asof():%Y-%m-%d}", core.CORE_VERSION)
         if dvw.empty:
@@ -2379,8 +2423,8 @@ def render_arena(ticker: str, partner: str) -> None:
             st.dataframe(dvw, hide_index=True, width="stretch",
                          column_config={c: st.column_config.NumberColumn(format="%+.1f%%")
                                         for c in ("연평균(%)", "최대 낙폭(%)", "최근 2년 누적(%)", "최근 2년 MDD(%)")})
-            st.caption("일 단위로 채점했어요(오늘 종가 비중 × 내일 수익률, 거래 비용 0.1%). 주봉 버전은 금요일에 정한 비중을 "
-                       "다음 주 내내 유지해요. 일봉이 칼마·최근 2년 성적에서 확실히 낫지 않다면, 빠른 신호가 잦은 매매로 상쇄된 거예요.")
+            st.caption("일 단위로 채점했어요(오늘 종가 비중 × 내일 수익률, 거래 비용 0.1%). 주봉 규칙은 금요일에 정한 비중을 "
+                       "다음 주 내내 유지해요. 일봉 선수가 칼마·최근 2년 성적에서 확실히 낫지 않다면, 빠른 반응이 잦은 매매로 상쇄된 거예요.")
     with t3:
         if mins.empty:
             st.caption("아직 회의록이 없습니다. AI 위원회(Claude)가 매주 토요일 아침 10개 종목을 회의하고 여기에 기록합니다.")

@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-3"
+CORE_VERSION = "2026.11.25-4"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -2120,6 +2120,98 @@ def backtest_players(positions: pd.DataFrame, close: pd.Series, test_weeks: int 
                      "최근 2년 누적(%)": round(rec_ret, 1), "최근 2년 MDD(%)": round(rec_mdd, 1),
                      "최근 2년 칼마": round(rec_calmar, 2), "주 수": int(valid.sum())})
     return pd.DataFrame(rows)
+
+
+# ---- 일봉 리그: 모든 선수가 매일 비중을 냄 (오늘 종가에 정한 비중 × 내일 수익률로 채점) ----
+DAILY_TABLE = "valhalla_daily_positions"
+DAILY_LIVE_START = "2026-11-24"
+
+
+def daily_player_positions(daily: pd.DataFrame, ref_daily: pd.DataFrame | None, day_hist: pd.DataFrame,
+                           rules: list[tuple[int, dict]], ticker: str | None = None) -> pd.DataFrame:
+    """일봉 버전 선수들의 날짜별 비중표. 규칙은 '최근 5거래일' 일봉 버전, 추세·변동성은 매일 계산,
+    레버리지 ETF면 매매기법 연구소 기법·찰스 시스템(원래 매일 매매)."""
+    idx = daily.index
+    out = pd.DataFrame(index=idx)
+    for v, rule in rules:
+        if not day_hist.empty:
+            out[f"rule_v{v}"] = rule_positions(action_signals(day_hist, rule, step=5)).reindex(idx)
+    if ref_daily is not None and not ref_daily.empty:
+        c = ref_daily["Close"]
+        ma = c.rolling(200).mean()
+        tr = (c > ma).astype(float).where(ma.notna())
+        out["trend200"] = tr.reindex(tr.index.union(idx)).ffill().reindex(idx)
+    r = daily["Close"].pct_change()
+    vol = r.rolling(20).std()
+    normal = vol.rolling(252, min_periods=126).median()
+    out["voltarget"] = (normal / vol).clip(0, 1).where(normal.notna() & (vol > 0))
+    out["hold"] = 1.0
+    if ticker is not None and category_of(ticker) in TECHNIQUE_CATEGORIES:
+        out["inf_mine"] = infinite_exposure(daily).reindex(idx)
+        out["inf_v2"] = infinite_exposure(daily, star=True).reindex(idx)
+        out["inf_v2_safe"] = infinite_exposure(daily, star=True, quarter_cut=True, trend_filter=True).reindex(idx)
+        out["rebal50"] = rebalance_exposure(daily).reindex(idx)
+        out["charles"] = charles_exposure(daily, ref_daily).reindex(idx)
+    return out.round(4)
+
+
+def daily_today(pos: pd.DataFrame, step: float = 0.25) -> pd.DataFrame:
+    """선수별 오늘 비중, 어제 대비 변화, 오늘 매수·매도 표시(마지막 표시 때보다 25%p 이상 바뀌면)."""
+    rows = []
+    day = pos.index[-1]
+    for pid in pos.columns:
+        s_ = pos[pid].dropna()
+        if s_.empty:
+            continue
+        moves = position_moves(s_, step)
+        today = moves[moves.index == day]
+        last = moves.tail(1)
+        rows.append({"id": pid, "오늘 비중": float(s_.iloc[-1]),
+                     "어제 대비(%p)": round(float((s_.iloc[-1] - s_.iloc[-2]) * 100), 0) if len(s_) > 1 else 0.0,
+                     "오늘 신호": today["action"].iloc[0] if not today.empty else "",
+                     "마지막 신호": f"{last['action'].iloc[0]} {last.index[0]:%m/%d}" if not last.empty else "—"})
+    return pd.DataFrame(rows)
+
+
+def grade_daily(rows: pd.DataFrame, close: pd.Series) -> pd.DataFrame:
+    """일봉 리그 기록에 다음 거래일 수익률(ret_1d, %)을 채움."""
+    if rows is None or rows.empty:
+        return rows
+    out = rows.copy()
+    c = close.dropna()
+    if "ret_1d" not in out:
+        out["ret_1d"] = np.nan
+    for i, row in out.iterrows():
+        if pd.notna(row.get("ret_1d")):
+            continue
+        d = pd.Timestamp(row["day"])
+        if d in c.index:
+            k = c.index.get_loc(d)
+            if k + 1 < len(c):
+                out.at[i, "ret_1d"] = round(float((c.iloc[k + 1] / c.iloc[k] - 1) * 100), 4)
+    return out
+
+
+def daily_league_table(rows: pd.DataFrame, tickers: list[str] | None = None) -> pd.DataFrame:
+    """실전 일봉 리그 경기표: 종목별 (비중×다음날 수익) 누적을 종목 평균, '그냥 보유' 대비."""
+    if rows is None or rows.empty:
+        return pd.DataFrame()
+    d = rows.dropna(subset=["ret_1d"]).copy()
+    if tickers:
+        d = d[d["ticker"].isin(tickers)]
+    if d.empty:
+        return pd.DataFrame()
+    d["pr"] = d["position"].astype(float) * d["ret_1d"].astype(float) / 100
+    res = []
+    for p, g in d.groupby("player"):
+        per = g.sort_values("day").groupby("ticker")["pr"].apply(lambda x: float((1 + x).prod() - 1))
+        res.append({"id": p, "선수": player_label(p), "누적(%)": round(float(per.mean() * 100), 2),
+                    "채점 일수": int(g["day"].nunique()), "종목 수": int(g["ticker"].nunique()),
+                    "평균 비중(%)": round(float(g["position"].mean() * 100), 0)})
+    t = pd.DataFrame(res).sort_values("누적(%)", ascending=False).reset_index(drop=True)
+    hold = t.loc[t["id"] == "hold", "누적(%)"]
+    t["보유 대비(%p)"] = (t["누적(%)"] - (float(hold.iloc[0]) if not hold.empty else np.nan)).round(2)
+    return t
 
 
 def backtest_daily(positions: pd.DataFrame, close: pd.Series, test_days: int = 504,
