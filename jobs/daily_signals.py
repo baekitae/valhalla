@@ -76,6 +76,25 @@ def us_asof() -> pd.Timestamp:
     return day if now.hour >= 16 else day - pd.Timedelta(days=1)
 
 
+INSIGHT: dict = {}
+
+
+def _jsonable(x):
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, (pd.Timestamp, dt.date, dt.datetime)):
+        return str(x)[:10]
+    if isinstance(x, (np.floating, float)):
+        return None if not np.isfinite(x) else float(x)
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.bool_,)):
+        return bool(x)
+    return x
+
+
 def run(sb, fetch=download) -> str:
     macro = {t: fetch(t, False) for t in core.MACRO_TICKERS_SIGNAL.values()}
     lines = []
@@ -118,6 +137,12 @@ def run(sb, fetch=download) -> str:
         lines.append(f"포트폴리오 점검 실패: {exc}")
     rep = pd.DataFrame(reports)
     share = float((rep["test_diff"].dropna() > 0).mean() * 100) if not rep.empty and rep["test_diff"].notna().any() else None
+    INSIGHT["beat_share"] = share
+    INSIGHT["asof"] = asof.strftime("%Y-%m-%d")
+    try:
+        sb.table(core.INSIGHT_TABLE).upsert({"day": day, "payload": _jsonable(INSIGHT)}, on_conflict="day").execute()
+    except Exception:
+        traceback.print_exc()
     lines.append(f"규칙 v{rule_version} · {len(TICKERS)}개 중 {len(reports)}개 점검 · 새 예측 {new_preds}건 · 채점 {graded}건")
     lines.append("경쟁 " + " vs ".join(f"v{v}" for v, _ in contenders) + f" · 새 실전 신호 {live_new}건")
     lines.append(f"일봉 리그 새 기록 {daily_new}건")
@@ -141,6 +166,10 @@ def portfolio_summary(sb, fetch, asof, rule) -> str:
     hist = core.complete_weeks(core.build_signal_history(soxl, soxx, macro), asof)
     lab = core.portfolio_lab(daily, core.rule_positions(core.action_signals(hist, rule)), asof)
     t = lab["table"].set_index("id")
+    INSIGHT["portfolio"] = {"week": lab["week"], "lead": lab["lead"], "rising": lab["rising"], "raw": list(lab["raw"]),
+                            "base": lab["base"], "switches": lab["switches"], "core_on": lab["core_on"],
+                            "vehicles": {k: list(v) for k, v in lab["vehicles"].items()},
+                            "table": lab["table"].to_dict("records")}
     tg = ", ".join(f"{k} {v * 100:.0f}%" for k, v in sorted(lab["base"].items(), key=lambda x: -x[1]))
     parts = [f"{t.loc[p, '선수']} 연 {t.loc[p, '연평균(%)']}%·MDD {t.loc[p, '최대 낙폭(%)']}%·칼마 {t.loc[p, '칼마']}·회전 {t.loc[p, '연 회전율(%)']:.0f}%"
              for p in ("pf_harvest", "pf_month", "pf_week", "pf_band", "pf_none", "pf_trend", "bm_soxl", "bm_spy")]
@@ -185,12 +214,22 @@ def update_rebounds(sb, fetch, asof) -> str:
         sb.table(core.REBOUND_TABLE).upsert(rows, on_conflict="week").execute()
     hist = lab.dropna(subset=["outcome"])
     share = f" · 과거 {len(hist)}건 중 추세 전환 {hist['outcome'].mean() * 100:.0f}%" if len(hist) else ""
+    day5 = hist[hist["trigger"].str.startswith("하루")]
+    last_ev = lab.iloc[-1]
+    INSIGHT["rebound"] = {"events": len(hist), "reversal_share": float(hist["outcome"].mean() * 100) if len(hist) else None,
+                          "day5_share": float(day5["outcome"].mean() * 100) if len(day5) else None,
+                          "latest": {"date": last_ev["event_date"], "trigger": last_ev["trigger"],
+                                     "prior_low": float(last_ev["prior_low"]), "outcome": None if pd.isna(last_ev["outcome"]) else float(last_ev["outcome"]),
+                                     "base_rate": float(last_ev["base_rate"]), "macro_prob": None if pd.isna(last_ev["macro_prob"]) else float(last_ev["macro_prob"]),
+                                     "week": last_ev["week"]}}
     if lab["macro_prob"].notna().any():
         calls = pd.DataFrame({core.MACRO_CHECK_PLAYER: lab["macro_prob"].to_numpy(),
                               core.REBOUND_BASE_PLAYER: lab["base_rate"].to_numpy()}, index=pd.DatetimeIndex(lab["week"]))
         board = core.rebound_scoreboard(lab, calls).set_index("id")
         if core.MACRO_CHECK_PLAYER in board.index:
             m = board.loc[core.MACRO_CHECK_PLAYER]
+            INSIGHT["rebound"]["macro"] = {"n": int(m["사건 수"]), "brier": float(m["브라이어"]), "vs_base": float(m["기준 대비"]),
+                                           "hit": float(m["적중률(%)"])}
             share += (f" · 거시 체크리스트 {int(m['사건 수'])}건 브라이어 {m['브라이어']:.3f}(기준 대비 {m['기준 대비']:+.3f})"
                       f" 적중 {m['적중률(%)']:.0f}% · 최근 사건 확률 {lab['macro_prob'].iloc[-1] * 100:.0f}%")
     pending = live[live["outcome"].isna()]

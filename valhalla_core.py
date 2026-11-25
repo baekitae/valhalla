@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-10"
+CORE_VERSION = "2026.11.25-11"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -3099,6 +3099,164 @@ def rebalance_orders(holdings: pd.DataFrame, prices: dict[str, float], target: d
     rows.append({"종목": "현금", "지금 금액($)": round(new_cash, 2), "지금 비중(%)": round(new_cash / total * 100, 1) if total else 0,
                  "목표 비중(%)": round(cash_t * 100, 1), "주문": "", "금액($)": np.nan, "주식 수": np.nan})
     return pd.DataFrame(rows)
+
+
+# ==========================================================================
+# 20. 나의 투자 원칙 · 위험 관리 · 세금 장부 · 무한매수 사이클
+# ==========================================================================
+SETTINGS_KEY_PLAN = "plan"
+INSIGHT_TABLE = "valhalla_insights"
+DEFAULT_PRINCIPLES = {
+    "buy_target_krw": 250_000, "buy_max_krw": 300_000,     # 사용자 원칙: 무한매수 1회(하루) 매수 25만 원, 최대 30만 원
+    "extra": [],                                            # 사용자가 나중에 추가하는 원칙(문장)
+}
+TAX = {"deduction_krw": 2_500_000, "rate": 0.22}
+CYCLE_METHODS = {"①": ("내 방식 40분할 +10% 전량 익절", 40, 0.10, False),
+                 "②": ("V2형 별지점 1/4 분할 익절", 40, 0.10, True),
+                 "④": ("V2형 + 쿼터 손절 + 200일선", 40, 0.10, True),
+                 "기타": ("직접 관리", 40, 0.10, False)}
+
+
+def daily_buy_amounts(journal: pd.DataFrame, fx: float) -> pd.DataFrame:
+    """계좌·날짜별 매수 합계(원). 무한매수 1회 = 하루 매수로 봄."""
+    if journal is None or journal.empty:
+        return pd.DataFrame(columns=["Account", "Date", "Ticker", "usd", "krw"])
+    b = journal[journal["Action"] == "Buy"].copy()
+    b["usd"] = b["Qty"].astype(float) * b["Price"].astype(float)
+    g = b.groupby(["Account", "Date", "Ticker"], as_index=False)["usd"].sum()
+    g["krw"] = (g["usd"] * fx).round(0)
+    return g.sort_values(["Date", "Account"])
+
+
+def check_buy_principle(amounts: pd.DataFrame, target: float, hard: float) -> dict:
+    """원칙 점검: 하루 매수가 최대치를 넘은 날, 목표를 넘은 날."""
+    if amounts is None or amounts.empty:
+        return {"days": 0, "over_hard": pd.DataFrame(), "over_target": 0, "share_ok": np.nan}
+    over_h = amounts[amounts["krw"] > hard]
+    over_t = amounts[(amounts["krw"] > target) & (amounts["krw"] <= hard)]
+    return {"days": len(amounts), "over_hard": over_h, "over_target": len(over_t),
+            "share_ok": round(float((amounts["krw"] <= hard).mean() * 100), 1)}
+
+
+def buy_qty_for_budget(price_usd: float, fx: float, target: float, hard: float) -> dict:
+    """원칙 금액 안에서 살 수 있는 주식 수(정수, 키움 LOC 기준)."""
+    if not price_usd or price_usd <= 0:
+        return {"qty": 0, "krw": 0}
+    per = price_usd * fx
+    q = int(target // per)
+    if q == 0 and per <= hard:
+        q = 1
+    return {"qty": q, "krw": round(q * per), "per_share_krw": round(per)}
+
+
+def leverage_of(ticker: str) -> int:
+    cat = category_of(ticker) if ticker in SIGNAL_UNIVERSE else None
+    if cat == "3배 ETF":
+        return 3
+    if cat == "2배 ETF":
+        return 2
+    for _, levs in THEME_ETFS.values():
+        for t, k in levs:
+            if t == ticker:
+                return k
+    return 1
+
+
+SEMI_TICKERS = {"SOXL", "USD", "SOXX", "NVDA", "AVGO", "MU", "MRVL", "AMD", "TSM", "SMH", "SKHY"}
+
+
+def exposure_table(rows: list[dict]) -> pd.DataFrame:
+    """rows = [{account, ticker, qty, price}] → 금액·레버리지·반도체 여부."""
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["value"] = df["qty"].astype(float) * df["price"].astype(float)
+    df["lev"] = df["ticker"].map(leverage_of)
+    df["semi"] = df["ticker"].isin(SEMI_TICKERS)
+    return df
+
+
+def stress_test(exp: pd.DataFrame, shocks=(-0.10, -0.20, -0.30), cash: float = 0.0) -> pd.DataFrame:
+    """기초자산이 하루에 shock만큼 빠질 때 예상 손실(레버리지 배수 × 하락, -100% 한도). 현금은 그대로."""
+    total = float(exp["value"].sum()) + cash if not exp.empty else cash
+    rows = []
+    for sc in shocks:
+        for name, mask in (("반도체만", exp["semi"]), ("시장 전체", pd.Series(True, index=exp.index))):
+            loss = float((exp.loc[mask, "value"] * (exp.loc[mask, "lev"] * sc).clip(lower=-1.0)).sum())
+            rows.append({"시나리오": f"{name} {sc * 100:.0f}%", "예상 손실($)": round(loss, 0),
+                         "전체 자산 대비(%)": round(loss / total * 100, 1) if total else np.nan})
+    return pd.DataFrame(rows)
+
+
+def realized_by_year(journal: pd.DataFrame, year: int) -> pd.DataFrame:
+    """계좌별 그해 실현 손익(USD, 이동평균 원가법). 일지에 빠진 매수가 있으면 과소·과대 계산될 수 있음."""
+    rows = []
+    if journal is None or journal.empty:
+        return pd.DataFrame(columns=["Account", "Ticker", "realized_usd", "sells"])
+    for (acc, tk), g in journal.groupby(["Account", "Ticker"]):
+        qty = cost = 0.0
+        real, n = 0.0, 0
+        for r in sort_trades(g).itertuples(index=False):
+            q, pr = float(r.Qty), float(r.Price)
+            if not (q > 0 and pr > 0):
+                continue
+            if r.Action == "Buy":
+                qty += q
+                cost += q * pr
+            elif r.Action == "Sell" and qty > 1e-12:
+                sq = min(q, qty)
+                avg = cost / qty
+                if str(r.Date)[:4] == str(year):
+                    real += (pr - avg) * sq
+                    n += 1
+                cost -= avg * sq
+                qty -= sq
+                if qty <= 1e-9:
+                    qty = cost = 0.0
+        rows.append({"Account": acc, "Ticker": tk, "realized_usd": round(real, 2), "sells": n})
+    return pd.DataFrame(rows)
+
+
+def harvest_plan(realized_krw: float, accounts: pd.DataFrame, price: float, fx: float) -> dict:
+    """올해 과세 대상 이익을 0으로 만들려면 몇 주를 팔아야 하나 (같은 날 재매수 전제).
+    accounts = [Account, Qty, Avg]. 손실이 큰 계좌부터 채움."""
+    taxable = max(0.0, realized_krw - TAX["deduction_krw"])
+    out = {"realized_krw": realized_krw, "taxable_krw": taxable, "tax_krw": round(taxable * TAX["rate"]),
+           "rows": pd.DataFrame(), "shares": 0, "covered_krw": 0.0}
+    if taxable <= 0 or accounts is None or accounts.empty or not price:
+        return out
+    acc = accounts.copy()
+    acc["loss_per_share_krw"] = (acc["Avg"].astype(float) - price) * fx
+    acc = acc[acc["loss_per_share_krw"] > 0].sort_values("loss_per_share_krw", ascending=False)
+    need, rows = taxable, []
+    for _, r in acc.iterrows():
+        if need <= 0:
+            break
+        per = float(r["loss_per_share_krw"])
+        q = int(min(float(r["Qty"]), np.ceil(need / per)))
+        if q <= 0:
+            continue
+        rows.append({"계좌": r["Account"], "팔 주식 수": q, "주당 손실(원)": round(per), "실현 손실(원)": round(q * per)})
+        need -= q * per
+    df = pd.DataFrame(rows)
+    out.update({"rows": df, "shares": int(df["팔 주식 수"].sum()) if not df.empty else 0,
+                "covered_krw": float(df["실현 손실(원)"].sum()) if not df.empty else 0.0})
+    return out
+
+
+def cycle_status(qty: float, avg: float, t: float, price: float, method: str = "①", budget_krw: float = 0,
+                 unit_krw: float = 250_000, fx: float = 1350.0) -> dict:
+    """무한매수 사이클 상태: 회차, 목표가(①=평단+10%, V2형=별지점), 손익, 남은 예산."""
+    _, splits, target, star = CYCLE_METHODS.get(method, CYCLE_METHODS["기타"])
+    sell_px = avg * (1 + target) if avg else np.nan
+    star_px = avg * (1 + target - t / 2 / 100 * (40 / splits)) if (star and avg) else np.nan
+    invested_krw = qty * avg * fx
+    return {"회차": round(t, 1), "진행률(%)": round(t / splits * 100, 0), "평단($)": round(avg, 2),
+            "목표가($)": round(sell_px, 2) if pd.notna(sell_px) else np.nan,
+            "별지점($)": round(star_px, 2) if pd.notna(star_px) else np.nan,
+            "현재 손익(%)": round((price / avg - 1) * 100, 1) if avg else np.nan,
+            "투입(원)": round(invested_krw), "남은 예산(원)": round(max(budget_krw - invested_krw, 0)) if budget_krw else np.nan,
+            "남은 회차": int(max(budget_krw - invested_krw, 0) // unit_krw) if budget_krw and unit_krw else np.nan}
 
 
 def sb_fetch_all(sb, table: str, eq: dict | None = None, page: int = 1000) -> list[dict]:

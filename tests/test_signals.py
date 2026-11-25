@@ -445,3 +445,28 @@ def test_portfolio_method_champion():
     short = core.portfolio_verdicts(curves.iloc[:10], "pf_harvest")
     assert short["pf_month"][0] == "short"
     assert core.PORTFOLIO_MODE[core.PORTFOLIO_CHAMPION] == "수익 실현형"
+
+
+def test_principles_risk_tax_cycle():
+    j = pd.DataFrame({"Date": ["2026-03-02", "2026-03-02", "2026-03-03", "2026-03-04", "2025-12-01"],
+                      "Time": ["10:00:00"] * 5, "Account": ["A", "A", "A", "A", "A"], "Ticker": ["SOXL"] * 5,
+                      "Action": ["Buy", "Buy", "Buy", "Sell", "Buy"], "Qty": [1.0, 1.0, 2.0, 2.0, 1.0],
+                      "Price": [100.0, 100.0, 100.0, 120.0, 90.0], "Format": ["x"] * 5})
+    amt = core.daily_buy_amounts(j, 1000)
+    chk = core.check_buy_principle(amt, 250_000, 300_000)
+    assert len(chk["over_hard"]) == 0 and chk["days"] == 3
+    chk2 = core.check_buy_principle(amt, 150_000, 180_000)
+    assert len(chk2["over_hard"]) == 2
+    assert core.buy_qty_for_budget(35.0, 1350, 250_000, 300_000)["qty"] == 5
+    real = core.realized_by_year(j, 2026).set_index("Account")
+    assert real.loc["A", "realized_usd"] > 0 and real.loc["A", "sells"] == 1
+    exp = core.exposure_table([{"ticker": "SOXL", "qty": 10, "price": 30}, {"ticker": "SPY", "qty": 1, "price": 600}])
+    st_ = core.stress_test(exp, shocks=(-0.30,)).set_index("시나리오")
+    assert st_.loc["반도체만 -30%", "예상 손실($)"] == -270 and st_.loc["시장 전체 -30%", "예상 손실($)"] == -450
+    acc = pd.DataFrame({"Account": ["X", "Y"], "Qty": [38, 38], "Avg": [164.0, 160.0]})
+    hp = core.harvest_plan(27_790_000, acc, 35.0, 1340)
+    assert hp["taxable_krw"] == 25_290_000 and hp["shares"] == 76          # 두 계좌로는 모자람 → 전부
+    hp2 = core.harvest_plan(5_000_000, acc, 35.0, 1340)
+    assert hp2["covered_krw"] >= hp2["taxable_krw"] and hp2["shares"] == 15
+    cs = core.cycle_status(38, 164.23, 26, 35.0, "①", 10_000_000, 250_000, 1340)
+    assert cs["목표가($)"] == round(164.23 * 1.1, 2) and cs["남은 예산(원)"] >= 0

@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-10"
+REQUIRED_CORE_VERSION = "2026.11.25-11"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1002,6 +1002,350 @@ def render_breakeven(ticker: str, journal_avg: float | None) -> None:
     base_layout(fig, 260)
     fig.update_yaxes(title_text="본전까지 필요한 지수 상승률(%) · 즉시 기준")
     show_chart(fig, key=f"be_chart_{ticker}")
+
+
+# ==========================================================================
+# 공용: 설정 저장소 (valhalla_portfolio_settings, key별 JSON)
+# ==========================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def load_settings(key: str, backend_name: str) -> dict:
+    if backend_name != "supabase":
+        return {}
+    try:
+        rows = core.sb_fetch_all(get_supabase(), core.PORTFOLIO_SETTINGS, {"key": key})
+        return rows[0]["value"] if rows else {}
+    except Exception as exc:
+        LOGGER.warning("설정 조회 실패(%s): %s", key, exc)
+        return {}
+
+
+def save_settings(key: str, value: dict) -> None:
+    get_supabase().table(core.PORTFOLIO_SETTINGS).upsert({"key": key, "value": value}, on_conflict="key").execute()
+    load_settings.clear()
+    load_portfolio.clear()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_insight(backend_name: str) -> dict:
+    if backend_name != "supabase":
+        return {}
+    try:
+        rows = core._rows(get_supabase().table(core.INSIGHT_TABLE).select("*").order("day", desc=True).limit(1).execute())
+        return {**rows[0]["payload"], "_day": rows[0]["day"]} if rows else {}
+    except Exception as exc:
+        LOGGER.warning("인사이트 조회 실패: %s", exc)
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_last_run(backend_name: str) -> dict:
+    if backend_name != "supabase":
+        return {}
+    try:
+        rows = core._rows(get_supabase().table("valhalla_job_runs").select("*").eq("source", "signals")
+                          .order("id", desc=True).limit(1).execute())
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def kiwoom_cycles(plan: dict, journal: pd.DataFrame) -> pd.DataFrame:
+    """키움 무한매수 계좌 표: 저장된 표가 있으면 그것, 없으면 매매 일지로 계산한 값."""
+    cols = ["계좌", "기법", "보유 수량", "평단($)", "회차", "예산(원)", "1회 매수(원)"]
+    saved = plan.get("cycles")
+    if saved:
+        return pd.DataFrame(saved)[cols]
+    rows = []
+    if journal is not None and not journal.empty:
+        for acc, g in journal[journal["Ticker"] == "SOXL"].groupby("Account"):
+            pos = core.compute_position(g)
+            if pos.qty > 0:
+                rows.append({"계좌": str(acc), "기법": "①", "보유 수량": round(pos.qty, 4), "평단($)": round(pos.avg, 2),
+                             "회차": pos.buy_count, "예산(원)": 10_000_000,
+                             "1회 매수(원)": plan.get("buy_target_krw", core.DEFAULT_PRINCIPLES["buy_target_krw"])})
+    return pd.DataFrame(rows, columns=cols)
+
+
+# ==========================================================================
+# 페이지: 발할라 브리핑 (오늘 할 일 · 지금 상태 · 일정 · 데이터가 알려준 교훈)
+# ==========================================================================
+def page_briefing() -> None:
+    page_header("BRIEFING", "발할라 브리핑", "오늘 할 일 · 지금 상태 · 이번 주 일정 · 지금까지 데이터가 알려준 것",
+                [("매일 아침 자동 갱신", ACCENT)])
+    ins = load_insight(backend())
+    plan = {**core.DEFAULT_PRINCIPLES, **load_settings(core.SETTINGS_KEY_PLAN, backend())}
+    holdings, pset = load_portfolio(backend())
+    fx = fetch_usdkrw() or 1350.0
+    now = pd.Timestamp(now_kst().replace(tzinfo=None))
+    snap = load_snapshot(("SOXL", "SOXX", "^SOX"))
+    soxl = snap.get("SOXL")
+    tasks: list[tuple[str, str]] = []
+
+    # 12월 손실 실현
+    dec1 = pd.Timestamp(f"{now.year}-12-01")
+    if pd.Timestamp(f"{now.year}-11-20") <= now <= pd.Timestamp(f"{now.year}-12-22"):
+        d = (dec1.normalize() - now.normalize()).days
+        tasks.append(("warn", f"12월 손실 실현 {'D-' + str(d) if d > 0 else '진행 기간'} · 세금·사이클 페이지에서 팔 주식 수를 확인하세요 "
+                              "(팔고 같은 날 다시 사기, 연내 결제 마감 전에)."))
+    # 반등 판별 감시선
+    reb = (ins.get("rebound") or {}).get("latest") or {}
+    if reb and reb.get("outcome") is None:
+        tasks.append(("info", f"반도체 반등({str(reb.get('date'))[:10]} {reb.get('trigger')}) 판정 대기 · SOX {reb['prior_low']:,.0f} 아래로 "
+                              "내려가면 '일시 반등' 확정이에요. 그 전까지는 추세 전환 가능성 열어두기."))
+    # 토스 리밸런싱
+    port = ins.get("portfolio") or {}
+    if port and not holdings.empty:
+        champ = pset.get("champion", core.PORTFOLIO_CHAMPION)
+        tgt = {k: float(v) for k, v in (port.get("base") or {}).items()}
+        tick = tuple(sorted({str(t).upper() for t in holdings["ticker"]} | {k for k in tgt if k != "CASH"}))
+        prices = {t: v[0] for t, v in load_snapshot(tick).items()}
+        if champ == "pf_harvest":
+            orders = core.harvest_orders(holdings.assign(ticker=holdings["ticker"].str.upper()), prices,
+                                         core.with_cash_buffer(tgt, float(pset.get("cash_buffer", core.HARVEST["cash"]))),
+                                         cash=float(pset.get("cash_krw", 0) or 0) / fx, band=float(pset.get("band", core.HARVEST["band"])))
+        else:
+            orders = core.rebalance_orders(holdings.assign(ticker=holdings["ticker"].str.upper()), prices, tgt)
+        act = orders[orders["주문"].isin(["매수", "매도"])]
+        if not act.empty:
+            txt = ", ".join(f"{r['종목']} {r['주문']} ${r['금액($)']:,.0f}" for _, r in act.head(4).iterrows())
+            tasks.append(("info", f"토스 계좌 리밸런싱 제안 ({core.PORTFOLIO_PLAYERS[champ].split(' (')[0]}): {txt} · 내 포트폴리오 페이지"))
+    # 일봉 리그 오늘 신호 (SOXL)
+    led = load_daily_ledger(backend())
+    if not led.empty:
+        s_ = led[led["ticker"] == "SOXL"].copy()
+        if not s_.empty:
+            s_["day"] = pd.to_datetime(s_["day"])
+            piv = s_.pivot_table(index="day", columns="player", values="position", aggfunc="last").sort_index()
+            today = core.daily_today(piv)
+            fired = today[today["오늘 신호"] != ""]
+            if not fired.empty:
+                tasks.append(("stop", f"일봉 리그 SOXL {piv.index[-1]:%m/%d} 신호: " + ", ".join(
+                    f"{core.player_label(r['id'])} {r['오늘 신호']}" for _, r in fired.iterrows())))
+    # 원칙 점검 (최근 2주 매수)
+    journal, _ = load_table("trade_journal")
+    amt = core.daily_buy_amounts(journal, fx)
+    recent = amt[pd.to_datetime(amt["Date"]) >= now - pd.Timedelta(days=14)] if not amt.empty else amt
+    if not recent.empty:
+        chk = core.check_buy_principle(recent, plan["buy_target_krw"], plan["buy_max_krw"])
+        if len(chk["over_hard"]):
+            tasks.append(("stop", f"투자 원칙 위반 {len(chk['over_hard'])}건: 최근 2주 하루 매수가 {plan['buy_max_krw']:,}원을 넘은 날이 있어요."))
+    if not journal.empty and pd.to_datetime(journal["Date"]).max() < now - pd.Timedelta(days=14):
+        tasks.append(("warn", f"매매 일지가 {pd.to_datetime(journal['Date']).max():%m/%d}에서 멈춰 있어요. 키움 CSV를 동기화하면 원칙 점검·세금 장부가 정확해져요."))
+    # 가까운 일정
+    ev = core.upcoming_events(now, days=3)
+    for _, e in ev.iterrows():
+        tasks.append(("info", f"{e['when']:%m/%d %H:%M} {e['일정']}{'' if e['확정'] else ' (미확정)'} · {e['메모']}"))
+    # 데이터 상태
+    run = load_last_run(backend())
+    if run:
+        ran = pd.Timestamp(run["ran_at"])
+        if (now - ran) > pd.Timedelta(hours=30):
+            tasks.append(("warn", f"자동 점검이 {ran:%m/%d %H:%M} 이후 멈춰 있어요. 숫자가 오래됐을 수 있어요."))
+
+    section("오늘 할 일", f"{now:%m월 %d일 %H:%M} 기준. 행동이 필요한 것만 모았어요.")
+    if not tasks:
+        st.success("오늘은 따로 할 일이 없어요. 차트를 덜 보는 것도 전략이에요.", icon=":material/self_improvement:")
+    for kind, text in tasks:
+        icon = {"stop": ":material/priority_high:", "warn": ":material/schedule:", "info": ":material/info:"}[kind]
+        (st.error if kind == "stop" else st.warning if kind == "warn" else st.info)(text, icon=icon)
+
+    section("지금 상태")
+    c = st.columns(4)
+    if soxl:
+        c[0].metric("SOXL", f"${soxl[0]:.2f}", f"{soxl[1]:+.1f}%", border=True)
+    pos, _ = load_arena(backend())
+    if not pos.empty:
+        v1 = pos[(pos["ticker"] == "SOXL") & (pos["player"] == "rule_v1")].sort_values("week")
+        if not v1.empty:
+            c[1].metric("규칙 v1 (SOXL)", "보유" if float(v1["position"].iloc[-1]) >= 0.5 else "쉬는 중",
+                        f"{str(v1['week'].iloc[-1])[:10]} 주", delta_color="off", delta_arrow="off", border=True)
+    champ_p = load_champion_state(backend())["champion"]["player"]
+    c[2].metric("경기장 챔피언", core.player_label(champ_p), border=True)
+    if port:
+        c[3].metric("토스 테마", f"{port.get('lead') or '—'} · {port.get('rising') or '—'}",
+                    "주도 · 떠오르는", delta_color="off", delta_arrow="off", border=True)
+
+    section("이번 주 일정 (한국 시간)")
+    ev = core.upcoming_events(now, days=10)
+    if ev.empty:
+        st.caption("가까운 일정이 없어요.")
+    else:
+        st.dataframe(pd.DataFrame({"날짜": ev["when"].dt.strftime("%m/%d %H:%M"), "일정": ev["일정"],
+                                   "확정": ev["확정"].map({True: "확정", False: "미확정"})}), hide_index=True, width="stretch")
+
+    section("지금까지 데이터가 알려준 것", "실제 기록과 백테스트에서 나온 교훈이에요. 매일 아침 숫자가 갱신돼요.")
+    lessons = []
+    if ins.get("beat_share") is not None:
+        lessons.append(f"**신호만 믿고 사면 안 돼요.** 매수 신호가 '평소'보다 나았던 종목은 최근 2년 검증 구간에서 {ins['beat_share']:.0f}%뿐이에요. (연구실)")
+    rb = ins.get("rebound") or {}
+    if rb.get("reversal_share") is not None:
+        lessons.append(f"**큰 반등에 흥분하지 마세요.** 1994년 이후 반도체 큰 반등 {rb['events']}건 중 추세 전환은 {rb['reversal_share']:.0f}%, "
+                       f"하루 +5% 급반등만 보면 {rb.get('day5_share') or 0:.0f}%예요. (선수 경기장 → 반등 판별전)")
+    if rb.get("macro"):
+        m = rb["macro"]
+        lessons.append(f"**흔한 거시 조건으로는 바닥을 못 맞혀요.** 금리·VIX·신용 스프레드 체크리스트는 {m['n']}건에서 '과거 확률'과 거의 같은 "
+                       f"정확도였어요(차이 {m['vs_base']:+.3f}). (시장 레이더)")
+    if port.get("table"):
+        t = pd.DataFrame(port["table"]).set_index("id")
+        if {"pf_harvest", "bm_soxl"} <= set(t.index):
+            lessons.append(f"**현금 완충이 낙폭을 줄여요.** 2018년 이후 SOXL만 들고 있으면 최대 낙폭 {t.loc['bm_soxl', '최대 낙폭(%)']:.0f}%, "
+                           f"SOXL 핵심 + 테마 + 현금 20% 수익 실현형은 {t.loc['pf_harvest', '최대 낙폭(%)']:.0f}%였어요. (내 포트폴리오)")
+    lessons.append(f"**한 번에 많이 사지 않기.** 무한매수는 하루 {plan['buy_target_krw']:,}원, 최대 {plan['buy_max_krw']:,}원까지. "
+                   "올해 손실의 핵심은 종목보다 '3배 레버리지 한 종목에 자산 대부분'이었다는 점이에요. (원칙·위험)")
+    for l_ in lessons:
+        st.markdown(f"- {l_}")
+    if ins:
+        st.caption(f"교훈 숫자 기준일 {str(ins.get('_day'))[:10]} (매일 아침 자동 점검).")
+    else:
+        st.caption("아직 자동 점검의 인사이트 기록이 없어요. 다음 자동 점검 뒤부터 숫자가 채워져요.")
+
+
+# ==========================================================================
+# 페이지: 원칙 · 위험 관리
+# ==========================================================================
+def page_principles() -> None:
+    page_header("PRINCIPLES & RISK", "원칙 · 위험 관리", "나의 투자 원칙과 지키고 있는지 점검 · 키움+토스 전체 위험",
+                [("재기를 위한 안전장치", GOLD)])
+    plan = {**core.DEFAULT_PRINCIPLES, **load_settings(core.SETTINGS_KEY_PLAN, backend())}
+    fx = fetch_usdkrw() or 1350.0
+    section("나의 투자 원칙")
+    c = st.columns([1, 1, 2])
+    tgt = c[0].number_input("무한매수 하루 매수 목표 (원)", 50_000, 2_000_000, int(plan["buy_target_krw"]), 10_000, key="pp_t")
+    mx = c[1].number_input("하루 매수 최대 (원)", 50_000, 2_000_000, int(plan["buy_max_krw"]), 10_000, key="pp_m")
+    extra = c[2].text_area("추가 원칙 (한 줄에 하나)", "\n".join(plan.get("extra") or []), height=110, key="pp_x",
+                           placeholder="예) 3배 레버리지는 전체 자산의 50%까지\n예) 현금은 항상 20% 이상")
+    if st.button("원칙 저장", type="primary", key="pp_save") and backend() == "supabase":
+        save_settings(core.SETTINGS_KEY_PLAN, {**plan, "buy_target_krw": tgt, "buy_max_krw": mx,
+                                               "extra": [x.strip() for x in extra.splitlines() if x.strip()]})
+        flash("투자 원칙을 저장했어요.")
+        st.rerun()
+    st.markdown(f"1. **무한매수는 한 계좌에서 하루 {tgt:,}원씩, 아무리 많아도 {mx:,}원을 넘기지 않는다.**")
+    for i, x in enumerate(plan.get("extra") or [], start=2):
+        st.markdown(f"{i}. {x}")
+    snap = load_snapshot(("SOXL",))
+    if "SOXL" in snap:
+        q = core.buy_qty_for_budget(snap["SOXL"][0], fx, tgt, mx)
+        st.info(f"오늘 SOXL ${snap['SOXL'][0]:.2f} · 환율 {fx:,.0f}원 → 원칙 안에서 하루 **{q['qty']}주** "
+                f"(약 {q['krw']:,}원, 1주 {q.get('per_share_krw', 0):,}원)", icon=":material/shopping_cart:")
+
+    section("원칙을 지키고 있나요?", "키움 매매 일지로 계좌·날짜별 하루 매수 금액을 점검해요 (현재 환율로 원화 환산한 대략치).")
+    journal, _ = load_table("trade_journal")
+    amt = core.daily_buy_amounts(journal, fx)
+    if amt.empty:
+        st.caption("매매 일지가 비어 있어요.")
+    else:
+        chk = core.check_buy_principle(amt, tgt, mx)
+        m = st.columns(3)
+        m[0].metric("점검한 매수일", f"{chk['days']}일", border=True)
+        m[1].metric(f"{mx:,}원 넘은 날", f"{len(chk['over_hard'])}일", border=True)
+        m[2].metric("원칙 지킨 비율", f"{chk['share_ok']:.0f}%", border=True)
+        if len(chk["over_hard"]):
+            st.dataframe(chk["over_hard"].rename(columns={"Account": "계좌", "Date": "날짜", "Ticker": "종목", "usd": "매수($)", "krw": "매수(원)"})
+                         .sort_values("날짜", ascending=False).head(30), hide_index=True, width="stretch")
+        st.caption(f"매매 일지 마지막 날짜: {pd.to_datetime(journal['Date']).max():%Y-%m-%d}. 12월 새 사이클부터는 이 표가 0건이어야 해요.")
+
+    section("전체 위험 (키움 + 토스)", "레버리지 ETF가 하루에 크게 빠지면 내 전체 자산이 얼마나 줄어드는지 미리 봐요.")
+    cycles = kiwoom_cycles(plan, journal)
+    holdings, pset = load_portfolio(backend())
+    tick = tuple(sorted({"SOXL"} | {str(t).upper() for t in holdings["ticker"]}))
+    prices = {t: v[0] for t, v in load_snapshot(tick).items()}
+    rows = [{"account": f"키움 {r['계좌']}", "ticker": "SOXL", "qty": float(r["보유 수량"]), "price": prices.get("SOXL", np.nan)}
+            for _, r in cycles.iterrows()]
+    rows += [{"account": "토스", "ticker": str(r["ticker"]).upper(), "qty": float(r["shares"]),
+              "price": prices.get(str(r["ticker"]).upper(), np.nan)} for _, r in holdings.iterrows()]
+    cash_usd = (float(plan.get("kiwoom_cash_krw", 0) or 0) + float(pset.get("cash_krw", 0) or 0)) / fx
+    exp = core.exposure_table([r for r in rows if pd.notna(r["price"])])
+    if exp.empty:
+        st.caption("보유 내역이 없어요.")
+        return
+    total = float(exp["value"].sum()) + cash_usd
+    lev_share = float(exp.loc[exp["lev"] >= 2, "value"].sum() / total * 100)
+    semi_share = float(exp.loc[exp["semi"], "value"].sum() / total * 100)
+    top = exp.groupby("ticker")["value"].sum().sort_values(ascending=False)
+    m = st.columns(4)
+    m[0].metric("전체 자산", fmt_usd(total), fmt_krw(total * fx), delta_color="off", delta_arrow="off", border=True)
+    m[1].metric("레버리지(2·3배) 비중", f"{lev_share:.0f}%", border=True)
+    m[2].metric("반도체 비중", f"{semi_share:.0f}%", border=True)
+    m[3].metric("가장 큰 종목", f"{top.index[0]} {top.iloc[0] / total * 100:.0f}%", border=True)
+    st.dataframe(core.stress_test(exp, cash=cash_usd), hide_index=True, width="stretch",
+                 column_config={"예상 손실($)": st.column_config.NumberColumn(format="$%.0f"),
+                                "전체 자산 대비(%)": st.column_config.NumberColumn(format="%.1f%%")})
+    st.caption("하루에 기초 지수가 그만큼 빠질 때 3배 ETF는 약 3배, 2배는 2배로 빠진다고 본 대략치예요. 현금은 그대로 둬요. "
+               "키움 보유는 '세금·사이클' 페이지의 계좌 표를, 현금은 아래 입력값을 써요.")
+    kc = st.number_input("키움 계좌들 현금 합계 (원)", 0, 1_000_000_000, int(plan.get("kiwoom_cash_krw", 0) or 0), 100_000, key="pp_kc")
+    if st.button("현금 저장", key="pp_kc_save") and backend() == "supabase":
+        save_settings(core.SETTINGS_KEY_PLAN, {**plan, "kiwoom_cash_krw": kc})
+        st.rerun()
+
+
+# ==========================================================================
+# 페이지: 세금 장부 · 무한매수 사이클
+# ==========================================================================
+def page_ledger() -> None:
+    page_header("TAX & CYCLES", "세금 · 사이클", "무한매수 계좌별 사이클 관리 · 올해 해외주식 양도세와 12월 손실 실현 계산",
+                [("세금은 참고용 · 최종 확인은 증권사", GOLD)])
+    plan = {**core.DEFAULT_PRINCIPLES, **load_settings(core.SETTINGS_KEY_PLAN, backend())}
+    fx = fetch_usdkrw() or 1350.0
+    journal, _ = load_table("trade_journal")
+    price = (load_snapshot(("SOXL",)).get("SOXL") or (np.nan,))[0]
+    t1, t2 = st.tabs(["무한매수 사이클", "세금 장부 · 12월 손실 실현"])
+    with t1:
+        st.caption("계좌마다 기법·보유 수량·평단·회차·예산을 적어 두면 목표가와 남은 회차를 계산해요. 처음에는 매매 일지로 채웠어요 "
+                   "(일지가 멈춘 뒤 거래는 직접 고쳐 주세요). 기법: ①=40분할 +10% 전량 익절, ②=V2 별지점, ④=V2+쿼터 손절+200일선.")
+        cyc = kiwoom_cycles(plan, journal)
+        edited = st.data_editor(cyc, num_rows="dynamic", width="stretch", key="cyc_editor",
+                                column_config={"기법": st.column_config.SelectboxColumn(options=list(core.CYCLE_METHODS)),
+                                               "평단($)": st.column_config.NumberColumn(format="%.2f"),
+                                               "예산(원)": st.column_config.NumberColumn(format="%d"),
+                                               "1회 매수(원)": st.column_config.NumberColumn(format="%d")})
+        if st.button("계좌 표 저장", type="primary", key="cyc_save") and backend() == "supabase":
+            save_settings(core.SETTINGS_KEY_PLAN, {**plan, "cycles": edited.dropna(subset=["계좌"]).to_dict("records")})
+            flash("무한매수 계좌 표를 저장했어요.")
+            st.rerun()
+        if pd.notna(price) and not edited.empty:
+            rows = []
+            for _, r in edited.dropna(subset=["계좌"]).iterrows():
+                unit = float(r.get("1회 매수(원)") or plan["buy_target_krw"])
+                stt = core.cycle_status(float(r["보유 수량"] or 0), float(r["평단($)"] or 0), float(r["회차"] or 0), price,
+                                        str(r.get("기법") or "①"), float(r.get("예산(원)") or 0), unit, fx)
+                q = core.buy_qty_for_budget(price, fx, min(unit, plan["buy_max_krw"]), plan["buy_max_krw"])
+                over = " ⚠️원칙 초과" if unit > plan["buy_max_krw"] else ""
+                rows.append({"계좌": r["계좌"], "기법": r.get("기법"), **stt, "오늘 살 수량": f"{q['qty']}주 (≈{q['krw']:,}원){over}"})
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                         column_config={"투입(원)": st.column_config.NumberColumn(format="%d"),
+                                        "남은 예산(원)": st.column_config.NumberColumn(format="%d")})
+            st.caption(f"SOXL ${price:.2f} · 환율 {fx:,.0f}원. 목표가는 ①이면 평단 +10%, V2형은 별지점(평단 × (1.10 − 회차/200))도 함께 봐요. "
+                       f"오늘 살 수량은 원칙({plan['buy_target_krw']:,}원, 최대 {plan['buy_max_krw']:,}원) 안에서 계산했어요.")
+    with t2:
+        year = now_kst().year
+        real = core.realized_by_year(journal, year)
+        kiwoom_usd = float(real.loc[real["Ticker"] == "SOXL", "realized_usd"].sum()) if not real.empty else 0.0
+        st.caption(f"매매 일지로 계산한 키움 {year}년 실현 손익: ${kiwoom_usd:,.0f} (≈{kiwoom_usd * fx:,.0f}원, 현재 환율 환산). "
+                   "일지가 8월 이후 비어 있거나 매수가 빠져 있으면 실제와 달라요. 정확한 값은 증권사 '양도소득 예상' 화면 숫자를 아래에 넣으세요.")
+        c = st.columns(3)
+        k_in = c[0].number_input("키움 올해 실현 이익 (원)", -1_000_000_000, 1_000_000_000,
+                                 int(plan.get("realized_kiwoom_krw", round(kiwoom_usd * fx))), 100_000, key="tx_k")
+        t_in = c[1].number_input("토스 올해 실현 이익 (원)", -1_000_000_000, 1_000_000_000,
+                                 int(plan.get("realized_toss_krw", 0) or 0), 100_000, key="tx_t")
+        if c[2].button("저장", key="tx_save") and backend() == "supabase":
+            save_settings(core.SETTINGS_KEY_PLAN, {**plan, "realized_kiwoom_krw": k_in, "realized_toss_krw": t_in})
+            st.rerun()
+        cyc = kiwoom_cycles(plan, journal).rename(columns={"계좌": "Account", "보유 수량": "Qty", "평단($)": "Avg"})
+        hp = core.harvest_plan(k_in + t_in, cyc[["Account", "Qty", "Avg"]], price, fx)
+        m = st.columns(4)
+        m[0].metric("올해 실현 이익 합계", f"{hp['realized_krw']:,.0f}원", border=True)
+        m[1].metric("공제 뒤 과세 대상", f"{hp['taxable_krw']:,.0f}원", f"공제 {core.TAX['deduction_krw']:,}원", delta_color="off",
+                    delta_arrow="off", border=True)
+        m[2].metric("예상 세금 (22%)", f"{hp['tax_krw']:,.0f}원", border=True)
+        m[3].metric("상쇄에 필요한 SOXL 매도", f"{hp['shares']}주", f"실현 손실 {hp['covered_krw']:,.0f}원", delta_color="off",
+                    delta_arrow="off", border=True)
+        if not hp["rows"].empty:
+            st.dataframe(hp["rows"], hide_index=True, width="stretch")
+            if hp["covered_krw"] < hp["taxable_krw"]:
+                st.warning("지금 계좌 표의 손실만으로는 과세 대상을 다 상쇄하지 못해요.", icon=":material/warning:")
+        st.caption(f"SOXL ${price:.2f}, 환율 {fx:,.0f}원 기준. 손실이 큰 계좌부터 필요한 만큼만 팔고 같은 날 다시 사는 계획이에요. "
+                   "세금은 살 때·팔 때 환율로 계산돼서 실제와 다를 수 있어요. 손실은 다음 해로 넘어가지 않으니 필요한 만큼만, "
+                   "미국 주식은 다음 영업일 결제라 연말 마감 전에 여유 있게 하세요. 최종 판단은 증권사·세무 상담으로 확인하세요.")
 
 
 # ==========================================================================
@@ -2653,23 +2997,29 @@ def render_arena(ticker: str, partner: str) -> None:
             st.markdown(this[this["ticker"] == pick]["minutes"].iloc[0] or "—")
 
 
+def signal_selector(prefix: str) -> tuple[str, str]:
+    """섹터 → 유형 → 종목 선택 (페이지마다 같은 모양)."""
+    c = st.columns([1, 1, 1, 1, 1.4], vertical_alignment="bottom")
+    sector = c[0].selectbox("섹터", core.SECTORS + ["직접 입력"], key=f"{prefix}_sector")
+    if sector == "직접 입력":
+        ticker = c[2].text_input("종목", "SOXL", key=f"{prefix}_ticker").upper().strip()
+        partner = c[3].text_input("비교 지수", core.partner_of(ticker), key=f"{prefix}_partner").upper().strip()
+    else:
+        cats = [k for k in core.CATEGORIES if any(v[1] == k and v[2] == sector for v in core.SIGNAL_UNIVERSE.values())]
+        cat = c[1].selectbox("유형", cats, key=f"{prefix}_cat_{sector}")
+        options = [t for t, (_, k, sec) in core.SIGNAL_UNIVERSE.items() if k == cat and sec == sector]
+        ticker = c[2].selectbox("종목", options, key=f"{prefix}_pick_{sector}_{cat}")
+        partner = core.partner_of(ticker)
+        c[3].text_input("비교 지수", partner, disabled=True, key=f"{prefix}_partner_{ticker}")
+    c[4].caption("섹터와 레버리지(3배·2배·1배·개별 종목)가 다르면 확률과 적중률을 섞지 않고 따로 계산합니다.")
+    return ticker, partner
+
+
 def page_signals() -> None:
     page_header("SIGNAL ROOM", "신호 관제",
                 "반등 신호 점수판 · 과거 같은 점수의 실제 결과 · 매주 남기는 예측과 채점",
                 [("주봉 기준", ACCENT), ("확률 = 과거 실제 비율", GOLD)])
-    c = st.columns([1, 1, 1, 1, 1.4], vertical_alignment="bottom")
-    sector = c[0].selectbox("섹터", core.SECTORS + ["직접 입력"], key="sig_sector")
-    if sector == "직접 입력":
-        ticker = c[2].text_input("종목", "SOXL", key="sig_ticker").upper().strip()
-        partner = c[3].text_input("비교 지수", core.partner_of(ticker), key="sig_partner").upper().strip()
-    else:
-        cats = [k for k in core.CATEGORIES if any(v[1] == k and v[2] == sector for v in core.SIGNAL_UNIVERSE.values())]
-        cat = c[1].selectbox("유형", cats, key=f"sig_cat_{sector}")
-        options = [t for t, (_, k, sec) in core.SIGNAL_UNIVERSE.items() if k == cat and sec == sector]
-        ticker = c[2].selectbox("종목", options, key=f"sig_pick_{sector}_{cat}")
-        partner = core.partner_of(ticker)
-        c[3].text_input("비교 지수", partner, disabled=True, key=f"sig_partner_{ticker}")
-    c[4].caption("섹터와 레버리지(3배·2배·1배·개별 종목)가 다르면 확률과 적중률을 섞지 않고 따로 계산합니다.")
+    ticker, partner = signal_selector("sig")
     with st.spinner("10년 이상 주봉 데이터로 신호를 계산하는 중…"):
         hist = load_signal_history(ticker, partner)
     if hist is None or hist.empty:
@@ -2727,9 +3077,29 @@ def page_signals() -> None:
     show_chart(fig, key="sig_trend")
 
     render_actions(done, ticker, partner)
+    st.caption("선수 경기장(챔피언·일봉 리그·반등 판별전·회의록)과 규칙 개선은 '선수 경기장' 페이지로, 점수별 과거 성적·섹터 비교·예측 장부는 "
+               "'연구실' 페이지로 옮겼어요.")
+
+def page_arena() -> None:
+    page_header("ARENA", "선수 경기장", "규칙·기준 선수·연구소 기법·AI 위원회·앙상블의 실전 경기 · 챔피언 · 일봉 리그 · 반등 판별전",
+                [("실전 채점", ACCENT), ("챔피언은 직접 결정", GOLD)])
+    ticker, partner = signal_selector("arena")
     render_arena(ticker, partner)
     render_rule_improvement()
 
+
+def page_research() -> None:
+    page_header("RESEARCH", "연구실", "점수별 과거 성적 · 섹터·유형별 비교 · 예측 장부 (매일 볼 필요는 없는 연구용 자료)",
+                [("주봉 기준", ACCENT)])
+    ticker, partner = signal_selector("res")
+    with st.spinner("10년 이상 주봉 데이터로 신호를 계산하는 중…"):
+        hist = load_signal_history(ticker, partner)
+    if hist is None or hist.empty:
+        st.error("가격 데이터를 불러오지 못했습니다.", icon=":material/cloud_off:")
+        return
+    asof = us_asof()
+    done = core.complete_weeks(hist, asof)
+    bt = core.score_backtest(done)
     section("점수별 과거 성적", f"{bt['start']:%Y-%m} ~ {bt['cutoff']:%Y-%m}은 학습 구간, 그 뒤 최근 2년은 확률 계산에 쓰지 않은 "
                          "검증 구간입니다. 두 구간의 방향이 비슷해야 믿을 만한 신호예요.")
     tabs = st.tabs([f"{hz}주 뒤" for hz in core.HORIZONS] + ["거시 점수별"])
@@ -3060,10 +3430,15 @@ def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
     init_local_storage()
     PAGES.update({
-        "dashboard": st.Page(page_dashboard, title="전술 관제", icon=":material/monitoring:", url_path="dashboard", default=True),
+        "dashboard": st.Page(page_dashboard, title="전술 관제", icon=":material/monitoring:", url_path="dashboard"),
         "signals": st.Page(page_signals, title="신호 관제", icon=":material/insights:", url_path="signals"),
         "discover": st.Page(page_discover, title="종목 발굴", icon=":material/travel_explore:", url_path="discover"),
         "radar": st.Page(page_radar, title="시장 레이더", icon=":material/radar:", url_path="radar"),
+        "briefing": st.Page(page_briefing, title="브리핑", icon=":material/today:", url_path="briefing", default=True),
+        "arena": st.Page(page_arena, title="선수 경기장", icon=":material/emoji_events:", url_path="arena"),
+        "research": st.Page(page_research, title="연구실", icon=":material/biotech:", url_path="research"),
+        "principles": st.Page(page_principles, title="원칙 · 위험", icon=":material/shield:", url_path="principles"),
+        "ledger": st.Page(page_ledger, title="세금 · 사이클", icon=":material/receipt_long:", url_path="ledger"),
         "portfolio": st.Page(page_portfolio, title="내 포트폴리오", icon=":material/account_balance_wallet:",
                              url_path="portfolio"),
         "league": st.Page(page_league, title="AI 실전 리그", icon=":material/emoji_events:", url_path="league"),
@@ -3071,9 +3446,11 @@ def main() -> None:
         "journal": st.Page(page_journal, title="매매 일지", icon=":material/menu_book:", url_path="journal"),
         "validation": st.Page(page_validation, title="예측 검증실", icon=":material/science:", url_path="validation"),
     })
-    nav = st.navigation({"운용": [PAGES["dashboard"], PAGES["portfolio"], PAGES["signals"], PAGES["discover"],
-                                 PAGES["radar"], PAGES["league"]],
-                         "연구 · 관리": [PAGES["training"], PAGES["validation"], PAGES["journal"]]})
+    nav = st.navigation({"운용": [PAGES["briefing"], PAGES["dashboard"], PAGES["portfolio"], PAGES["signals"],
+                                 PAGES["arena"], PAGES["discover"], PAGES["radar"]],
+                         "계좌 · 원칙": [PAGES["principles"], PAGES["ledger"]],
+                         "연구 · 관리": [PAGES["research"], PAGES["journal"]],
+                         "보관함": [PAGES["league"], PAGES["training"], PAGES["validation"]]})
     render_sidebar()
     show_flash()
     nav.run()
