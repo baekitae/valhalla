@@ -41,7 +41,16 @@ def get_client():
 
 def download(ticker: str, adjusted: bool) -> pd.DataFrame | None:
     raw = yf.download(ticker, period="max", interval="1d", auto_adjust=adjusted, progress=False, threads=False)
-    return core.clean_ohlcv(raw)
+    df = core.clean_ohlcv(raw)
+    # 야후가 마감 직후 그날 일봉 종가를 비워 보내면 30분봉으로 채움
+    if df is not None and df.index[-1] < core.expected_session(dt.datetime.now(ET)):
+        try:
+            intr = core.clean_ohlcv(yf.download(ticker, period="5d", interval="30m", prepost=False,
+                                                auto_adjust=False, progress=False, threads=False))
+            df = core.fill_missing_days(df, core.intraday_to_daily(intr))
+        except Exception:
+            traceback.print_exc()
+    return df
 
 
 def load_histories(fetch=download) -> dict[str, pd.DataFrame]:

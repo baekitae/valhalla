@@ -352,3 +352,11 @@ def test_daily_league_players_and_grading():
     assert g["ret_1d"].notna().sum() == 4                       # 마지막 날은 다음 날이 없어 대기
     t = core.daily_league_table(g).set_index("id")
     assert t.loc["cash", "누적(%)"] == 0 and "보유 대비(%p)" in t.columns
+
+
+def test_expected_session():
+    import datetime as _dt
+    assert core.expected_session(_dt.datetime(2026, 11, 24, 20, 0)) == pd.Timestamp("2026-11-24")   # 화 저녁
+    assert core.expected_session(_dt.datetime(2026, 11, 24, 10, 0)) == pd.Timestamp("2026-11-23")   # 화 장중
+    assert core.expected_session(_dt.datetime(2026, 11, 23, 9, 0)) == pd.Timestamp("2026-11-20")    # 월 개장 전 → 금
+    assert core.expected_session(_dt.datetime(2026, 11, 22, 12, 0)) == pd.Timestamp("2026-11-20")   # 일요일

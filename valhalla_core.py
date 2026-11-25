@@ -817,6 +817,16 @@ def clean_ohlcv(raw: pd.DataFrame | None) -> pd.DataFrame | None:
     return None if df.empty else df
 
 
+def expected_session(now_et) -> pd.Timestamp:
+    """미국 동부 시각 기준, 일봉이 있어야 하는 마지막 거래일(주말 제외, 휴장일은 모름)."""
+    day = pd.Timestamp(now_et.date())
+    if now_et.hour < 16 or (now_et.hour == 16 and now_et.minute < 15):
+        day -= pd.Timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= pd.Timedelta(days=1)
+    return day
+
+
 def intraday_to_daily(intraday: pd.DataFrame | None) -> pd.DataFrame | None:
     """분·시간봉 → 날짜별 일봉 (정규장 봉만 들어온다고 가정)."""
     if intraday is None or intraday.empty:

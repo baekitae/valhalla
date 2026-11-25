@@ -391,14 +391,7 @@ def _clean_ohlcv(raw: pd.DataFrame | None) -> pd.DataFrame | None:
 
 
 def _expected_session() -> pd.Timestamp:
-    """지금 기준으로 일봉이 있어야 하는 마지막 미국 거래일(주말 제외, 휴장일은 모름)."""
-    now = dt.datetime.now(ET)
-    day = pd.Timestamp(now.date())
-    if now.hour < 16 or (now.hour == 16 and now.minute < 15):
-        day -= pd.Timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= pd.Timedelta(days=1)
-    return day
+    return core.expected_session(dt.datetime.now(ET))
 
 
 def _download(ticker: str, period: str, adjusted: bool) -> pd.DataFrame | None:
