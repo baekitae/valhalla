@@ -1932,7 +1932,8 @@ def page_league() -> None:
             px = load_recent(row.Ticker)
             if px is not None:
                 cmd_unreal += (float(px["Close"].iloc[-1]) - row.Avg) * row.Qty
-        cmd_budget = st.session_state.get("budget_krw", 10_000_000) / fx_rate()
+        cmd_budget = st.session_state.get("budget_krw_SOXL", int(((load_settings(core.SETTINGS_KEY_PLAN, backend())
+                                                                    .get("agent_budget") or {}).get("SOXL", 10_000_000)))) / fx_rate()
         cmd_pnl = holdings["Realized"].sum() + cmd_unreal
         board = pd.concat([board, pd.DataFrame([{
             "요원": "사령관 (실계좌)", "구분": "사령관", "총자산": cmd_budget + cmd_pnl,
