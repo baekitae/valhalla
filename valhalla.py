@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-14"
+REQUIRED_CORE_VERSION = "2026.11.25-15"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1139,6 +1139,15 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
 
     journal, _ = load_table("trade_journal")
     acc = core.scenario_accounts(kiwoom_cycles(plan, journal), s, snap["price"], fx, float(plan["buy_target_krw"]))
+    if not acc.empty and not s.get("rebought"):
+        lab = core.rebuy_label("금액 지정", s)
+        sub = acc[acc["다시 사기"] == lab]
+        if not sub.empty and int(sub["현금화(주)"].sum()) > 0:
+            per = snap["price"] * fx
+            st.info(f"**금액 지정 {float(s['cash_out_krw']):,.0f}원 → 다시 사지 않을 SOXL 총 {int(sub['현금화(주)'].sum())}주** "
+                    f"(≈{int(sub['현금화(주)'].sum()) * per:,.0f}원, ${snap['price']:.2f}·{fx:,.0f}원 기준). 계좌별: "
+                    + ", ".join(f"{r['계좌']} {int(r['현금화(주)'])}주" for _, r in sub.iterrows()),
+                    icon=":material/calculate:")
     with st.expander("계좌별 남은 총알 · 다음 매수가 · 익절 지정가", expanded=False):
         if acc.empty:
             st.caption("세금·사이클 페이지의 계좌 표가 비어 있어요.")
@@ -1146,7 +1155,7 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
             st.dataframe(acc, hide_index=True, width="stretch",
                          column_config={"예수금(원)": st.column_config.NumberColumn(format="%d"),
                                         "지금 평가(원)": st.column_config.NumberColumn(format="%d")})
-            st.caption(("12월 다시 사기 방식이 미정이라 전부·절반·비율·현금 목표를 나란히 보여 줘요. 덜 다시 산 만큼 판 돈이 예수금에 더해져요. "
+            st.caption(("12월 다시 사기 방식이 미정이라 전부·절반·비율·금액 지정을 나란히 보여 줘요. 덜 다시 산 만큼 판 돈이 예수금에 더해져요. "
                         if s.get("rebuy") not in core.REBUY_MODES[1:] else
                         ("" if s.get("rebought") else f"다시 사기 방식: {core.rebuy_label(s['rebuy'], s)}. ")) +
                        f"새 평단은 {'다시 산 가격' if s.get('rebought') else '지금 가격(다시 산다고 가정)'} 기준, "
@@ -1168,8 +1177,10 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
         tp = f[2].number_input("새 사이클 익절 (%)", 1.0, 100.0, float(s["take_profit"]) * 100, 1.0, key="sc_tp")
         f = st.columns(3)
         rpct = f[0].number_input("비율 직접: 다시 살 비율 (%)", 0.0, 100.0, float(s["rebuy_pct"]), 5.0, key="sc_rpct")
-        cgoal = f[1].number_input("현금 목표: 계좌마다 남길 현금 (원)", 0, 100_000_000, int(s["cash_goal_krw"]), 100_000, key="sc_cgoal")
-        f[2].caption("'비율 직접'은 보유 주식 중 그 비율만 다시 사고, '현금 목표'는 예수금이 목표 금액이 되도록 그만큼만 덜 다시 사요.")
+        cout = f[1].number_input("금액 지정: 현금으로 남길 총액 (원, 전체 계좌 합)", 0, 1_000_000_000, int(s["cash_out_krw"]), 100_000,
+                                 key="sc_cout")
+        f[2].caption("'비율 직접'은 보유 주식 중 그 비율만 다시 사요. '금액 지정'은 총 얼마치를 현금으로 남길지 정하면 "
+                     "계좌별 다시 사지 않을 수량을 보유 수량 비율로 나눠 정해 줘요.")
         f = st.columns(3)
         done = f[0].checkbox("12월 다시 사기 완료", bool(s.get("rebought")), key="sc_done")
         rp = f[1].number_input("다시 산 가격 ($)", 0.0, 1000.0, float(s["rebuy_price"] or 0.0), 0.01, key="sc_rp")
@@ -1180,7 +1191,7 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
         if f[2].button("시나리오 설정 저장", type="primary", key="sc_save") and backend() == "supabase":
             try:
                 new = {**s, "exit_target": ex, "tranches": sorted(float(x) for x in tr.split(",") if x.strip()),
-                       "resistance": rs or None, "cash_per_account_krw": cash, "rebuy": rb, "rebuy_pct": rpct, "cash_goal_krw": cgoal, "take_profit": tp / 100,
+                       "resistance": rs or None, "cash_per_account_krw": cash, "rebuy": rb, "rebuy_pct": rpct, "cash_out_krw": cout, "take_profit": tp / 100,
                        "rebought": done, "rebuy_price": rp or None,
                        "dip_steps": sorted(float(x) / 100 for x in dips.split(",") if x.strip()),
                        "wait_before_h": wb, "settle_after_h": sa}

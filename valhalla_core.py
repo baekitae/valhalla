@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-14"
+CORE_VERSION = "2026.11.25-15"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -3285,9 +3285,9 @@ SCENARIO_DEFAULTS = {
     "tranches": [70.0, 85.0, 102.0],      # D 시나리오 단계적 탈출 가격 (각 1/3)
     "resistance": None,                   # 매물대 직접 입력 (None = 차트에서 자동 계산)
     "cash_per_account_krw": 500_000,      # 키움 계좌당 예수금
-    "rebuy": "미정",                      # 12월 다시 사기: 미정 / 전부 / 절반 / 비율 직접 / 현금 목표
+    "rebuy": "미정",                      # 12월 다시 사기: 미정 / 전부 / 절반 / 비율 직접 / 금액 지정
     "rebuy_pct": 70.0,                    # 비율 직접: 다시 살 비율(%)
-    "cash_goal_krw": 1_000_000,           # 현금 목표: 다시 산 뒤 계좌마다 남길 현금(원)
+    "cash_out_krw": 0,                    # 금액 지정: 다시 사지 않고 현금으로 남길 총액(원, 전체 계좌 합)
     "rebought": False,                    # 12월 다시 사기 완료 여부
     "rebuy_price": None,                  # 다시 산 가격
     "dip_steps": [0.15, 0.30],            # 총알을 쓰는 하락폭 (다시 산 가격 또는 지금 가격 기준)
@@ -3295,7 +3295,25 @@ SCENARIO_DEFAULTS = {
     "wait_before_h": 24,                  # 큰 발표 몇 시간 전부터 보류
     "settle_after_h": 12,                 # 발표 뒤 몇 시간은 소화 시간 (다음 장 종가 확인)
 }
-REBUY_MODES = ["미정", "전부", "절반", "비율 직접", "현금 목표"]
+REBUY_MODES = ["미정", "전부", "절반", "비율 직접", "금액 지정"]
+
+
+def allocate_cash_out(qtys: list[float], total_krw: float, price: float, fx: float) -> list[int]:
+    """총 얼마치를 현금으로 남길지 → 계좌별로 다시 사지 않을 주식 수.
+    보유 수량 비율로 나누고, 반올림 차이는 남는 몫이 큰 계좌부터 채움(최대한 목표 금액에 가깝게)."""
+    q = [int(np.floor(x or 0)) for x in qtys]
+    per = price * fx
+    if per <= 0 or total_krw <= 0 or sum(q) == 0:
+        return [0] * len(q)
+    need = min(int(round(total_krw / per)), sum(q))
+    raw = [need * x / sum(q) for x in q]
+    out = [min(int(np.floor(r)), x) for r, x in zip(raw, q)]
+    for i in sorted(range(len(q)), key=lambda i: -(raw[i] - out[i])):
+        if sum(out) >= need:
+            break
+        if out[i] < q[i]:
+            out[i] += 1
+    return out
 
 
 def rebuy_keep(qty: float, mode: str, s: dict, cash_krw: float, price: float, fx: float) -> int:
@@ -3305,18 +3323,14 @@ def rebuy_keep(qty: float, mode: str, s: dict, cash_krw: float, price: float, fx
         return qty // 2
     if mode == "비율 직접":
         return int(np.floor(qty * min(max(float(s.get("rebuy_pct") or 0), 0), 100) / 100))
-    if mode == "현금 목표":
-        need = max(float(s.get("cash_goal_krw") or 0) - cash_krw, 0.0)
-        per = price * fx
-        return int(max(qty - (np.ceil(need / per) if per > 0 else 0), 0))
     return qty
 
 
 def rebuy_label(mode: str, s: dict) -> str:
     if mode == "비율 직접":
         return f"{float(s.get('rebuy_pct') or 0):g}%"
-    if mode == "현금 목표":
-        return f"현금 {float(s.get('cash_goal_krw') or 0) / 10000:,.0f}만 원 남기기"
+    if mode == "금액 지정":
+        return f"{float(s.get('cash_out_krw') or 0) / 10000:,.0f}만 원 현금화"
     return mode
 
 
@@ -3456,17 +3470,24 @@ def scenario_accounts(cycles: pd.DataFrame, s: dict, price: float, fx: float, un
         return pd.DataFrame()
     cash = float(s["cash_per_account_krw"] or 0)
     ref = float(s["rebuy_price"] or price) if s.get("rebought") else price
-    modes = [s["rebuy"]] if s.get("rebuy") in REBUY_MODES[1:] else ["전부", "절반", "비율 직접", "현금 목표"]
+    modes = [s["rebuy"]] if s.get("rebuy") in REBUY_MODES[1:] else ["전부", "절반", "비율 직접", "금액 지정"]
+    out_sh = allocate_cash_out([float(x or 0) for x in cycles["보유 수량"]], float(s.get("cash_out_krw") or 0), ref, fx)
     rows = []
-    for _, r in cycles.iterrows():
+    for j, (_, r) in enumerate(cycles.iterrows()):
         qty, avg = float(r.get("보유 수량") or 0), float(r.get("평단($)") or 0)
         for m in modes:
-            keep = qty if s.get("rebought") else rebuy_keep(qty, m, s, cash, ref, fx)
+            if s.get("rebought"):
+                keep = qty
+            elif m == "금액 지정":
+                keep = int(np.floor(qty)) - out_sh[j]
+            else:
+                keep = rebuy_keep(qty, m, s, cash, ref, fx)
             c = cash if s.get("rebought") else cash + (np.floor(qty) - keep) * ref * fx
             bullets = int(c // unit_krw) if unit_krw else 0
             new_avg = ref
             dips = [round(ref * (1 - d), 2) for d in s["dip_steps"]]
-            rows.append({"계좌": r.get("계좌"), "다시 사기": rebuy_label(m, s), "보유(주)": int(keep), "새 평단($)": round(new_avg, 2),
+            rows.append({"계좌": r.get("계좌"), "다시 사기": rebuy_label(m, s), "보유(주)": int(keep),
+                         "현금화(주)": 0 if s.get("rebought") else int(np.floor(qty) - keep), "새 평단($)": round(new_avg, 2),
                          "예수금(원)": round(c), "남은 총알(발)": bullets,
                          "다음 매수가($)": ", ".join(f"{x:.2f}" for x in dips[:max(1, min(len(dips), bullets))]) if bullets else "총알 없음",
                          "익절 지정가($)": round(new_avg * (1 + float(s["take_profit"])), 2),
