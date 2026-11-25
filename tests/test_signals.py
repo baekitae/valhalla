@@ -470,3 +470,39 @@ def test_principles_risk_tax_cycle():
     assert hp2["covered_krw"] >= hp2["taxable_krw"] and hp2["shares"] == 15
     cs = core.cycle_status(38, 164.23, 26, 35.0, "①", 10_000_000, 250_000, 1340)
     assert cs["목표가($)"] == round(164.23 * 1.1, 2) and cs["남은 예산(원)"] >= 0
+
+
+def test_scenario_engine():
+    import numpy as np
+    import pandas as pd
+    import valhalla_core as core
+    idx = pd.bdate_range("2025-06-02", periods=300)
+    close = pd.Series(np.r_[np.linspace(60, 48, 100), np.full(100, 48.0), np.linspace(48, 33, 100)], index=idx)
+    vol = pd.Series(np.r_[np.full(100, 1e6), np.full(100, 9e6), np.full(100, 1e6)], index=idx)
+    df = pd.DataFrame({"Open": close, "High": close * 1.01, "Low": close * 0.99, "Close": close, "Volume": vol})
+    vr = core.volume_resistance(df, 33.0)
+    assert 45 < vr["resistance"] < 51           # 거래가 몰린 48 근처가 매물대
+    s = core.scenario_settings({})
+    assert core.pick_scenario(33, 30, 8500, 8409, 48, 34, 70)[0] == "B"
+    assert core.pick_scenario(29, 30, 8500, 8409, 48, 34, 70)[0] == "A"
+    assert core.pick_scenario(33, 30, 8300, 8409, 48, 34, 70)[0] == "A"
+    assert core.pick_scenario(50, 30, 9000, 8409, 48, 49, 70)[0] == "C"
+    assert core.pick_scenario(50, 30, 9000, 8409, 48, 46, 70)[0] == "B"   # 주간 종가 확인 전
+    assert core.pick_scenario(75, 30, 9900, 8409, 48, 74, 70)[0] == "D"
+    cal = [("2026-12-10 04:00", "FOMC 금리 결정", "", True), ("2026-12-10 15:00", "TSMC 매출", "", False)]
+    g = core.event_gate(pd.Timestamp("2026-12-09 10:00"), 24, 12, cal)
+    assert g["state"] == "wait" and "FOMC" in g["event"]
+    assert core.event_gate(pd.Timestamp("2026-12-10 08:00"), 24, 12, cal)["state"] == "settle"
+    assert core.event_gate(pd.Timestamp("2026-12-11 09:00"), 24, 12, cal)["state"] == "after"
+    assert core.event_gate(pd.Timestamp("2026-12-20 09:00"), 24, 12, cal)["state"] == "clear"
+    acts = core.scenario_actions("B", "wait", s, 33.0, 48.0, 250_000, 300_000, 1350)
+    assert any("발표" in a for a in acts)
+    cyc = pd.DataFrame([{"계좌": "a", "보유 수량": 38, "평단($)": 164.23}])
+    acc = core.scenario_accounts(cyc, s, 33.0, 1350, 250_000)
+    assert set(acc["다시 사기"]) == {"전부", "절반"}
+    whole, half = acc.set_index("다시 사기").loc["전부"], acc.set_index("다시 사기").loc["절반"]
+    assert whole["남은 총알(발)"] == 2 and half["남은 총알(발)"] > 2
+    snap = core.scenario_snapshot(df, 8500.0, 8409.0, s, False, None, pd.Timestamp("2026-11-25 13:00"))
+    assert snap["code"] in "ABCD" and len(snap["checks"]) >= 6
+    gr = core.grade_scenarios(pd.Series({idx[100]: "B", idx[200]: "A"}), close)
+    assert gr["맞음"].tolist() == [True, True]

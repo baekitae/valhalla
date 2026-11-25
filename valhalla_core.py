@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-11"
+CORE_VERSION = "2026.11.25-12"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -3271,3 +3271,213 @@ def sb_fetch_all(sb, table: str, eq: dict | None = None, page: int = 1000) -> li
         if len(batch) < page:
             return rows
         start += page
+
+
+# ==========================================================================
+# 21. 내 상황 시나리오 관제 (자동 시나리오 판정 · 이벤트 관문 · 계좌별 대응)
+#   시나리오: A 추가 하락 / B 박스권 / C 매물대 돌파 / D 강한 회복
+#   이벤트 관문: 큰 발표 전에는 새 매수·매도를 미루고, 발표가 지나고 시장이 소화한 뒤 대응
+#   예측 도구가 아니라 '미리 정한 대응을 지키게 하는' 도구. 원칙 금액을 넘는 제안은 만들지 않음.
+# ==========================================================================
+SCENARIO_KEY = "scenario"                 # plan 설정 안의 하위 키
+SCENARIO_DEFAULTS = {
+    "exit_target": 102.0,                 # 탈출 목표가 (올해 이익만큼만 손해 보고 나오는 가격)
+    "tranches": [70.0, 85.0, 102.0],      # D 시나리오 단계적 탈출 가격 (각 1/3)
+    "resistance": None,                   # 매물대 직접 입력 (None = 차트에서 자동 계산)
+    "cash_per_account_krw": 500_000,      # 키움 계좌당 예수금
+    "rebuy": "미정",                      # 12월 다시 사기: 미정 / 전부 / 절반
+    "rebought": False,                    # 12월 다시 사기 완료 여부
+    "rebuy_price": None,                  # 다시 산 가격
+    "dip_steps": [0.15, 0.30],            # 총알을 쓰는 하락폭 (다시 산 가격 또는 지금 가격 기준)
+    "take_profit": 0.10,                  # 새 사이클 익절 (기법 ① = 평단 +10%)
+    "wait_before_h": 24,                  # 큰 발표 몇 시간 전부터 보류
+    "settle_after_h": 12,                 # 발표 뒤 몇 시간은 소화 시간 (다음 장 종가 확인)
+}
+SCENARIO_NAMES = {"A": "A · 추가 하락", "B": "B · 박스권", "C": "C · 매물대 돌파", "D": "D · 강한 회복"}
+BIG_EVENT_WORDS = ("FOMC", "PCE", "CPI", "고용", "실적", "청문회", "GDP")
+
+
+def scenario_settings(plan: dict) -> dict:
+    return {**SCENARIO_DEFAULTS, **((plan or {}).get(SCENARIO_KEY) or {})}
+
+
+def volume_resistance(df: pd.DataFrame, price: float, lookback: int = 250, bins: int = 40) -> dict:
+    """가격대별 거래량(매물대). 지금 가격 위에서 거래량이 가장 많은 가격대 = 저항, 아래 = 지지."""
+    d = df.dropna(subset=["Close"]).tail(lookback)
+    if d.empty or "Volume" not in d or not price:
+        return {"resistance": np.nan, "support": np.nan}
+    tp = (d["High"].fillna(d["Close"]) + d["Low"].fillna(d["Close"]) + d["Close"]) / 3
+    vol = d["Volume"].fillna(0).astype(float)
+    edges = np.linspace(float(tp.min()), float(tp.max()), bins + 1)
+    idx = np.clip(np.digitize(tp, edges) - 1, 0, bins - 1)
+    prof = np.bincount(idx, weights=vol, minlength=bins)
+    mids = (edges[:-1] + edges[1:]) / 2
+    above = mids > price * 1.03
+    below = mids < price * 0.97
+    res = float(mids[above][np.argmax(prof[above])]) if above.any() and prof[above].max() > 0 else np.nan
+    sup = float(mids[below][np.argmax(prof[below])]) if below.any() and prof[below].max() > 0 else np.nan
+    return {"resistance": round(res, 2) if pd.notna(res) else np.nan, "support": round(sup, 2) if pd.notna(sup) else np.nan}
+
+
+def is_big_event(name: str) -> bool:
+    return any(w in name for w in BIG_EVENT_WORDS)
+
+
+def event_gate(now: pd.Timestamp, before_h: float = 24, after_h: float = 12, calendar=None) -> dict:
+    """큰 발표 기준 지금 상태.
+    wait   = 발표 before_h 시간 전 ~ 발표 시각: 새 매수·매도 보류
+    settle = 발표 ~ 발표+after_h: 시장이 소화 중, 다음 장 종가로 확인
+    after  = 발표가 지나고 소화도 끝남(3일 안): 계획대로 대응
+    clear  = 가까운 큰 발표 없음"""
+    cal = calendar if calendar is not None else EVENT_CALENDAR
+    evs = sorted(((pd.Timestamp(w), n, note, ok) for w, n, note, ok in cal if is_big_event(n)), key=lambda x: x[0])
+    nxt = next(((t, n) for t, n, _, _ in evs if t > now), None)
+    for t, n, _, ok in evs:
+        if t - pd.Timedelta(hours=before_h) <= now < t:
+            return {"state": "wait", "event": n, "when": t, "until": t + pd.Timedelta(hours=after_h), "confirmed": ok, "next": nxt}
+        if t <= now < t + pd.Timedelta(hours=after_h):
+            return {"state": "settle", "event": n, "when": t, "until": t + pd.Timedelta(hours=after_h), "confirmed": ok, "next": nxt}
+    past = [(t, n, ok) for t, n, _, ok in evs if t + pd.Timedelta(hours=after_h) <= now <= t + pd.Timedelta(days=3)]
+    if past:
+        t, n, ok = past[-1]
+        return {"state": "after", "event": n, "when": t, "until": None, "confirmed": ok, "next": nxt}
+    return {"state": "clear", "event": None, "when": None, "until": None, "confirmed": True, "next": nxt}
+
+
+GATE_TEXT = {
+    "wait": "큰 발표 전이에요. 새 매수·매도는 발표 뒤로 미뤄요. 이미 걸어 둔 익절 지정가는 그대로 두세요.",
+    "settle": "발표 직후라 시장이 결과를 소화하는 중이에요. 다음 장 종가를 보고 움직여요.",
+    "after": "발표가 지나갔어요. 이제 아래 시나리오 대응을 실행해도 돼요.",
+    "clear": "가까운 큰 발표가 없어요. 시나리오 대응대로 하면 돼요.",
+}
+
+
+def scenario_checks(price: float, soxl_low: float, sox: float, sox_line: float, resistance: float,
+                    week_close: float, v1_on: bool | None, rebound_outcome, tranche1: float) -> list[dict]:
+    """시나리오를 가르는 체크 항목(참/거짓)."""
+    def row(name, ok, value, meaning):
+        return {"항목": name, "충족": None if ok is None else bool(ok), "지금": value, "뜻": meaning}
+    out = [
+        row("SOXL 최근 저점 유지", None if pd.isna(soxl_low) else price >= soxl_low,
+            f"${price:.2f} / 저점 ${soxl_low:.2f}" if pd.notna(soxl_low) else "—", "깨지면 A(추가 하락)"),
+        row("SOX 반등 기준선 유지", None if (pd.isna(sox) or pd.isna(sox_line)) else sox >= sox_line,
+            f"{sox:,.0f} / 기준 {sox_line:,.0f}" if pd.notna(sox) and pd.notna(sox_line) else "—", "깨지면 '일시 반등' 확정 → A"),
+        row("매물대 위 (오늘 종가)", None if pd.isna(resistance) else price > resistance,
+            f"${price:.2f} / 매물대 ${resistance:.2f}" if pd.notna(resistance) else "—", "넘으면 C 후보"),
+        row("매물대 위 (주간 종가 확인)", None if (pd.isna(resistance) or pd.isna(week_close)) else week_close > resistance,
+            f"주간 ${week_close:.2f}" if pd.notna(week_close) else "—", "주간 종가로 넘어야 C 확정"),
+        row("규칙 v1 매수 켜짐", v1_on, "켜짐" if v1_on else ("꺼짐" if v1_on is not None else "—"), "켜지면 C·D 신뢰도 ↑"),
+        row(f"1차 탈출가 ${tranche1:.0f} 도달", price >= tranche1, f"${price:.2f}", "넘으면 D(강한 회복)"),
+    ]
+    if rebound_outcome is not None:
+        out.append(row("반등 판별전 결과", bool(rebound_outcome), "추세 전환" if rebound_outcome else "일시 반등", "참고"))
+    return out
+
+
+def pick_scenario(price: float, soxl_low: float, sox: float, sox_line: float, resistance: float,
+                  week_close: float, tranche1: float) -> tuple[str, str]:
+    if pd.notna(soxl_low) and price < soxl_low:
+        return "A", f"SOXL이 최근 저점 ${soxl_low:.2f} 아래로 내려갔어요."
+    if pd.notna(sox) and pd.notna(sox_line) and sox < sox_line:
+        return "A", f"SOX가 반등 기준선 {sox_line:,.0f} 아래예요 (일시 반등 확정)."
+    if price >= tranche1:
+        return "D", f"1차 탈출가 ${tranche1:.0f} 위예요."
+    if pd.notna(resistance) and pd.notna(week_close) and week_close > resistance:
+        return "C", f"주간 종가 ${week_close:.2f}가 매물대 ${resistance:.2f} 위에 안착했어요."
+    if pd.notna(resistance) and price > resistance:
+        return "B", f"오늘은 매물대 ${resistance:.2f} 위지만 주간 종가 확인 전이라 아직 B예요 (C 후보)."
+    lo = f"${soxl_low:.2f}" if pd.notna(soxl_low) else "저점"
+    hi = f"${resistance:.2f}" if pd.notna(resistance) else "매물대"
+    return "B", f"저점 {lo}과 매물대 {hi} 사이 박스권이에요."
+
+
+def scenario_accounts(cycles: pd.DataFrame, s: dict, price: float, fx: float, unit_krw: float) -> pd.DataFrame:
+    """계좌별 남은 총알·다음 매수가·매도 지정가. 12월 다시 사기 전이면 '전부/절반' 두 경우를 나란히."""
+    if cycles is None or cycles.empty or not price:
+        return pd.DataFrame()
+    cash = float(s["cash_per_account_krw"] or 0)
+    ref = float(s["rebuy_price"] or price) if s.get("rebought") else price
+    modes = [s["rebuy"]] if (s.get("rebought") and s["rebuy"] in ("전부", "절반")) else ["전부", "절반"]
+    rows = []
+    for _, r in cycles.iterrows():
+        qty, avg = float(r.get("보유 수량") or 0), float(r.get("평단($)") or 0)
+        for m in modes:
+            keep = qty if m == "전부" else np.floor(qty / 2)
+            freed = 0.0 if m == "전부" else (qty - keep) * ref * fx
+            c = cash + (0.0 if s.get("rebought") else freed)
+            if s.get("rebought"):
+                c = cash
+            bullets = int(c // unit_krw) if unit_krw else 0
+            new_avg = ref
+            dips = [round(ref * (1 - d), 2) for d in s["dip_steps"]]
+            rows.append({"계좌": r.get("계좌"), "다시 사기": m, "보유(주)": int(keep), "새 평단($)": round(new_avg, 2),
+                         "예수금(원)": round(c), "남은 총알(발)": bullets,
+                         "다음 매수가($)": ", ".join(f"{x:.2f}" for x in dips[:max(1, min(len(dips), bullets))]) if bullets else "총알 없음",
+                         "익절 지정가($)": round(new_avg * (1 + float(s["take_profit"])), 2),
+                         "지금 평가(원)": round(keep * price * fx),
+                         "옛 평단($)": round(avg, 2)})
+    return pd.DataFrame(rows)
+
+
+def scenario_actions(code: str, gate: str, s: dict, price: float, resistance: float, unit_krw: float,
+                     max_krw: float, fx: float) -> list[str]:
+    """시나리오 × 이벤트 관문 → 오늘 할 일 문장. 원칙 금액을 넘는 제안은 없음."""
+    q = buy_qty_for_budget(price, fx, unit_krw, max_krw)
+    shot = f"1발 = {q['qty']}주(≈{q['krw']:,}원)"
+    pre = [] if s.get("rebought") else ["12월 손실 실현 전이에요. 팔고 같은 날 다시 사는 계획은 시나리오와 상관없이 그대로 진행해요."]
+    tp = float(s["take_profit"]) * 100
+    acts = {
+        "A": [f"매일 사지 않아요. 총알은 다시 산 가격에서 -{s['dip_steps'][0]*100:.0f}%, -{s['dip_steps'][-1]*100:.0f}%에만 써요 ({shot}).",
+              "원칙 금액을 넘겨 '물타기'하지 않아요. 현금을 남기는 게 목표예요.",
+              "더 낮은 가격에서 12월에 다시 사면 새 평단이 더 낮아져요."],
+        "B": [f"새 사이클은 평단 +{tp:.0f}% 익절 지정가를 걸어 두고, 체결되면 그 현금으로 25만 원짜리 분할 사이클을 다시 돌려요.",
+              f"총알은 지정한 하락 가격에서만 써요 ({shot}). 박스권에서 쌓는 익절이 회복의 주 엔진이에요.",
+              f"매물대 ${resistance:.2f} 근처에선 한 번 밀리기 쉬워요. 거기서 추격 매수하지 않아요." if pd.notna(resistance)
+              else "매물대 근처에선 추격 매수하지 않아요."],
+        "C": ["주간 종가로 매물대를 넘었어요. 새 사이클 물량은 익절 규칙대로 팔아요.",
+              "판 돈 일부는 규칙 v1 계좌로 옮겨 추세에 태워요 (v1이 켜져 있을 때).",
+              "다시 매물대 아래로 주간 마감하면 B로 돌아가요."],
+        "D": [f"단계적 탈출: ${s['tranches'][0]:.0f}에서 1/3, ${s['tranches'][1]:.0f}에서 1/3, ${s['tranches'][2]:.0f}에서 나머지.",
+              "규칙 v1이 켜져 있으면 마지막 1/3은 v1 매도 신호까지 들고 가요.",
+              "한 번에 다 팔지도, 다 들고 있지도 않아요."],
+    }[code]
+    if gate in ("wait", "settle"):
+        return pre + [GATE_TEXT[gate], "발표가 지나면 아래가 할 일이에요: " + acts[0]]
+    return pre + acts
+
+
+def grade_scenarios(calls: pd.Series, close: pd.Series, horizon: int = 20) -> pd.DataFrame:
+    """지난 판정 채점: horizon 거래일 뒤 수익률로 맞았는지. A=하락, B=±20% 안, C·D=상승."""
+    close = close.dropna()
+    rows = []
+    for day, code in calls.dropna().items():
+        day = pd.Timestamp(day)
+        after = close[close.index >= day]
+        if len(after) <= horizon:
+            rows.append({"날짜": day, "판정": code, f"{horizon}일 뒤(%)": np.nan, "맞음": None})
+            continue
+        r = float((after.iloc[horizon] / after.iloc[0] - 1) * 100)
+        ok = r < 0 if code == "A" else (abs(r) <= 20 if code == "B" else r > 0)
+        rows.append({"날짜": day, "판정": code, f"{horizon}일 뒤(%)": round(r, 1), "맞음": ok})
+    return pd.DataFrame(rows)
+
+
+def scenario_snapshot(soxl: pd.DataFrame, sox_close: float, sox_line: float, s: dict, v1_on, rebound_outcome,
+                      now: pd.Timestamp) -> dict:
+    """앱과 자동 점검이 함께 쓰는 판정 묶음."""
+    d = soxl.dropna(subset=["Close"])
+    price = float(d["Close"].iloc[-1])
+    low = float(d["Low"].tail(60).min()) if "Low" in d else float(d["Close"].tail(60).min())
+    vr = volume_resistance(d, price)
+    res = float(s["resistance"]) if s.get("resistance") else vr["resistance"]
+    wk = d["Close"].resample("W-FRI").last().dropna()
+    last_fri = _friday(d.index[-1]) if d.index[-1].weekday() == 4 else _friday(d.index[-1]) - pd.Timedelta(weeks=1)
+    wk = wk[wk.index <= last_fri]
+    week_close = float(wk.iloc[-1]) if len(wk) else np.nan
+    t1 = float(s["tranches"][0])
+    code, why = pick_scenario(price, low, sox_close, sox_line, res, week_close, t1)
+    gate = event_gate(now, float(s["wait_before_h"]), float(s["settle_after_h"]))
+    return {"price": price, "low": low, "resistance": res, "resistance_auto": vr["resistance"], "support": vr["support"],
+            "week_close": week_close, "sox": sox_close, "sox_line": sox_line, "code": code, "why": why, "gate": gate,
+            "checks": scenario_checks(price, low, sox_close, sox_line, res, week_close, v1_on, rebound_outcome, t1),
+            "exit_gap": (float(s["exit_target"]) / price - 1) * 100}

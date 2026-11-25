@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-11"
+REQUIRED_CORE_VERSION = "2026.11.25-12"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1066,6 +1066,133 @@ def kiwoom_cycles(plan: dict, journal: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_insight_history(backend_name: str) -> pd.DataFrame:
+    if backend_name != "supabase":
+        return pd.DataFrame()
+    try:
+        rows = core.sb_fetch_all(get_supabase(), core.INSIGHT_TABLE)
+    except Exception:
+        try:
+            rows = core._rows(get_supabase().table(core.INSIGHT_TABLE).select("*").order("day").execute())
+        except Exception as exc:
+            LOGGER.warning("인사이트 기록 조회 실패: %s", exc)
+            return pd.DataFrame()
+    return pd.DataFrame([{"day": r["day"], "code": (r.get("payload") or {}).get("scenario", {}).get("code")} for r in rows])
+
+
+def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None:
+    """내 상황 시나리오 관제: 이벤트 관문 → 시나리오 판정 → 체크리스트 → 오늘 할 일 → 계좌별 총알."""
+    s = core.scenario_settings(plan)
+    section("내 상황 시나리오", "시장 흐름을 매일 체크해서 A·B·C·D 중 지금 어디인지 판정하고, 큰 발표 전에는 기다렸다가 지나간 뒤 대응을 제안해요. "
+            "미래를 맞히는 도구가 아니라 미리 정한 대응을 지키게 하는 도구예요.")
+    soxl = load_long("SOXL", "2y", False)
+    if soxl is None or soxl.empty:
+        st.info("SOXL 시세를 불러오지 못했어요. 잠시 뒤 새로고침하세요.")
+        return
+    sox = (load_snapshot(("^SOX",)).get("^SOX") or (np.nan,))[0]
+    reb = (ins.get("rebound") or {}).get("latest") or {}
+    sox_line = float(reb["prior_low"]) if reb.get("prior_low") else np.nan
+    v1_on = None
+    pos, _ = load_arena(backend())
+    if not pos.empty:
+        v1 = pos[(pos["ticker"] == "SOXL") & (pos["player"] == "rule_v1")].sort_values("week")
+        if not v1.empty:
+            v1_on = float(v1["position"].iloc[-1]) >= 0.5
+    snap = core.scenario_snapshot(soxl, sox, sox_line, s, v1_on, reb.get("outcome"), now)
+    g = snap["gate"]
+    code = snap["code"]
+
+    gate_kind = {"wait": st.warning, "settle": st.warning, "after": st.success, "clear": st.info}[g["state"]]
+    head = {"wait": "⏸ 발표 대기", "settle": "⏳ 발표 소화 중", "after": "▶ 발표 지남 · 대응 가능", "clear": "▶ 대응 가능"}[g["state"]]
+    ev_txt = f" — {g['event']} ({g['when']:%m/%d %H:%M}{'' if g['confirmed'] else ', 미확정'})" if g["event"] else ""
+    nxt = g.get("next")
+    nxt_txt = f" · 다음 큰 발표: {nxt[0]:%m/%d %H:%M} {nxt[1]}" if nxt and g["state"] in ("after", "clear") else ""
+    gate_kind(f"**{head}**{ev_txt}. {core.GATE_TEXT[g['state']]}{nxt_txt}", icon=":material/event:")
+
+    c = st.columns(4)
+    c[0].metric("지금 시나리오", core.SCENARIO_NAMES[code], border=True)
+    c[1].metric("SOXL", f"${snap['price']:.2f}", f"최근 저점 ${snap['low']:.2f}", delta_color="off", delta_arrow="off", border=True)
+    c[2].metric("매물대 (저항)", f"${snap['resistance']:.2f}" if pd.notna(snap["resistance"]) else "—",
+                f"+{(snap['resistance'] / snap['price'] - 1) * 100:.0f}% 위" if pd.notna(snap["resistance"]) else None,
+                delta_color="off", delta_arrow="off", border=True)
+    c[3].metric("탈출 목표", f"${float(s['exit_target']):.0f}", f"+{snap['exit_gap']:.0f}% 필요", delta_color="off",
+                delta_arrow="off", border=True)
+    st.markdown(f"**판정 이유:** {snap['why']}")
+
+    left, right = st.columns([1.1, 1])
+    with left:
+        st.markdown("**오늘 할 일**")
+        for a in core.scenario_actions(code, g["state"], s, snap["price"], snap["resistance"],
+                                       float(plan["buy_target_krw"]), float(plan["buy_max_krw"]), fx):
+            st.markdown(f"- {a}")
+    with right:
+        st.markdown("**체크리스트 (자동)**")
+        ck = pd.DataFrame(snap["checks"])
+        ck["충족"] = ck["충족"].map({True: "✅", False: "❌", None: "—"})
+        st.dataframe(ck, hide_index=True, width="stretch")
+
+    journal, _ = load_table("trade_journal")
+    acc = core.scenario_accounts(kiwoom_cycles(plan, journal), s, snap["price"], fx, float(plan["buy_target_krw"]))
+    with st.expander("계좌별 남은 총알 · 다음 매수가 · 익절 지정가", expanded=False):
+        if acc.empty:
+            st.caption("세금·사이클 페이지의 계좌 표가 비어 있어요.")
+        else:
+            st.dataframe(acc, hide_index=True, width="stretch",
+                         column_config={"예수금(원)": st.column_config.NumberColumn(format="%d"),
+                                        "지금 평가(원)": st.column_config.NumberColumn(format="%d")})
+            st.caption(("12월 다시 사기 전이라 '전부 다시 사기'와 '절반만 다시 사기'를 나란히 보여 줘요. 절반이면 판 돈이 예수금에 더해져요. "
+                        if not s.get("rebought") else "") +
+                       f"새 평단은 {'다시 산 가격' if s.get('rebought') else '지금 가격(다시 산다고 가정)'} 기준, "
+                       f"총알 1발 = {int(plan['buy_target_krw']):,}원(원칙).")
+
+    with st.expander("시나리오 설정 (탈출 목표 · 예수금 · 12월 다시 사기 · 이벤트 대기 시간)", expanded=False):
+        f = st.columns(3)
+        ex = f[0].number_input("탈출 목표가 ($)", 1.0, 1000.0, float(s["exit_target"]), 1.0, key="sc_ex")
+        tr = f[1].text_input("단계적 탈출 가격 (쉼표)", ", ".join(f"{x:g}" for x in s["tranches"]), key="sc_tr")
+        rs = f[2].number_input("매물대 직접 입력 ($, 0 = 자동)", 0.0, 1000.0, float(s["resistance"] or 0.0), 0.25, key="sc_rs",
+                               help=f"자동 계산값 ${snap['resistance_auto']:.2f} (최근 1년 가격대별 거래량)" if pd.notna(snap["resistance_auto"]) else None)
+        f = st.columns(3)
+        cash = f[0].number_input("키움 계좌당 예수금 (원)", 0, 100_000_000, int(s["cash_per_account_krw"]), 50_000, key="sc_cash")
+        rb = f[1].selectbox("12월 다시 사기 방식", ["미정", "전부", "절반"], ["미정", "전부", "절반"].index(s["rebuy"]), key="sc_rb")
+        tp = f[2].number_input("새 사이클 익절 (%)", 1.0, 100.0, float(s["take_profit"]) * 100, 1.0, key="sc_tp")
+        f = st.columns(3)
+        done = f[0].checkbox("12월 다시 사기 완료", bool(s.get("rebought")), key="sc_done")
+        rp = f[1].number_input("다시 산 가격 ($)", 0.0, 1000.0, float(s["rebuy_price"] or 0.0), 0.01, key="sc_rp")
+        dips = f[2].text_input("총알 쓰는 하락폭 (%, 쉼표)", ", ".join(f"{x * 100:g}" for x in s["dip_steps"]), key="sc_dip")
+        f = st.columns(3)
+        wb = f[0].number_input("큰 발표 몇 시간 전부터 대기", 0, 96, int(s["wait_before_h"]), 1, key="sc_wb")
+        sa = f[1].number_input("발표 뒤 소화 시간 (시간)", 0, 72, int(s["settle_after_h"]), 1, key="sc_sa")
+        if f[2].button("시나리오 설정 저장", type="primary", key="sc_save") and backend() == "supabase":
+            try:
+                new = {**s, "exit_target": ex, "tranches": sorted(float(x) for x in tr.split(",") if x.strip()),
+                       "resistance": rs or None, "cash_per_account_krw": cash, "rebuy": rb, "take_profit": tp / 100,
+                       "rebought": done, "rebuy_price": rp or None,
+                       "dip_steps": sorted(float(x) / 100 for x in dips.split(",") if x.strip()),
+                       "wait_before_h": wb, "settle_after_h": sa}
+                if len(new["tranches"]) < 3 or not new["dip_steps"]:
+                    raise ValueError("탈출 가격은 3개, 하락폭은 1개 이상 적어 주세요.")
+                save_settings(core.SETTINGS_KEY_PLAN, {**plan, core.SCENARIO_KEY: new})
+                flash("시나리오 설정을 저장했어요.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(f"저장하지 못했어요: {exc}")
+        st.caption("큰 발표 = 이름에 FOMC·PCE·CPI·고용·실적·청문회·GDP가 들어간 일정 (시장 레이더 일정표).")
+
+    hist = load_insight_history(backend())
+    if not hist.empty and hist["code"].notna().any():
+        with st.expander("지난 판정 채점 (20거래일 뒤)", expanded=False):
+            calls = hist.dropna(subset=["code"]).set_index(pd.to_datetime(hist.dropna(subset=["code"])["day"]))["code"]
+            gr = core.grade_scenarios(calls, soxl["Close"])
+            done_ = gr.dropna(subset=["맞음"])
+            if len(done_):
+                st.metric("맞힌 비율", f"{done_['맞음'].mean() * 100:.0f}%", f"{len(done_)}건 채점", delta_color="off", delta_arrow="off")
+            gr["날짜"] = gr["날짜"].dt.strftime("%Y-%m-%d")
+            gr["맞음"] = gr["맞음"].map({True: "✅", False: "❌", None: "대기"})
+            st.dataframe(gr.iloc[::-1], hide_index=True, width="stretch")
+            st.caption("A=20거래일 뒤 하락, B=±20% 안, C·D=상승이면 맞음. 매일 아침 자동 점검이 판정을 기록해요.")
+
+
 # ==========================================================================
 # 페이지: 발할라 브리핑 (오늘 할 일 · 지금 상태 · 일정 · 데이터가 알려준 교훈)
 # ==========================================================================
@@ -1148,6 +1275,12 @@ def page_briefing() -> None:
     for kind, text in tasks:
         icon = {"stop": ":material/priority_high:", "warn": ":material/schedule:", "info": ":material/info:"}[kind]
         (st.error if kind == "stop" else st.warning if kind == "warn" else st.info)(text, icon=icon)
+
+    try:
+        render_scenario(plan, ins, now, fx)
+    except Exception as exc:
+        LOGGER.exception("시나리오 관제 실패")
+        st.warning(f"시나리오 관제를 그리지 못했어요: {exc}")
 
     section("지금 상태")
     c = st.columns(4)

@@ -135,6 +135,11 @@ def run(sb, fetch=download) -> str:
     except Exception as exc:
         traceback.print_exc()
         lines.append(f"포트폴리오 점검 실패: {exc}")
+    try:
+        lines.append(update_scenario(sb, fetch, asof, rules))
+    except Exception as exc:
+        traceback.print_exc()
+        lines.append(f"시나리오 판정 실패: {exc}")
     rep = pd.DataFrame(reports)
     share = float((rep["test_diff"].dropna() > 0).mean() * 100) if not rep.empty and rep["test_diff"].notna().any() else None
     INSIGHT["beat_share"] = share
@@ -175,6 +180,38 @@ def portfolio_summary(sb, fetch, asof, rule) -> str:
              for p in ("pf_harvest", "pf_month", "pf_week", "pf_band", "pf_none", "pf_trend", "bm_soxl", "bm_spy")]
     return (f"포트폴리오 {lab['week']:%m/%d} 주도 {lab['lead']}·떠오르는 {lab['rising']} (순위만 보면 {lab['raw'][0]}·{lab['raw'][1]}) "
             f"테마 교체 {lab['switches']}번 · 목표 {tg} · " + " | ".join(parts))
+
+
+def update_scenario(sb, fetch, asof, rule) -> str:
+    """내 상황 시나리오 판정을 기록(채점용). 앱과 같은 core.scenario_snapshot 사용."""
+    try:
+        rows = core._rows(sb.table(core.PORTFOLIO_SETTINGS).select("*").eq("key", core.SETTINGS_KEY_PLAN).execute())
+        plan = rows[0]["value"] if rows else {}
+    except Exception:
+        plan = {}
+    s = core.scenario_settings(plan)
+    soxl = fetch("SOXL", False)
+    soxl = soxl[soxl.index <= asof]
+    sox = fetch("^SOX", False)
+    sox_close = float(sox["Close"].dropna()[lambda x: x.index <= asof].iloc[-1]) if sox is not None and not sox.empty else float("nan")
+    reb = (INSIGHT.get("rebound") or {}).get("latest") or {}
+    sox_line = float(reb["prior_low"]) if reb.get("prior_low") else float("nan")
+    v1_on = None
+    try:
+        soxx = fetch("SOXX", True)
+        macro = {t: fetch(t, False) for t in core.MACRO_TICKERS_SIGNAL.values()}
+        hist = core.complete_weeks(core.build_signal_history(fetch("SOXL", True), soxx, macro), asof)
+        state = core.rule_positions(core.action_signals(hist, rule))
+        v1_on = bool(state.iloc[-1] >= 0.5) if len(state) else None
+    except Exception:
+        traceback.print_exc()
+    now = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None)
+    snap = core.scenario_snapshot(soxl, sox_close, sox_line, s, v1_on, reb.get("outcome"), now)
+    INSIGHT["scenario"] = {"code": snap["code"], "why": snap["why"], "price": snap["price"], "low": snap["low"],
+                           "resistance": snap["resistance"], "week_close": snap["week_close"], "gate": snap["gate"]["state"],
+                           "event": snap["gate"]["event"], "v1_on": v1_on}
+    return (f"시나리오 {core.SCENARIO_NAMES[snap['code']]} ({snap['why']}) · 매물대 ${snap['resistance']:.2f} · "
+            f"이벤트 관문 {snap['gate']['state']}{' ' + snap['gate']['event'] if snap['gate']['event'] else ''}")
 
 
 def update_rebounds(sb, fetch, asof) -> str:
