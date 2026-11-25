@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-2"
+CORE_VERSION = "2026.11.25-3"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -996,10 +996,31 @@ def signal_on(value) -> bool:
     return bool(pd.notna(value) and bool(value))
 
 
-def to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
-    """일봉 OHLCV → 주봉 (금요일 기준 라벨)."""
-    w = daily.resample("W-FRI").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last",
-                                     "Volume": "sum"})
+def bucket_labels(dates: pd.DatetimeIndex, ends: pd.DatetimeIndex) -> pd.Series:
+    """각 날짜 → 그 날짜를 포함하는 묶음의 마지막 날(ends 중 같거나 뒤의 첫 날). 마지막 묶음 뒤 날짜는 NaT."""
+    pos = ends.searchsorted(dates, side="left")
+    lab = pd.Series(pd.NaT, index=dates, dtype="datetime64[ns]")
+    ok = pos < len(ends)
+    lab[ok] = ends[pos[ok]]
+    return lab
+
+
+def _group_last(series: pd.Series, ends: pd.DatetimeIndex | None, index: pd.DatetimeIndex) -> pd.Series:
+    """주(금요일) 또는 사용자 묶음 단위의 마지막 값."""
+    if ends is None:
+        return series.resample("W-FRI").last().reindex(index)
+    lab = bucket_labels(series.index, ends)
+    return series.groupby(lab.to_numpy()).last().reindex(index)
+
+
+def to_weekly(daily: pd.DataFrame, ends: pd.DatetimeIndex | None = None) -> pd.DataFrame:
+    """일봉 OHLCV → 주봉 (금요일 기준 라벨). ends를 주면 '그 날짜로 끝나는 5거래일 묶음' 단위."""
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    if ends is None:
+        w = daily.resample("W-FRI").agg(agg)
+    else:
+        lab = bucket_labels(daily.index, ends)
+        w = daily[lab.notna().to_numpy()].groupby(lab.dropna().to_numpy()).agg(agg)
     return w.dropna(subset=["Close"])
 
 
@@ -1008,9 +1029,10 @@ def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9)
     return macd - macd.ewm(span=signal, adjust=False).mean()
 
 
-def chart_signal_table(daily: pd.DataFrame, partner_daily: pd.DataFrame | None = None) -> pd.DataFrame:
+def chart_signal_table(daily: pd.DataFrame, partner_daily: pd.DataFrame | None = None,
+                       ends: pd.DatetimeIndex | None = None) -> pd.DataFrame:
     """주별 차트 신호(True/False)와 점수. partner_daily 는 SOXX 같은 1배 지수."""
-    w = to_weekly(daily)
+    w = to_weekly(daily, ends)
     close = w["Close"]
     out = pd.DataFrame(index=w.index)
     out["close"] = close
@@ -1023,9 +1045,9 @@ def chart_signal_table(daily: pd.DataFrame, partner_daily: pd.DataFrame | None =
     out["rsi_up"] = (rsi > rsi.shift(1)).where(rsi.shift(1).notna())
     ma20 = daily["Close"].rolling(20).mean()
     above = (daily["Close"] > ma20).where(ma20.notna())
-    out["above_ma20d"] = above.resample("W-FRI").last().reindex(out.index)
+    out["above_ma20d"] = _group_last(above, ends, out.index)
     if partner_daily is not None and not partner_daily.empty:
-        pc = to_weekly(partner_daily)["Close"].reindex(out.index)
+        pc = to_weekly(partner_daily, ends)["Close"].reindex(out.index)
         out["soxx_up"] = (pc > pc.shift(1)).where(pc.notna() & pc.shift(1).notna())
     else:
         out["soxx_up"] = np.nan
@@ -1039,7 +1061,8 @@ def chart_signal_table(daily: pd.DataFrame, partner_daily: pd.DataFrame | None =
     return out
 
 
-def macro_signal_table(macro_daily: dict[str, pd.DataFrame | None], index: pd.DatetimeIndex) -> pd.DataFrame:
+def macro_signal_table(macro_daily: dict[str, pd.DataFrame | None], index: pd.DatetimeIndex,
+                       ends: pd.DatetimeIndex | None = None) -> pd.DataFrame:
     """주별 거시 신호. macro_daily = {ticker: 일봉 DataFrame}. 없는 지표는 NaN."""
     out = pd.DataFrame(index=index)
 
@@ -1047,7 +1070,7 @@ def macro_signal_table(macro_daily: dict[str, pd.DataFrame | None], index: pd.Da
         df = macro_daily.get(ticker)
         if df is None or df.empty:
             return None
-        return df["Close"].resample("W-FRI").last().reindex(index).ffill(limit=1)
+        return _group_last(df["Close"], ends, index).ffill(limit=1)
 
     tnx, dxy, oil, vix = (weekly_close(MACRO_TICKERS_SIGNAL[k]) for k in
                           ("rate_down", "dollar_down", "oil_calm", "fear_easing"))
@@ -1070,10 +1093,26 @@ def macro_signal_table(macro_daily: dict[str, pd.DataFrame | None], index: pd.Da
 
 
 def build_signal_history(daily: pd.DataFrame, partner_daily: pd.DataFrame | None,
-                         macro_daily: dict[str, pd.DataFrame | None] | None) -> pd.DataFrame:
-    chart = chart_signal_table(daily, partner_daily)
-    macro = macro_signal_table(macro_daily or {}, chart.index)
+                         macro_daily: dict[str, pd.DataFrame | None] | None,
+                         ends: pd.DatetimeIndex | None = None) -> pd.DataFrame:
+    chart = chart_signal_table(daily, partner_daily, ends)
+    macro = macro_signal_table(macro_daily or {}, chart.index, ends)
     return chart.join(macro)
+
+
+def build_daily_signal_history(daily: pd.DataFrame, partner_daily: pd.DataFrame | None,
+                               macro_daily: dict[str, pd.DataFrame | None] | None) -> pd.DataFrame:
+    """일봉 버전: 매일 '오늘로 끝나는 최근 5거래일'을 한 주로 보고 같은 신호를 계산.
+    5가지 시작점(위상)으로 주봉을 만들어 계산한 뒤 날짜순으로 합침 → 하루마다 한 줄."""
+    idx = daily.index
+    n = len(idx)
+    parts = []
+    for phase in range(5):
+        ends = idx[[(n - 1 - i) % 5 == phase for i in range(n)]]
+        if len(ends) < 40:
+            continue
+        parts.append(build_signal_history(daily, partner_daily, macro_daily, ends))
+    return pd.concat(parts).sort_index() if parts else pd.DataFrame()
 
 
 def _bucket_stats(frame: pd.DataFrame, score_col: str, horizon: int, max_score: int) -> pd.DataFrame:
@@ -1211,15 +1250,26 @@ ACTION_RULE_TEXT = {
 }
 
 
-def action_signals(history: pd.DataFrame, rules: dict | None = None) -> pd.DataFrame:
-    """주별 행동 신호. action: '매수' / '매도' / '' (조건이 처음 켜진 주에만), state: 신호 이후 상태."""
+def _lagged(series: pd.Series, n: int, step: int, how: str) -> pd.Series:
+    """최근 n주 값의 최소/최대. step=1은 주봉(연속 행), step=5는 일봉 버전(5거래일 간격)."""
+    if step == 1:
+        r = series.rolling(n)
+        return r.min() if how == "min" else r.max()
+    lagged = pd.concat([series.shift(step * j) for j in range(n)], axis=1)
+    out = lagged.min(axis=1) if how == "min" else lagged.max(axis=1)
+    return out.where(lagged.notna().all(axis=1))
+
+
+def action_signals(history: pd.DataFrame, rules: dict | None = None, step: int = 1) -> pd.DataFrame:
+    """주별 행동 신호. action: '매수' / '매도' / '' (조건이 처음 켜진 주에만), state: 신호 이후 상태.
+    step=5면 일봉 버전 기록(하루 한 줄)에서 'n주 연속'을 5거래일 간격으로 확인."""
     r = rules or ACTION_RULES
     b, s = r["buy"], r["sell"]
     out = history.copy()
     chart = out["chart_score"].astype(float)
-    buy_on = (chart.rolling(b["weeks"]).min() >= b["chart_min"]) & (out["macro_score"] >= b["macro_min"])
+    buy_on = (_lagged(chart, b["weeks"], step, "min") >= b["chart_min"]) & (out["macro_score"] >= b["macro_min"])
     above = out["above_ma20d"].map(lambda v: bool(v) if pd.notna(v) else True)
-    sell_on = chart.rolling(s["weeks"]).max() <= s["chart_max"]
+    sell_on = _lagged(chart, s["weeks"], step, "max") <= s["chart_max"]
     if s.get("below_ma", True):
         sell_on = sell_on & ~above
     out["buy_on"], out["sell_on"] = buy_on.fillna(False), sell_on.fillna(False)
@@ -2070,6 +2120,46 @@ def backtest_players(positions: pd.DataFrame, close: pd.Series, test_weeks: int 
                      "최근 2년 누적(%)": round(rec_ret, 1), "최근 2년 MDD(%)": round(rec_mdd, 1),
                      "최근 2년 칼마": round(rec_calmar, 2), "주 수": int(valid.sum())})
     return pd.DataFrame(rows)
+
+
+def backtest_daily(positions: pd.DataFrame, close: pd.Series, test_days: int = 504,
+                   fee_bps: float = 10) -> pd.DataFrame:
+    """일 단위 과거 성적: 오늘 종가 비중 × 내일 수익률 (거래 비용 반영). 주봉 전략은 금요일 비중을 다음 주 내내 유지."""
+    ret = close.pct_change().shift(-1)
+    cut = close.index[-1] - pd.Timedelta(days=int(test_days * 365 / 252))
+    rows = []
+    for pid in positions.columns:
+        p_all = positions[pid].astype(float)
+        valid = p_all.notna() & ret.notna()
+        if valid.sum() < 50:
+            continue
+        p, r = p_all[valid], ret[valid]
+        wr = p * r - p.diff().abs().fillna(p.iloc[0]) * fee_bps / 10_000
+
+        def stats(x):
+            eq = (1 + x).cumprod()
+            dd = eq / eq.cummax() - 1
+            yrs = len(x) / 252
+            cagr = float((eq.iloc[-1] ** (1 / yrs) - 1) * 100) if eq.iloc[-1] > 0 else float("nan")
+            mdd = float(dd.min() * 100)
+            under = (dd < -1e-9).astype(int)
+            longest = int(under.groupby((under == 0).cumsum()).sum().max())
+            return float((eq.iloc[-1] - 1) * 100), mdd, cagr, (cagr / abs(mdd) if mdd < 0 else float("nan")), longest
+
+        tot, mdd, cagr, calmar, longest = stats(wr)
+        rec = wr[wr.index > cut]
+        rtot, rmdd, _, rcal, _ = stats(rec) if len(rec) > 20 else (np.nan,) * 5
+        trades = len(position_moves(p)) / max(len(p) / 252, 1e-9)
+        rows.append({"전략": pid, "연평균(%)": round(cagr, 1), "최대 낙폭(%)": round(mdd, 1),
+                     "칼마": round(calmar, 2), "최장 회복(주)": round(longest / 5), "연 매매(회)": round(trades, 1),
+                     "최근 2년 누적(%)": round(rtot, 1), "최근 2년 MDD(%)": round(rmdd, 1),
+                     "최근 2년 칼마": round(rcal, 2), "기간": f"{p.index[0]:%Y}~"})
+    return pd.DataFrame(rows)
+
+
+def weekly_to_daily_positions(weekly_pos: pd.Series, daily_index: pd.DatetimeIndex) -> pd.Series:
+    """금요일 종가에 정한 비중을 다음 금요일 전까지 매일 유지."""
+    return weekly_pos.reindex(weekly_pos.index.union(daily_index)).ffill().reindex(daily_index)
 
 
 def experiment_rules(active: dict, challengers: list[tuple[int, dict]]) -> dict[str, dict]:

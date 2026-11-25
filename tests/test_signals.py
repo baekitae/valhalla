@@ -311,3 +311,25 @@ def test_fill_missing_day_from_intraday():
     assert out.index[-1] == pd.Timestamp("2026-11-24") and out["Close"].iloc[-1] == 35.33
     assert out["Low"].iloc[-1] == 34 and out["Volume"].iloc[-1] == 6 and len(out) == 3
     assert core.fill_missing_days(daily, None) is daily
+
+
+def test_daily_version_of_rules():
+    daily = _daily(seed=7, n=900)
+    dh = core.build_daily_signal_history(daily, daily, {})
+    assert len(dh) > 600 and dh.index.is_monotonic_increasing and not dh.index.duplicated().any()
+    # 마지막 날 행 = '마지막 날로 끝나는 5거래일 묶음'으로 만든 주봉의 마지막 행과 같아야 함
+    idx = daily.index
+    ends = idx[[(len(idx) - 1 - i) % 5 == 0 for i in range(len(idx))]]
+    ref = core.build_signal_history(daily, daily, {}, ends)
+    assert dh.loc[idx[-1], "chart_score"] == ref["chart_score"].iloc[-1]
+    assert dh.loc[idx[-1], "close"] == daily["Close"].iloc[-1]
+    act = core.action_signals(dh, core.ACTION_RULES, step=5)
+    assert set(act["action"].unique()) <= {"", "매수", "매도"}
+    # 주봉 버전 결과는 그대로(ends 없음 = 금요일 주봉)
+    wk = core.build_signal_history(daily, daily, {})
+    assert wk.index.dayofweek.unique().tolist() == [4]
+    pos_d = core.rule_positions(act)
+    pos_w = core.weekly_to_daily_positions(core.rule_positions(core.action_signals(wk)), daily.index)
+    bt = core.backtest_daily(pd.DataFrame({"daily": pos_d, "weekly": pos_w, "hold": 1.0}, index=daily.index),
+                             daily["Close"]).set_index("전략")
+    assert {"daily", "weekly", "hold"} <= set(bt.index) and bt.loc["hold", "연 매매(회)"] == 0
