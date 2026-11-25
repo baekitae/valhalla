@@ -1175,14 +1175,13 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
         cash = f[0].number_input("키움 계좌당 예수금 (원)", 0, 100_000_000, int(s["cash_per_account_krw"]), 50_000, key="sc_cash")
         modes = core.REBUY_MODES
         rb = f[1].selectbox("12월 다시 사기 방식", modes, modes.index(s["rebuy"]) if s["rebuy"] in modes else 0, key="sc_rb",
-                            help="미정이면 네 가지를 나란히 비교해요. 손실 실현(세금 상쇄)은 다시 사는 양과 상관없이 판 순간 확정돼요.")
+                            help="미정이면 세 가지를 나란히 비교해요. 손실 실현(세금 상쇄)은 다시 사는 양과 상관없이 판 순간 확정돼요.")
         tp = f[2].number_input("새 사이클 익절 (%)", 1.0, 100.0, float(s["take_profit"]) * 100, 1.0, key="sc_tp")
         f = st.columns(3)
         rpct = f[0].number_input("비율 직접: 다시 살 비율 (%)", 0.0, 100.0, float(s["rebuy_pct"]), 5.0, key="sc_rpct")
-        cout = f[1].number_input("금액 지정: 현금으로 남길 총액 (원, 전체 계좌 합)", 0, 1_000_000_000, int(s["cash_out_krw"]), 100_000,
-                                 key="sc_cout")
-        f[2].caption("'비율 직접'은 보유 주식 중 그 비율만 다시 사요. '금액 지정'은 총 얼마치를 현금으로 남길지 정하면 "
-                     "계좌별 다시 사지 않을 수량을 보유 수량 비율로 나눠 정해 줘요.")
+        loss = f[1].number_input("12월 손절할 금액 (원)", 0, 1_000_000_000, int(s["loss_krw"]), 100_000, key="sc_loss",
+                                 help="예: 올해 이익만큼 손절하려면 그 금액. 세금만 0원으로 만들려면 올해 이익 − 250만 원.")
+        f[2].caption("손절 금액을 넣으면 몇 주를 팔아야 하는지 계좌별로 계산해요. '비율 직접'은 판 뒤 보유 주식 중 그 비율만 다시 사는 방식이에요.")
         f = st.columns(3)
         done = f[0].checkbox("12월 다시 사기 완료", bool(s.get("rebought")), key="sc_done")
         rp = f[1].number_input("다시 산 가격 ($)", 0.0, 1000.0, float(s["rebuy_price"] or 0.0), 0.01, key="sc_rp")
