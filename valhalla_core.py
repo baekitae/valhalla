@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-4"
+CORE_VERSION = "2026.11.25-7"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -2698,6 +2698,238 @@ def checklist_snapshot(tnx: pd.Series, vix: pd.Series, credit: pd.Series, hy: pd
                      "상태": "ok" if yoy < prev else ("warn" if yoy == prev else "stop"),
                      "변화": f"{prev:.1f}% → {yoy:.1f}% ({x.index[-1]:%Y-%m})", "설명": "연준이 가장 중시하는 물가"})
     return rows
+
+
+# ==========================================================================
+# 19. 포트폴리오 선수 · 리밸런싱 선수 (토스 장기 계좌용)
+#   테마 순위: 타이탄봇과 같은 식(1주 20%·1달 30%·3달 50% 수익률 순위 가중합, 4주 전 순위와 비교)
+#   주도 테마 = 순위 3위 안 + 50일선 위 중 1등, 떠오르는 테마 = 4주 전보다 3계단 이상 오른 테마 중 가장 많이 오른 것
+#   핵심 = SOXL (규칙 v1 상태로 보유/현금), 테마 칸은 해당 테마의 레버리지 ETF(없으면 2배, 그것도 없으면 1배)
+# ==========================================================================
+THEME_ETFS = {   # 테마: (1배 대표 ETF, 레버리지 후보들(앞에서부터, 배수))
+    "반도체": ("SOXX", [("SOXL", 3)]), "AI 소프트웨어": ("IGV", []), "AI 전력·인프라": ("GRID", []),
+    "원전·우라늄": ("URA", []), "방산·우주": ("ITA", [("DFEN", 3)]), "사이버보안": ("CIBR", [("UCYB", 2)]),
+    "바이오": ("XBI", [("LABU", 3)]), "헬스케어": ("XLV", [("CURE", 3)]), "금융": ("XLF", [("FAS", 3)]),
+    "에너지": ("XLE", [("ERX", 2)]), "산업재": ("XLI", [("DUSL", 3)]), "소비재": ("XLY", [("WANT", 3)]),
+    "금·귀금속": ("GDX", [("NUGT", 2)]), "크립토": ("IBIT", [("BITX", 2)]), "중국 인터넷": ("KWEB", [("CWEB", 2)]),
+    "리츠": ("VNQ", [("DRN", 3)]),
+}
+THEME_WEIGHTS = {"ret_1w": (5, 0.2), "ret_1m": (21, 0.3), "ret_3m": (63, 0.5)}
+PORTFOLIO_TARGET = {"core": 0.50, "lead": 0.25, "rising": 0.25}
+PORTFOLIO_START = "2018-06-01"
+PORTFOLIO_LIVE_START = "2026-11-27"
+PORTFOLIO_TABLE = "valhalla_portfolio_holdings"
+PORTFOLIO_SETTINGS = "valhalla_portfolio_settings"
+PORTFOLIO_PLAYERS = {
+    "pf_month": "포트폴리오 · 월간 리밸런싱", "pf_week": "리밸런싱 · 매주", "pf_band": "리밸런싱 · 밴드 ±5%p",
+    "pf_none": "리밸런싱 · 안 함(테마 바뀔 때만)", "pf_trend": "포트폴리오 + 추세 필터 (월간)",
+    "bm_soxl": "기준 · SOXL 그냥 보유", "bm_spy": "기준 · S&P500 그냥 보유",
+}
+
+
+def theme_rank_history(closes: dict[str, pd.Series], dates: pd.DatetimeIndex) -> dict[str, pd.DataFrame]:
+    """날짜별 테마 점수·순위·50일선 위 여부·4주 전 순위 (그날까지의 데이터만)."""
+    frame = pd.DataFrame({k: v for k, v in closes.items()}).sort_index()
+    score_parts = []
+    for _, (n, w) in THEME_WEIGHTS.items():
+        r = frame / frame.shift(n) - 1
+        score_parts.append(r.rank(axis=1, pct=True) * w)
+    score = sum(score_parts) * 100
+    valid = frame.notna() & frame.shift(63).notna()
+    score = score.where(valid)
+    rank = score.rank(axis=1, ascending=False, method="min")
+    rank_prev = rank.shift(20)
+    above = (frame > frame.rolling(50).mean()).where(valid)
+    pick = lambda df: df.reindex(frame.index.union(dates)).ffill(limit=3).reindex(dates)
+    return {"score": pick(score), "rank": pick(rank), "rank_prev": pick(rank_prev), "above50": pick(above)}
+
+
+def pick_themes(rank: pd.Series, rank_prev: pd.Series, above50: pd.Series, exclude: tuple = ("반도체",)) -> tuple:
+    """(주도 테마, 떠오르는 테마). 반도체는 핵심(SOXL)과 겹치므로 제외."""
+    r = rank.dropna()
+    r = r[~r.index.isin(exclude)]
+    if r.empty:
+        return None, None
+    lead_c = [t for t in r.sort_values().index if r[t] <= 3 + len(exclude) and bool(above50.get(t, False))]
+    lead = lead_c[0] if lead_c else r.sort_values().index[0]
+    chg = (rank_prev.reindex(r.index) - r).dropna()
+    chg = chg[(chg >= 3) & (chg.index != lead)]
+    if not chg.empty:
+        best = chg[chg == chg.max()].index
+        rising = min(best, key=lambda t: r[t])
+    else:
+        rest = [t for t in r.sort_values().index if t != lead]
+        rising = rest[0] if rest else None
+    return lead, rising
+
+
+def theme_vehicle(theme: str | None, prices: dict[str, pd.Series], when: pd.Timestamp) -> tuple[str | None, int]:
+    """그 날짜에 거래 가능한 테마 ETF (레버리지 우선)."""
+    if theme is None:
+        return None, 0
+    base, levs = THEME_ETFS[theme]
+    for t, k in levs:
+        s_ = prices.get(t)
+        if s_ is not None and not s_.dropna().empty and s_.dropna().index[0] <= when - pd.Timedelta(days=30):
+            return t, k
+    return base, 1
+
+
+PORTFOLIO_HOLD = {"lead_keep_rank": 5, "rising_min_weeks": 4}
+
+
+def theme_schedule(weeks: pd.DatetimeIndex, ranks: dict, rules: dict | None = None) -> pd.DataFrame:
+    """주별 (주도, 떠오르는) 테마. 잦은 교체를 막는 유지 규칙:
+    주도 테마는 순위 5위 안에 있는 동안 유지, 떠오르는 테마는 최소 4주 유지 후 다시 고름."""
+    th = {**PORTFOLIO_HOLD, **(rules or {})}
+    rows, lead, rising, held = [], None, None, 0
+    for w in weeks:
+        r, rp, ab = ranks["rank"].loc[w], ranks["rank_prev"].loc[w], ranks["above50"].loc[w]
+        new_lead, new_rising = pick_themes(r, rp, ab)
+        if lead is None or pd.isna(r.get(lead)) or r.get(lead) > th["lead_keep_rank"]:
+            lead = new_lead
+        held += 1
+        if rising is None or rising == lead or held >= th["rising_min_weeks"] or pd.isna(r.get(rising)):
+            cand = new_rising if new_rising != lead else None
+            if cand is None:
+                rest = [t for t in r.dropna().sort_values().index if t not in (lead, "반도체")]
+                cand = rest[0] if rest else None
+            if cand != rising:
+                rising, held = cand, 0
+            elif held >= th["rising_min_weeks"]:
+                held = 0
+        rows.append({"week": w, "lead": lead, "rising": rising})
+    return pd.DataFrame(rows).set_index("week")
+
+
+def portfolio_targets(week: pd.Timestamp, ranks: dict, prices: dict[str, pd.Series], core_on: float,
+                      target: dict | None = None, trend: bool = False, themes: tuple | None = None) -> dict[str, float]:
+    """한 주의 목표 비중 {티커 또는 'CASH': 비중}. themes=(주도, 떠오르는)를 주면 그대로 씀."""
+    tg = {**PORTFOLIO_TARGET, **(target or {})}
+    if themes is not None:
+        lead, rising = themes
+    else:
+        lead, rising = pick_themes(ranks["rank"].loc[week], ranks["rank_prev"].loc[week], ranks["above50"].loc[week])
+    out: dict[str, float] = {}
+
+    def add(t, w):
+        out[t] = out.get(t, 0.0) + w
+
+    add("SOXL" if core_on >= 0.5 else "CASH", tg["core"])
+    for theme, w in ((lead, tg["lead"]), (rising, tg["rising"])):
+        vehicle, _ = theme_vehicle(theme, prices, week)
+        if vehicle is None:
+            add("CASH", w)
+            continue
+        if trend:
+            base = THEME_ETFS[theme][0]
+            b = prices.get(base, pd.Series(dtype=float)).dropna()
+            b = b[b.index <= week]
+            if len(b) < 200 or b.iloc[-1] < b.tail(200).mean():
+                add("CASH", w)
+                continue
+        add(vehicle, w)
+    cash_rest = 1 - sum(out.values())
+    if cash_rest > 1e-9:
+        add("CASH", cash_rest)
+    return out
+
+
+def simulate_portfolio(weekly: pd.DataFrame, targets: dict[pd.Timestamp, dict], policy: str,
+                       band: float = 0.05, fee_bps: float = 10) -> pd.DataFrame:
+    """주간 시뮬레이션. weekly = 주별 종가(열=티커). policy: week/month/band/none.
+    반환: 주별 가치(value), 회전율(turnover), 보유 비중(weights)."""
+    rets = weekly.pct_change()
+    dates = [d for d in weekly.index if d in targets]
+    hold: dict[str, float] = {}
+    value, rows, prev_month = 1.0, [], None
+    for i, d in enumerate(dates):
+        if i > 0:
+            grow = 0.0
+            for t, w in hold.items():
+                r = 0.0 if t == "CASH" else float(rets.at[d, t]) if pd.notna(rets.at[d, t]) else 0.0
+                grow += w * (1 + r)
+            hold = {t: w * (1 + (0.0 if t == "CASH" else float(rets.at[d, t]) if pd.notna(rets.at[d, t]) else 0.0)) / grow
+                    for t, w in hold.items()}
+            value *= grow
+        tgt = targets[d]
+        drift = max(abs(tgt.get(k, 0) - hold.get(k, 0)) for k in set(tgt) | set(hold)) if hold else 1.0
+        full = (not hold or policy == "week"
+                or (policy == "month" and d.month != prev_month)
+                or (policy == "band" and drift > band))
+        before = dict(hold)
+        if full:
+            hold = dict(tgt)
+        else:
+            # 테마·핵심 상태가 바뀐 칸만 교체: 빠진 종목을 팔아 새 종목을 목표 비율대로 삼 (나머지는 그대로)
+            removed = {k: w for k, w in hold.items() if k not in tgt}
+            added = [k for k in tgt if k not in hold]
+            if removed or added:
+                freed = sum(removed.values())
+                hold = {k: w for k, w in hold.items() if k in tgt}
+                if added:
+                    tw = sum(tgt[k] for k in added)
+                    for k in added:
+                        hold[k] = hold.get(k, 0.0) + freed * tgt[k] / tw
+                elif freed > 0:
+                    k = "CASH" if "CASH" in tgt else max(tgt, key=tgt.get)
+                    hold[k] = hold.get(k, 0.0) + freed
+        turnover = sum(abs(hold.get(k, 0) - before.get(k, 0)) for k in set(hold) | set(before) if k != "CASH")
+        if turnover > 0:
+            value *= 1 - turnover * fee_bps / 10_000
+        prev_month = d.month
+        rows.append({"week": d, "value": value, "turnover": turnover, "weights": dict(hold)})
+    return pd.DataFrame(rows).set_index("week")
+
+
+def portfolio_stats(value: pd.Series, live_start: str | None = None) -> dict:
+    v = value.dropna()
+    r = v.pct_change().dropna()
+    yrs = len(r) / 52
+    cagr = (v.iloc[-1] / v.iloc[0]) ** (1 / yrs) - 1 if yrs > 0 else np.nan
+    dd = v / v.cummax() - 1
+    under = (dd < -1e-9).astype(int)
+    longest = int(under.groupby((under == 0).cumsum()).sum().max()) if len(under) else 0
+    cut = v.index[-1] - pd.Timedelta(weeks=104)
+    rv = v[v.index >= cut]
+    out = {"연평균(%)": round(cagr * 100, 1), "최대 낙폭(%)": round(float(dd.min() * 100), 1),
+           "칼마": round(cagr / abs(dd.min()), 2) if dd.min() < 0 else np.nan, "최장 회복(주)": longest,
+           "최근 2년(%)": round(float((rv.iloc[-1] / rv.iloc[0] - 1) * 100), 1) if len(rv) > 4 else np.nan}
+    if live_start:
+        lv = v[v.index >= pd.Timestamp(live_start)]
+        out["실전(%)"] = round(float((lv.iloc[-1] / lv.iloc[0] - 1) * 100), 2) if len(lv) > 1 else np.nan
+    return out
+
+
+def rebalance_orders(holdings: pd.DataFrame, prices: dict[str, float], target: dict[str, float],
+                     new_cash: float = 0.0, buy_only: bool = False) -> pd.DataFrame:
+    """현재 보유(ticker, shares) + 새로 넣을 돈 → 목표 비중에 맞추는 주문(소수점 주 허용).
+    buy_only면 팔지 않고 새 돈으로 모자란 종목만 채움(세금이 생기는 매도 피하기)."""
+    cur = {r["ticker"]: float(r["shares"]) * prices.get(r["ticker"], np.nan) for _, r in holdings.iterrows()}
+    cur = {k: v for k, v in cur.items() if pd.notna(v)}
+    total = sum(cur.values()) + new_cash
+    keys = sorted(set(cur) | {k for k in target if k != "CASH"})
+    want = {k: target.get(k, 0.0) * total for k in keys}
+    diff = {k: want[k] - cur.get(k, 0.0) for k in keys}
+    if buy_only:
+        need = {k: max(d, 0.0) for k, d in diff.items()}
+        s_ = sum(need.values())
+        scale = min(1.0, new_cash / s_) if s_ > 0 else 0.0
+        diff = {k: need[k] * scale for k in keys}
+    rows = []
+    for k in keys:
+        px = prices.get(k)
+        if px is None or not np.isfinite(px) or abs(diff[k]) < 1:
+            act = "유지"
+        else:
+            act = "매수" if diff[k] > 0 else "매도"
+        rows.append({"종목": k, "지금 금액($)": round(cur.get(k, 0.0), 2), "지금 비중(%)": round(cur.get(k, 0.0) / total * 100, 1) if total else 0,
+                     "목표 비중(%)": round(target.get(k, 0.0) * 100, 1), "주문": act,
+                     "금액($)": round(abs(diff[k]), 2), "주식 수": round(abs(diff[k]) / px, 4) if px else np.nan})
+    cash_t = target.get("CASH", 0.0)
+    rows.append({"종목": "현금", "지금 금액($)": round(new_cash, 2), "지금 비중(%)": round(new_cash / total * 100, 1) if total else 0,
+                 "목표 비중(%)": round(cash_t * 100, 1), "주문": "", "금액($)": np.nan, "주식 수": np.nan})
+    return pd.DataFrame(rows)
 
 
 def sb_fetch_all(sb, table: str, eq: dict | None = None, page: int = 1000) -> list[dict]:

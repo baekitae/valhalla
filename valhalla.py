@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-4"
+REQUIRED_CORE_VERSION = "2026.11.25-7"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1002,6 +1002,199 @@ def render_breakeven(ticker: str, journal_avg: float | None) -> None:
     base_layout(fig, 260)
     fig.update_yaxes(title_text="본전까지 필요한 지수 상승률(%) · 즉시 기준")
     show_chart(fig, key=f"be_chart_{ticker}")
+
+
+# ==========================================================================
+# 페이지: 내 포트폴리오 (토스 장기 계좌) · 포트폴리오 선수 · 리밸런싱 선수
+# ==========================================================================
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def cached_portfolio_lab(rule_key: str, target_key: str, core_version: str = "") -> dict:
+    """테마 순위 재현 → 주별 목표 비중 → 리밸런싱 방식별 시뮬레이션. 그날까지의 데이터만 사용."""
+    rule = core.normalize_rules(json.loads(rule_key))
+    target = json.loads(target_key)
+    tickers = {"SOXL", "SPY"} | {base for base, _ in core.THEME_ETFS.values()} | {
+        t for _, levs in core.THEME_ETFS.values() for t, _ in levs}
+    daily = {}
+    for t in sorted(tickers):
+        d = load_long(t, "max", True)
+        if d is not None and not d.empty:
+            daily[t] = d["Close"].dropna()
+    if "SOXL" not in daily:
+        return {}
+    asof = us_asof()
+    weeks = pd.date_range(core.PORTFOLIO_START, asof, freq="W-FRI")
+    weeks = weeks[weeks <= asof]
+    ranks = core.theme_rank_history({th: daily[b] for th, (b, _) in core.THEME_ETFS.items() if b in daily}, weeks)
+    hist = load_signal_history("SOXL", "SOXX")
+    core_state = core.rule_positions(core.action_signals(core.complete_weeks(hist, asof), rule)) if hist is not None \
+        else pd.Series(1.0, index=weeks)
+    core_state = core_state.reindex(core_state.index.union(weeks)).ffill().reindex(weeks).fillna(1.0)
+    weekly = pd.DataFrame({t: s_.resample("W-FRI").last() for t, s_ in daily.items()}).reindex(weeks)
+    sched = core.theme_schedule(weeks, ranks)
+    th_of = {d: (sched.at[d, "lead"], sched.at[d, "rising"]) for d in weeks}
+    base_t = {d: core.portfolio_targets(d, ranks, daily, float(core_state.loc[d]), target, themes=th_of[d]) for d in weeks}
+    trend_t = {d: core.portfolio_targets(d, ranks, daily, float(core_state.loc[d]), target, trend=True, themes=th_of[d])
+               for d in weeks}
+    runs = {"pf_month": (base_t, "month"), "pf_week": (base_t, "week"), "pf_band": (base_t, "band"),
+            "pf_none": (base_t, "none"), "pf_trend": (trend_t, "month"),
+            "bm_soxl": ({d: {"SOXL": 1.0} for d in weeks}, "none"), "bm_spy": ({d: {"SPY": 1.0} for d in weeks}, "none")}
+    curves, rows = {}, []
+    for pid, (tg, pol) in runs.items():
+        sim = core.simulate_portfolio(weekly, tg, pol)
+        curves[pid] = sim["value"]
+        st_ = core.portfolio_stats(sim["value"], core.PORTFOLIO_LIVE_START)
+        rows.append({"id": pid, "선수": core.PORTFOLIO_PLAYERS[pid], **st_,
+                     "연 회전율(%)": round(float(sim["turnover"].sum() / max(len(sim) / 52, 1e-9) * 100), 0)})
+    last = weeks[-1]
+    lead, rising = th_of[last]
+    raw_lead, raw_rising = core.pick_themes(ranks["rank"].loc[last], ranks["rank_prev"].loc[last], ranks["above50"].loc[last])
+    return {"table": pd.DataFrame(rows), "curves": pd.DataFrame(curves), "week": last,
+            "base": base_t[last], "trend": trend_t[last], "lead": lead, "rising": rising,
+            "core_on": float(core_state.loc[last]),
+            "vehicles": {th: core.theme_vehicle(th, daily, last) for th in (lead, rising) if th},
+            "ranks": ranks["rank"].loc[last].dropna().sort_values(), "raw": (raw_lead, raw_rising),
+            "switches": int((sched["lead"] != sched["lead"].shift()).sum() + (sched["rising"] != sched["rising"].shift()).sum())}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_portfolio(backend_name: str) -> tuple[pd.DataFrame, dict]:
+    if backend_name != "supabase":
+        return pd.DataFrame(columns=["ticker", "shares", "avg_price"]), {}
+    try:
+        sb = get_supabase()
+        h = pd.DataFrame(core.sb_fetch_all(sb, core.PORTFOLIO_TABLE, {"account": "toss"}))
+        st_rows = core.sb_fetch_all(sb, core.PORTFOLIO_SETTINGS, {"key": "toss"})
+        return (h[["ticker", "shares", "avg_price"]] if not h.empty else pd.DataFrame(columns=["ticker", "shares", "avg_price"]),
+                (st_rows[0]["value"] if st_rows else {}))
+    except Exception as exc:
+        LOGGER.warning("포트폴리오 조회 실패: %s", exc)
+        return pd.DataFrame(columns=["ticker", "shares", "avg_price"]), {}
+
+
+def save_portfolio(edited: pd.DataFrame) -> None:
+    sb = get_supabase()
+    sb.table(core.PORTFOLIO_TABLE).delete().eq("account", "toss").execute()
+    rows = [{"account": "toss", "ticker": str(r["ticker"]).strip().upper(), "shares": float(r["shares"]),
+             "avg_price": float(r["avg_price"]) if pd.notna(r["avg_price"]) else None}
+            for _, r in edited.iterrows() if str(r.get("ticker") or "").strip() and pd.notna(r.get("shares"))]
+    if rows:
+        sb.table(core.PORTFOLIO_TABLE).insert(rows).execute()
+    load_portfolio.clear()
+
+
+def save_portfolio_settings(value: dict) -> None:
+    get_supabase().table(core.PORTFOLIO_SETTINGS).upsert({"key": "toss", "value": value}, on_conflict="key").execute()
+    load_portfolio.clear()
+
+
+def page_portfolio() -> None:
+    page_header("MY PORTFOLIO", "내 포트폴리오", "토스 장기 계좌 · SOXL 핵심 + 주도 테마 + 떠오르는 테마 · 리밸런싱 제안")
+    holdings, settings = load_portfolio(backend())
+    target = {**core.PORTFOLIO_TARGET, **(settings.get("target") or {})}
+    state = load_rule_state(backend())
+    with st.expander("목표 비율 설정", icon=":material/tune:"):
+        c = st.columns(3)
+        core_w = c[0].slider("SOXL 핵심", 0, 100, int(target["core"] * 100), 5, key="pf_core")
+        lead_w = c[1].slider("주도 테마", 0, 100, int(target["lead"] * 100), 5, key="pf_lead")
+        rise_w = c[2].slider("떠오르는 테마", 0, 100, int(target["rising"] * 100), 5, key="pf_rise")
+        cash_w = 100 - core_w - lead_w - rise_w
+        if cash_w < 0:
+            st.error("합이 100%를 넘어요.")
+        else:
+            st.caption(f"나머지 현금 {cash_w}%. SOXL 핵심 칸은 규칙 v{state['version']}이 매도 상태면 현금으로 쉬어요.")
+            if st.button("이 비율 저장", key="pf_save_target") and backend() == "supabase":
+                save_portfolio_settings({**settings, "target": {"core": core_w / 100, "lead": lead_w / 100,
+                                                                "rising": rise_w / 100}})
+                st.rerun()
+        target = {"core": core_w / 100, "lead": lead_w / 100, "rising": rise_w / 100}
+    with st.spinner("테마 순위와 포트폴리오 선수 계산 중… (처음에는 1분쯤 걸려요)"):
+        lab = cached_portfolio_lab(json.dumps(state["rules"]), json.dumps(target), core.CORE_VERSION)
+    if not lab:
+        st.warning("시세를 불러오지 못했습니다.")
+        return
+
+    section("이번 주 목표 포트폴리오", f"{lab['week']:%Y-%m-%d} 금요일 마감 기준. 테마 순위는 타이탄봇과 같은 계산식이에요.")
+    variant = st.segmented_control("방식", ["기본", "추세 필터"], default="기본", key="pf_variant") or "기본"
+    tgt = lab["base"] if variant == "기본" else lab["trend"]
+    cols = st.columns(3)
+    cols[0].metric(f"SOXL 핵심 · 규칙 v{state['version']}", "보유" if lab["core_on"] >= 0.5 else "쉬는 중(현금)",
+                   f"목표 {target['core'] * 100:.0f}%", delta_color="off", delta_arrow="off", border=True)
+    for col, (label, th) in zip(cols[1:], (("주도 테마", lab["lead"]), ("떠오르는 테마", lab["rising"]))):
+        veh, k = lab["vehicles"].get(th, (None, 0))
+        col.metric(label, th or "—", f"{veh} ({k}배)" if veh else "", delta_color="off", delta_arrow="off", border=True)
+    st.dataframe(pd.DataFrame([{"종목": k if k != "CASH" else "현금", "목표 비중(%)": round(v * 100, 1)}
+                               for k, v in sorted(tgt.items(), key=lambda x: -x[1])]), hide_index=True, width="stretch")
+    if variant == "추세 필터":
+        st.caption("추세 필터: 테마의 1배 대표 ETF가 200일선 아래면 그 칸은 현금으로 쉬어요.")
+    raw = lab.get("raw", (None, None))
+    if raw != (lab["lead"], lab["rising"]):
+        st.caption(f"이번 주 순위만 보면 주도 {raw[0]} · 떠오르는 {raw[1]}이지만, 잦은 교체를 막는 유지 규칙(주도 테마는 5위 안이면 유지, "
+                   "떠오르는 테마는 최소 4주 유지) 때문에 위 테마를 유지해요.")
+    st.caption("레버리지 ETF가 없는 테마는 2배, 그것도 없으면 1배 대표 ETF를 써요. 반도체는 핵심(SOXL)과 겹쳐서 테마 칸에서 빼요. "
+               f"{core.PORTFOLIO_START[:4]}년 이후 테마 교체 {lab.get('switches', 0)}번.")
+
+    section("내 토스 계좌", "주식 모으기로 모은 장기 투자 계좌. 표를 직접 고치고 저장하세요 (티커 · 주식 수 · 평균 단가 $).")
+    edited = st.data_editor(holdings, num_rows="dynamic", width="stretch", key="pf_editor",
+                            column_config={"ticker": st.column_config.TextColumn("티커"),
+                                           "shares": st.column_config.NumberColumn("주식 수", format="%.4f", min_value=0),
+                                           "avg_price": st.column_config.NumberColumn("평균 단가($)", format="%.2f")})
+    if st.button("보유 내역 저장", type="primary", key="pf_save") and backend() == "supabase":
+        save_portfolio(edited)
+        flash("토스 보유 내역을 저장했어요.")
+        st.rerun()
+    fx = fetch_usdkrw() or 1350.0
+    tick = tuple(sorted({str(t).upper() for t in edited["ticker"].dropna() if str(t).strip()} |
+                        {k for k in tgt if k != "CASH"}))
+    snap = load_snapshot(tick) if tick else {}
+    prices = {t: v[0] for t, v in snap.items()}
+    if not edited.empty:
+        view = edited.dropna(subset=["ticker"]).copy()
+        view["ticker"] = view["ticker"].str.upper()
+        view["현재가"] = view["ticker"].map(prices)
+        view["평가($)"] = (view["shares"].astype(float) * view["현재가"]).round(2)
+        view["손익(%)"] = ((view["현재가"] / view["avg_price"].astype(float) - 1) * 100).round(1)
+        tot = view["평가($)"].sum()
+        view["비중(%)"] = (view["평가($)"] / tot * 100).round(1) if tot else 0
+        m = st.columns(3)
+        m[0].metric("평가 금액", fmt_usd(tot), fmt_krw(tot * fx), delta_color="off", delta_arrow="off", border=True)
+        cost = (view["shares"].astype(float) * view["avg_price"].astype(float)).sum()
+        m[1].metric("평가 손익", fmt_usd(tot - cost), f"{(tot / cost - 1) * 100:+.1f}%" if cost else None, border=True)
+        m[2].metric("종목 수", f"{len(view)}개", border=True)
+        st.dataframe(view.rename(columns={"ticker": "티커", "shares": "주식 수", "avg_price": "평균 단가"}),
+                     hide_index=True, width="stretch")
+
+    section("리밸런싱 제안", "목표 포트폴리오에 맞추려면 무엇을 얼마나 사고팔지. 토스는 소수점 매매가 돼서 주식 수를 소수로 보여줘요.")
+    c = st.columns([1, 1])
+    new_krw = c[0].number_input("이번에 넣을 돈 (원, 주식 모으기·예수금)", min_value=0, value=int(settings.get("monthly_krw", 0) or 0),
+                                step=10000, key="pf_newcash")
+    buy_only = c[1].toggle("팔지 않고 새 돈으로만 맞추기", value=True, key="pf_buyonly",
+                           help="매도하면 해외주식 양도세 계산에 들어가요. 장기 계좌는 새 돈으로 천천히 맞추는 걸 기본으로 했어요.")
+    orders = core.rebalance_orders(edited.dropna(subset=["ticker"]).assign(ticker=lambda d: d["ticker"].str.upper()),
+                                   prices, tgt, new_cash=new_krw / fx, buy_only=buy_only)
+    st.dataframe(orders, hide_index=True, width="stretch",
+                 column_config={"금액($)": st.column_config.NumberColumn(format="$%.2f"),
+                                "지금 금액($)": st.column_config.NumberColumn(format="$%.2f")})
+    st.caption(f"환율 {fx:,.0f}원 기준. 제안일 뿐이고 실제 주문은 직접 판단해서 하세요. 손실 중인 종목을 팔면 그해 손실로 잡혀요 "
+               "(12월 손실 실현 계획과 함께 고려).")
+
+    section("포트폴리오 선수 · 리밸런싱 선수 성적",
+            f"{core.PORTFOLIO_START[:4]}년부터 매주 금요일에 위 규칙대로 했다면? 같은 목표 비중을 리밸런싱 방식만 바꿔 비교해요. "
+            f"실전 기록은 {core.PORTFOLIO_LIVE_START}부터 이어서 쌓여요.")
+    tbl = lab["table"].sort_values("칼마", ascending=False)
+    st.dataframe(tbl.drop(columns=["id"]), hide_index=True, width="stretch",
+                 column_config={c_: st.column_config.NumberColumn(format="%+.1f%%")
+                                for c_ in ("연평균(%)", "최대 낙폭(%)", "최근 2년(%)", "실전(%)")})
+    curves = lab["curves"]
+    fig = go.Figure()
+    for i, pid in enumerate(curves.columns):
+        fig.add_trace(go.Scatter(x=curves.index, y=curves[pid], name=core.PORTFOLIO_PLAYERS[pid],
+                                 line=dict(width=2.5 if pid == "pf_month" else 1.5,
+                                           color=PLAYER_COLORS[i % len(PLAYER_COLORS)])))
+    base_layout(fig, 360)
+    fig.update_yaxes(type="log", title_text="자산 (시작 = 1, 로그)")
+    show_chart(fig, key="pf_curves")
+    st.caption("칼마 = 연평균 ÷ |최대 낙폭|. 높을수록 위험 대비 수익이 좋아요. 거래 비용 0.1% 반영, 세금은 미반영. "
+               "레버리지 ETF가 상장되기 전 기간은 1배 ETF로 대신했어요.")
 
 
 # ==========================================================================
@@ -2847,13 +3040,15 @@ def main() -> None:
         "signals": st.Page(page_signals, title="신호 관제", icon=":material/insights:", url_path="signals"),
         "discover": st.Page(page_discover, title="종목 발굴", icon=":material/travel_explore:", url_path="discover"),
         "radar": st.Page(page_radar, title="시장 레이더", icon=":material/radar:", url_path="radar"),
+        "portfolio": st.Page(page_portfolio, title="내 포트폴리오", icon=":material/account_balance_wallet:",
+                             url_path="portfolio"),
         "league": st.Page(page_league, title="AI 실전 리그", icon=":material/emoji_events:", url_path="league"),
         "training": st.Page(page_training, title="AI 훈련소", icon=":material/model_training:", url_path="training"),
         "journal": st.Page(page_journal, title="매매 일지", icon=":material/menu_book:", url_path="journal"),
         "validation": st.Page(page_validation, title="예측 검증실", icon=":material/science:", url_path="validation"),
     })
-    nav = st.navigation({"운용": [PAGES["dashboard"], PAGES["signals"], PAGES["discover"], PAGES["radar"],
-                                 PAGES["league"]],
+    nav = st.navigation({"운용": [PAGES["dashboard"], PAGES["portfolio"], PAGES["signals"], PAGES["discover"],
+                                 PAGES["radar"], PAGES["league"]],
                          "연구 · 관리": [PAGES["training"], PAGES["validation"], PAGES["journal"]]})
     render_sidebar()
     show_flash()

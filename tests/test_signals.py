@@ -360,3 +360,61 @@ def test_expected_session():
     assert core.expected_session(_dt.datetime(2026, 11, 24, 10, 0)) == pd.Timestamp("2026-11-23")   # 화 장중
     assert core.expected_session(_dt.datetime(2026, 11, 23, 9, 0)) == pd.Timestamp("2026-11-20")    # 월 개장 전 → 금
     assert core.expected_session(_dt.datetime(2026, 11, 22, 12, 0)) == pd.Timestamp("2026-11-20")   # 일요일
+
+
+def test_portfolio_model_pieces():
+    idx = pd.bdate_range("2019-01-01", periods=400)
+    rng = np.random.default_rng(4)
+    closes = {t: pd.Series(100 * np.exp(np.cumsum(rng.normal(0.0003, 0.01, 400))), idx) for t in core.THEME_ETFS}
+    closes["소비재"] = pd.Series(100 * np.exp(0.006 * np.arange(400)), idx)    # 꾸준히 1등
+    late = np.r_[np.linspace(100, 60, 370), np.linspace(60, 72, 30)]           # 꼴찌권에서 최근 반등 → 떠오르는 테마
+    closes["사이버보안"] = pd.Series(late, idx)
+    weeks = pd.date_range("2019-07-05", idx[-1], freq="W-FRI")
+    rk = core.theme_rank_history(closes, weeks)
+    lead, rising = core.pick_themes(rk["rank"].iloc[-1], rk["rank_prev"].iloc[-1], rk["above50"].iloc[-1])
+    assert lead == "소비재"
+    chg = (rk["rank_prev"].iloc[-1] - rk["rank"].iloc[-1]).drop("반도체")
+    assert rising != lead and (chg[rising] >= 3 or chg.max() < 3)
+    prices = {"WANT": pd.Series(1.0, idx), "XLY": closes["소비재"]}
+    tg = core.portfolio_targets(weeks[-1], rk, prices, core_on=0.0)
+    assert tg["CASH"] >= 0.5 - 1e-9 and tg.get("WANT") == 0.25          # 규칙 v1이 쉬면 핵심은 현금, 소비재는 3배
+    assert abs(sum(tg.values()) - 1) < 1e-9
+    wk = pd.DataFrame({"SOXL": np.linspace(10, 20, 30), "WANT": np.linspace(10, 12, 30)},
+                      index=pd.date_range("2020-01-03", periods=30, freq="W-FRI"))
+    tgts = {d: {"SOXL": 0.5, "WANT": 0.5} for d in wk.index}
+    for pol in ("week", "month", "band", "none"):
+        sim = core.simulate_portfolio(wk, tgts, pol)
+        assert sim["value"].iloc[-1] > 1.3
+    none = core.simulate_portfolio(wk, tgts, "none")
+    week = core.simulate_portfolio(wk, tgts, "week")
+    assert none["turnover"].sum() < week["turnover"].sum()
+    st_ = core.portfolio_stats(week["value"], "2020-05-01")
+    assert {"연평균(%)", "칼마", "실전(%)"} <= set(st_)
+    hold = pd.DataFrame({"ticker": ["SOXL"], "shares": [10.0]})
+    o = core.rebalance_orders(hold, {"SOXL": 30.0, "WANT": 50.0}, {"SOXL": 0.5, "WANT": 0.5}, new_cash=100,
+                              buy_only=True).set_index("종목")
+    assert o.loc["WANT", "주문"] == "매수" and o.loc["SOXL", "주문"] != "매도"
+    o2 = core.rebalance_orders(hold, {"SOXL": 30.0, "WANT": 50.0}, {"SOXL": 0.5, "WANT": 0.5}).set_index("종목")
+    assert o2.loc["SOXL", "주문"] == "매도" and abs(o2.loc["WANT", "금액($)"] - 150) < 1e-6
+
+
+def test_sleeve_swap_without_full_rebalance():
+    wk = pd.DataFrame({"A": [10, 20, 20, 20.0], "B": [10, 10, 10, 10.0], "C": [10, 10, 10, 10.0]},
+                      index=pd.date_range("2020-01-03", periods=4, freq="W-FRI"))
+    t = {wk.index[0]: {"A": 0.5, "B": 0.5}, wk.index[1]: {"A": 0.5, "B": 0.5},
+         wk.index[2]: {"A": 0.5, "C": 0.5}, wk.index[3]: {"A": 0.5, "C": 0.5}}
+    sim = core.simulate_portfolio(wk, t, "none")
+    w = sim["weights"].iloc[2]
+    assert "B" not in w and abs(w["A"] - 2 / 3) < 1e-9 and abs(w["C"] - 1 / 3) < 1e-9   # A는 불어난 비중 그대로
+    full = core.simulate_portfolio(wk, t, "week")["weights"].iloc[2]
+    assert abs(full["A"] - 0.5) < 1e-9
+
+
+def test_theme_schedule_holds():
+    weeks = pd.date_range("2020-01-03", periods=6, freq="W-FRI")
+    themes = list(core.THEME_ETFS)
+    rk = pd.DataFrame([[i + 1 for i in range(len(themes))]] * 6, index=weeks, columns=themes, dtype=float)
+    rk.loc[weeks[2], ["금융", "리츠"]] = rk.loc[weeks[2], ["리츠", "금융"]].to_numpy()   # 순위가 잠깐 뒤바뀜
+    ranks = {"rank": rk, "rank_prev": rk.shift(1).fillna(rk), "above50": rk.notna()}
+    sch = core.theme_schedule(weeks, ranks)
+    assert sch["lead"].nunique() == 1                      # 5위 안이면 주도 테마 유지
