@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.25-15"
+REQUIRED_CORE_VERSION = "2026.11.25-16"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1139,15 +1139,17 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
 
     journal, _ = load_table("trade_journal")
     acc = core.scenario_accounts(kiwoom_cycles(plan, journal), s, snap["price"], fx, float(plan["buy_target_krw"]))
-    if not acc.empty and not s.get("rebought"):
-        lab = core.rebuy_label("금액 지정", s)
-        sub = acc[acc["다시 사기"] == lab]
-        if not sub.empty and int(sub["현금화(주)"].sum()) > 0:
-            per = snap["price"] * fx
-            st.info(f"**금액 지정 {float(s['cash_out_krw']):,.0f}원 → 다시 사지 않을 SOXL 총 {int(sub['현금화(주)'].sum())}주** "
-                    f"(≈{int(sub['현금화(주)'].sum()) * per:,.0f}원, ${snap['price']:.2f}·{fx:,.0f}원 기준). 계좌별: "
-                    + ", ".join(f"{r['계좌']} {int(r['현금화(주)'])}주" for _, r in sub.iterrows()),
-                    icon=":material/calculate:")
+    cyc_ = kiwoom_cycles(plan, journal)
+    if float(s.get("loss_krw") or 0) > 0 and not cyc_.empty and not s.get("rebought"):
+        sl = core.shares_for_loss(float(s["loss_krw"]), cyc_.rename(columns={"계좌": "Account", "보유 수량": "Qty", "평단($)": "Avg"})
+                                  [["Account", "Qty", "Avg"]], snap["price"], fx)
+        if sl["shares"]:
+            st.info(f"**{float(s['loss_krw']):,.0f}원 손절하려면 SOXL {sl['shares']}주를 팔아요** (실현 손실 ≈{sl['covered_krw']:,.0f}원, "
+                    f"${snap['price']:.2f}·환율 {fx:,.0f}원 기준). 계좌별: "
+                    + ", ".join(f"{r['계좌']} {int(r['팔 주식 수'])}주" for _, r in sl["rows"].iterrows())
+                    + ". 같은 날 다시 사면 보유 수량은 그대로예요. 판 날 가격·환율로 다시 확인하세요.", icon=":material/calculate:")
+            if sl["covered_krw"] < float(s["loss_krw"]) * 0.99:
+                st.warning("지금 계좌 표의 손실만으로는 그 금액을 다 채우지 못해요.", icon=":material/warning:")
     with st.expander("계좌별 남은 총알 · 다음 매수가 · 익절 지정가", expanded=False):
         if acc.empty:
             st.caption("세금·사이클 페이지의 계좌 표가 비어 있어요.")
@@ -1155,7 +1157,7 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
             st.dataframe(acc, hide_index=True, width="stretch",
                          column_config={"예수금(원)": st.column_config.NumberColumn(format="%d"),
                                         "지금 평가(원)": st.column_config.NumberColumn(format="%d")})
-            st.caption(("12월 다시 사기 방식이 미정이라 전부·절반·비율·금액 지정을 나란히 보여 줘요. 덜 다시 산 만큼 판 돈이 예수금에 더해져요. "
+            st.caption(("12월 다시 사기 방식이 미정이라 전부·절반·비율을 나란히 보여 줘요. 덜 다시 산 만큼 판 돈이 예수금에 더해져요. "
                         if s.get("rebuy") not in core.REBUY_MODES[1:] else
                         ("" if s.get("rebought") else f"다시 사기 방식: {core.rebuy_label(s['rebuy'], s)}. ")) +
                        f"새 평단은 {'다시 산 가격' if s.get('rebought') else '지금 가격(다시 산다고 가정)'} 기준, "
@@ -1191,7 +1193,7 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
         if f[2].button("시나리오 설정 저장", type="primary", key="sc_save") and backend() == "supabase":
             try:
                 new = {**s, "exit_target": ex, "tranches": sorted(float(x) for x in tr.split(",") if x.strip()),
-                       "resistance": rs or None, "cash_per_account_krw": cash, "rebuy": rb, "rebuy_pct": rpct, "cash_out_krw": cout, "take_profit": tp / 100,
+                       "resistance": rs or None, "cash_per_account_krw": cash, "rebuy": rb, "rebuy_pct": rpct, "loss_krw": loss, "take_profit": tp / 100,
                        "rebought": done, "rebuy_price": rp or None,
                        "dip_steps": sorted(float(x) / 100 for x in dips.split(",") if x.strip()),
                        "wait_before_h": wb, "settle_after_h": sa}

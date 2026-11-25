@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-15"
+CORE_VERSION = "2026.11.25-16"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -3285,9 +3285,9 @@ SCENARIO_DEFAULTS = {
     "tranches": [70.0, 85.0, 102.0],      # D 시나리오 단계적 탈출 가격 (각 1/3)
     "resistance": None,                   # 매물대 직접 입력 (None = 차트에서 자동 계산)
     "cash_per_account_krw": 500_000,      # 키움 계좌당 예수금
-    "rebuy": "미정",                      # 12월 다시 사기: 미정 / 전부 / 절반 / 비율 직접 / 금액 지정
+    "rebuy": "미정",                      # 12월 다시 사기: 미정 / 전부 / 절반 / 비율 직접
+    "loss_krw": 0,                        # 12월에 손절(손실 실현)할 금액(원) → 팔 주식 수 계산
     "rebuy_pct": 70.0,                    # 비율 직접: 다시 살 비율(%)
-    "cash_out_krw": 0,                    # 금액 지정: 다시 사지 않고 현금으로 남길 총액(원, 전체 계좌 합)
     "rebought": False,                    # 12월 다시 사기 완료 여부
     "rebuy_price": None,                  # 다시 산 가격
     "dip_steps": [0.15, 0.30],            # 총알을 쓰는 하락폭 (다시 산 가격 또는 지금 가격 기준)
@@ -3295,7 +3295,15 @@ SCENARIO_DEFAULTS = {
     "wait_before_h": 24,                  # 큰 발표 몇 시간 전부터 보류
     "settle_after_h": 12,                 # 발표 뒤 몇 시간은 소화 시간 (다음 장 종가 확인)
 }
-REBUY_MODES = ["미정", "전부", "절반", "비율 직접", "금액 지정"]
+REBUY_MODES = ["미정", "전부", "절반", "비율 직접"]
+
+
+def shares_for_loss(loss_krw: float, accounts: pd.DataFrame, price: float, fx: float) -> dict:
+    """손절할 금액(원) → 팔 주식 수. 1주당 손실이 큰 계좌부터, 필요한 만큼만. accounts = [Account, Qty, Avg]."""
+    if not loss_krw or accounts is None or accounts.empty or not price:
+        return {"shares": 0, "covered_krw": 0.0, "rows": pd.DataFrame()}
+    hp = harvest_plan(float(loss_krw) + TAX["deduction_krw"], accounts, price, fx)
+    return {"shares": hp["shares"], "covered_krw": hp["covered_krw"], "rows": hp["rows"]}
 
 
 def allocate_cash_out(qtys: list[float], total_krw: float, price: float, fx: float) -> list[int]:
@@ -3329,8 +3337,6 @@ def rebuy_keep(qty: float, mode: str, s: dict, cash_krw: float, price: float, fx
 def rebuy_label(mode: str, s: dict) -> str:
     if mode == "비율 직접":
         return f"{float(s.get('rebuy_pct') or 0):g}%"
-    if mode == "금액 지정":
-        return f"{float(s.get('cash_out_krw') or 0) / 10000:,.0f}만 원 현금화"
     return mode
 
 
@@ -3470,16 +3476,13 @@ def scenario_accounts(cycles: pd.DataFrame, s: dict, price: float, fx: float, un
         return pd.DataFrame()
     cash = float(s["cash_per_account_krw"] or 0)
     ref = float(s["rebuy_price"] or price) if s.get("rebought") else price
-    modes = [s["rebuy"]] if s.get("rebuy") in REBUY_MODES[1:] else ["전부", "절반", "비율 직접", "금액 지정"]
-    out_sh = allocate_cash_out([float(x or 0) for x in cycles["보유 수량"]], float(s.get("cash_out_krw") or 0), ref, fx)
+    modes = [s["rebuy"]] if s.get("rebuy") in REBUY_MODES[1:] else ["전부", "절반", "비율 직접"]
     rows = []
     for j, (_, r) in enumerate(cycles.iterrows()):
         qty, avg = float(r.get("보유 수량") or 0), float(r.get("평단($)") or 0)
         for m in modes:
             if s.get("rebought"):
                 keep = qty
-            elif m == "금액 지정":
-                keep = int(np.floor(qty)) - out_sh[j]
             else:
                 keep = rebuy_keep(qty, m, s, cash, ref, fx)
             c = cash if s.get("rebought") else cash + (np.floor(qty) - keep) * ref * fx
