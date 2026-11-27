@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.25-17"
+CORE_VERSION = "2026.11.27-1"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -3650,7 +3650,8 @@ def scenario_snapshot(soxl: pd.DataFrame, sox_close: float, sox_line: float, s: 
     """앱과 자동 점검이 함께 쓰는 판정 묶음."""
     d = soxl.dropna(subset=["Close"])
     price = float(d["Close"].iloc[-1])
-    low = float(d["Low"].tail(60).min()) if "Low" in d else float(d["Close"].tail(60).min())
+    prev = d.iloc[:-1]                      # 오늘 장중 저점은 빼고 '직전까지의' 저점과 비교 (오늘 종가가 그 아래면 A)
+    low = float(prev["Low"].tail(60).min()) if "Low" in prev else float(prev["Close"].tail(60).min())
     vr = volume_resistance(d, price)
     if s.get("resistance"):                      # 직접 입력 = 띠 아래쪽, 위쪽은 +3%
         r_lo = float(s["resistance"])
