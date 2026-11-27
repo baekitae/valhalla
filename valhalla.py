@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.27-1"
+REQUIRED_CORE_VERSION = "2026.11.28-1"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1103,6 +1103,61 @@ def load_insight_history(backend_name: str) -> pd.DataFrame:
     return pd.DataFrame([{"day": r["day"], "code": (r.get("payload") or {}).get("scenario", {}).get("code")} for r in rows])
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_shares(backend_name: str, ticker: str = "SOXL") -> pd.DataFrame:
+    if backend_name != "supabase":
+        return pd.DataFrame()
+    try:
+        return pd.DataFrame(core.sb_fetch_all(get_supabase(), core.SHARES_TABLE, {"ticker": ticker}))
+    except Exception as exc:
+        LOGGER.warning("발행 주식 수 조회 실패: %s", exc)
+        return pd.DataFrame()
+
+
+def render_price_checks(plan: dict, soxl: pd.DataFrame, now: pd.Timestamp) -> None:
+    """가격 확인 신호등(기한·남은 날짜) + SOXL 발행 주식 수 추적."""
+    checks = plan.get(core.PRICE_CHECKS_KEY) or core.DEFAULT_PRICE_CHECKS
+    st.markdown("**🚦 가격 확인 신호등 (종가 기준 · 매일 자동)**")
+    tbl = core.evaluate_price_checks(soxl["Close"], checks, now)
+    st.dataframe(tbl, hide_index=True, width="stretch")
+    st.caption("✅ 달성·유지 · ⏳ 기한 안 진행 중 · 📅 시작 전 · ❌ 미달·깨짐. 날짜는 미국 거래일(종가) 기준. "
+               "기준은 SOXL 기술적·수급 브리핑(11/27)에서 가져왔어요. 엘리엇 파동 해석은 주관적이라, 가격이 실제로 기준을 지키는지로만 판정해요.")
+    with st.expander("신호등 기준 고치기", expanded=False):
+        ed = st.data_editor(pd.DataFrame(checks), num_rows="dynamic", hide_index=True, width="stretch", key="pc_edit",
+                            column_config={"name": "점검", "kind": st.column_config.SelectboxColumn(
+                                "종류", options=["above", "never_below"], help="above = 기간 안에 이 가격 이상 마감, never_below = 이 가격 아래로 마감하면 안 됨"),
+                                "price": st.column_config.NumberColumn("가격($)", format="%.2f"),
+                                "start": "시작일(YYYY-MM-DD)", "end": "마감일(비우면 기한 없음)", "note": "설명"})
+        c = st.columns(2)
+        if c[0].button("신호등 저장", type="primary", key="pc_save") and backend() == "supabase":
+            rows = [{k: (None if pd.isna(v) else v) for k, v in r.items()} for r in ed.to_dict("records") if r.get("price")]
+            save_settings(core.SETTINGS_KEY_PLAN, {**plan, core.PRICE_CHECKS_KEY: rows})
+            flash("가격 신호등 기준을 저장했어요.")
+            st.rerun()
+        if c[1].button("브리핑 기본값으로", key="pc_reset") and backend() == "supabase":
+            save_settings(core.SETTINGS_KEY_PLAN, {**plan, core.PRICE_CHECKS_KEY: core.DEFAULT_PRICE_CHECKS})
+            st.rerun()
+
+    st.markdown("**📉 SOXL 발행 주식 수 (진짜 바닥 신호 ②)**")
+    tr = core.shares_trend(load_shares(backend()))
+    if not tr:
+        st.caption("아직 기록이 없어요. 매일 아침 자동 점검이 운용사 자료로 기록해요.")
+        return
+    c = st.columns(4)
+    c[0].metric("발행 주식 수", f"{tr['latest'] / 1e6:,.1f}백만 주", f"{tr['day']:%m/%d}", delta_color="off",
+                delta_arrow="off", border=True)
+    c[1].metric("전일 대비", f"{tr['d1']:+.2f}%" if pd.notna(tr["d1"]) else "—", border=True)
+    c[2].metric("5거래일 대비", f"{tr['d5']:+.2f}%" if pd.notna(tr["d5"]) else "—", border=True)
+    c[3].metric("기록 중 최고 대비", f"{tr['from_peak']:+.2f}%", f"기록 {tr['n']}일", delta_color="off",
+                delta_arrow="off", border=True)
+    if tr["n"] > 1:
+        st.line_chart(tr["series"] / 1e6, height=160, y_label="백만 주")
+    st.caption(("🟢 최근 5거래일 동안 줄고 있어요. 개인 매물이 운용사 환매로 빠져나가는 신호일 수 있어요. "
+                if tr["falling"] else "⚪ 아직 줄어드는 흐름이 아니에요. ")
+               + "발행 주식 수가 줄면 개인이 레버리지 ETF에서 손을 떼고 있다는 뜻(브리핑의 진짜 바닥 신호). "
+                 "다만 반등 때 차익 실현으로도 줄 수 있어 레버리지 ETF 자금 흐름과 같이 봐야 해요.")
+
+
 def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None:
     """내 상황 시나리오 관제: 이벤트 관문 → 시나리오 판정 → 체크리스트 → 오늘 할 일 → 계좌별 총알."""
     s = core.scenario_settings(plan)
@@ -1158,6 +1213,12 @@ def render_scenario(plan: dict, ins: dict, now: pd.Timestamp, fx: float) -> None
         ck = pd.DataFrame(snap["checks"])
         ck["충족"] = ck["충족"].map({True: "✅", False: "❌", None: "—"})
         st.dataframe(ck, hide_index=True, width="stretch")
+
+    try:
+        render_price_checks(plan, soxl, now)
+    except Exception as exc:
+        LOGGER.exception("가격 신호등 실패")
+        st.warning(f"가격 신호등을 그리지 못했어요: {exc}")
 
     journal, _ = load_table("trade_journal")
     acc = core.scenario_accounts(kiwoom_cycles(plan, journal), s, snap["price"], fx, float(plan["buy_target_krw"]))

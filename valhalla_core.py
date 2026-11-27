@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.27-1"
+CORE_VERSION = "2026.11.28-1"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -3672,3 +3672,70 @@ def scenario_snapshot(soxl: pd.DataFrame, sox_close: float, sox_line: float, s: 
             "week_close": week_close, "sox": sox_close, "sox_line": sox_line, "code": code, "why": why, "gate": gate,
             "checks": scenario_checks(price, low, sox_close, sox_line, res, week_close, v1_on, rebound_outcome, t1, r_lo),
             "exit_gap": (float(s["exit_target"]) / price - 1) * 100}
+
+
+# ==========================================================================
+# 22. 가격 확인 신호등 (기한 있는 점검표) · ETF 발행 주식 수 추적
+# ==========================================================================
+PRICE_CHECKS_KEY = "price_checks"
+DEFAULT_PRICE_CHECKS = [
+    {"name": "1차 확인 · 하락 종료 1차 증거", "kind": "above", "price": 36.0, "start": "2026-11-30", "end": "2026-12-02",
+     "note": "종가 $36~38 위 마감 (미달이면 횡보로 시간 지연)"},
+    {"name": "2차 확인 · 하락 추세 완결", "kind": "above", "price": 45.0, "start": "2026-11-27", "end": "2026-12-11",
+     "note": "종가 $45 위 돌파 (4차 반등 고점)"},
+    {"name": "무효화 · 바닥 시나리오 폐기", "kind": "never_below", "price": 25.0, "start": "2026-11-26", "end": "",
+     "note": "종가 $25 아래면 바닥 시나리오 폐기 (기한 없음)"},
+]
+SHARES_TABLE = "valhalla_etf_shares"
+
+
+def evaluate_price_checks(close: pd.Series, checks: list[dict], today: pd.Timestamp) -> pd.DataFrame:
+    """기한 있는 가격 조건을 종가로 판정.
+    above: 기간 안에 종가가 price 이상인 날이 있으면 ✅, 기한 지나도록 없으면 ❌, 진행 중이면 ⏳, 시작 전이면 📅.
+    never_below: 시작일 뒤로 종가가 price 아래인 날이 한 번이라도 있으면 ❌, 아니면 ✅(유지 중)."""
+    c = close.dropna()
+    today = pd.Timestamp(today).normalize()
+    last = float(c.iloc[-1]) if len(c) else np.nan
+    rows = []
+    for ck in checks:
+        p = float(ck["price"])
+        a = pd.Timestamp(ck["start"]) if ck.get("start") else c.index.min()
+        b = pd.Timestamp(ck["end"]) if ck.get("end") else None
+        win = c[(c.index >= a) & ((c.index <= b) if b is not None else True)]
+        if ck["kind"] == "never_below":
+            broke = win[win < p]
+            status = f"❌ 깨짐 ({broke.index[0]:%m/%d} ${broke.iloc[0]:.2f})" if len(broke) else "✅ 유지 중"
+            best = f"최저 종가 ${win.min():.2f}" if len(win) else "—"
+        else:
+            hit = win[win >= p]
+            if len(hit):
+                status = f"✅ 달성 ({hit.index[0]:%m/%d} ${hit.iloc[0]:.2f})"
+            elif today < a:
+                status = "📅 시작 전"
+            elif b is not None and today > b:
+                status = "❌ 기한 내 미달"
+            else:
+                status = "⏳ 진행 중"
+            best = f"기간 최고 종가 ${win.max():.2f}" if len(win) else "—"
+        left = (b - today).days if b is not None else None
+        rows.append({"점검": ck["name"], "조건": ("종가 ≥ " if ck["kind"] == "above" else "종가가 계속 ≥ ") + f"${p:g}",
+                     "기간": f"{a:%m/%d}~" + (f"{b:%m/%d}" if b is not None else "기한 없음"),
+                     "남은 날": ("기한 지남" if left is not None and left < 0 else (f"D-{left}" if left is not None else "—")),
+                     "상태": status, "지금": f"${last:.2f} ({(last / p - 1) * 100:+.0f}%)" if pd.notna(last) else "—",
+                     "기록": best, "설명": ck.get("note", "")})
+    return pd.DataFrame(rows)
+
+
+def shares_trend(rows: pd.DataFrame) -> dict:
+    """발행 주식 수 기록 → 최근 값, 전일·5일·기록 시작 대비 변화, 최근 고점 대비."""
+    if rows is None or rows.empty:
+        return {}
+    s = rows.sort_values("day").set_index("day")["shares"].astype(float)
+    s.index = pd.to_datetime(s.index)
+    out = {"latest": float(s.iloc[-1]), "day": s.index[-1], "n": len(s), "series": s}
+    for k, n in (("d1", 1), ("d5", 5)):
+        out[k] = float(s.iloc[-1] / s.iloc[-1 - n] - 1) * 100 if len(s) > n else np.nan
+    out["since"] = float(s.iloc[-1] / s.iloc[0] - 1) * 100 if len(s) > 1 else np.nan
+    out["from_peak"] = float(s.iloc[-1] / s.max() - 1) * 100
+    out["falling"] = bool(len(s) > 5 and s.iloc[-1] < s.iloc[-6] and s.iloc[-1] < s.max())
+    return out

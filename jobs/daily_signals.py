@@ -174,6 +174,11 @@ def run(sb, fetch=download) -> str:
         traceback.print_exc()
         lines.append(f"요원 대결 실패: {exc}")
     try:
+        lines.append(update_shares(sb, asof))
+    except Exception as exc:
+        traceback.print_exc()
+        lines.append(f"발행 주식 수 기록 실패: {exc}")
+    try:
         lines.append(update_scenario(sb, fetch, asof, rules))
     except Exception as exc:
         traceback.print_exc()
@@ -218,6 +223,46 @@ def portfolio_summary(sb, fetch, asof, rule) -> str:
              for p in ("pf_harvest", "pf_month", "pf_week", "pf_band", "pf_none", "pf_trend", "bm_soxl", "bm_spy")]
     return (f"포트폴리오 {lab['week']:%m/%d} 주도 {lab['lead']}·떠오르는 {lab['rising']} (순위만 보면 {lab['raw'][0]}·{lab['raw'][1]}) "
             f"테마 교체 {lab['switches']}번 · 목표 {tg} · " + " | ".join(parts))
+
+
+def fetch_shares_outstanding(ticker: str) -> tuple[float | None, str]:
+    """ETF 발행 주식 수. 1) 운용사(Direxion) 보유종목 CSV 머리글 2) 야후 정보. 실패하면 (None, 이유)."""
+    import re
+    import urllib.request
+    errs = []
+    try:
+        req = urllib.request.Request(f"https://www.direxion.com/holdings/{ticker}.csv",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        text = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
+        m = re.search(r"Shares Outstanding[^0-9]*([0-9][0-9,\.]*)", text, re.I)
+        if m:
+            return float(m.group(1).replace(",", "")), "direxion"
+        errs.append("direxion: 머리글에 Shares Outstanding 없음 · " + text[:120].replace("\n", " | "))
+    except Exception as exc:
+        errs.append(f"direxion: {exc}")
+    try:
+        info = yf.Ticker(ticker).info or {}
+        for k in ("sharesOutstanding", "impliedSharesOutstanding"):
+            if info.get(k):
+                return float(info[k]), f"yahoo:{k}"
+        errs.append("yahoo: 값 없음")
+    except Exception as exc:
+        errs.append(f"yahoo: {exc}")
+    return None, " / ".join(errs)
+
+
+def update_shares(sb, asof) -> str:
+    shares, src = fetch_shares_outstanding("SOXL")
+    if shares is None:
+        return f"SOXL 발행 주식 수 실패 ({src[:300]})"
+    day = asof.strftime("%Y-%m-%d")
+    sb.table(core.SHARES_TABLE).upsert({"ticker": "SOXL", "day": day, "shares": shares, "source": src},
+                                       on_conflict="ticker,day").execute()
+    rows = pd.DataFrame(core.sb_fetch_all(sb, core.SHARES_TABLE, {"ticker": "SOXL"}))
+    tr = core.shares_trend(rows)
+    INSIGHT["shares"] = {"latest": shares, "source": src, "d5": tr.get("d5"), "from_peak": tr.get("from_peak"),
+                         "falling": tr.get("falling")}
+    return f"SOXL 발행 주식 수 {shares / 1e6:,.1f}백만 주 ({src}) · 기록 {tr.get('n', 1)}일"
 
 
 def update_scenario(sb, fetch, asof, rule) -> str:

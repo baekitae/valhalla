@@ -536,3 +536,23 @@ def test_agent_players():
     cmp_ = core.segment_compare(pos, hist["close"], ["agent_1", "hold"], segs)
     assert set(cmp_["id"]) == {"agent_1", "hold"} and cmp_["구간"].nunique() >= 2
     core.set_agents([])
+
+
+def test_price_checks_and_shares():
+    import pandas as pd
+    import valhalla_core as core
+    idx = pd.bdate_range("2026-11-23", "2026-12-04")
+    close = pd.Series([30, 29, 32, 33, 34, 37, 36, 35, 36, 38], index=idx, dtype=float)
+    t = core.evaluate_price_checks(close, core.DEFAULT_PRICE_CHECKS, pd.Timestamp("2026-12-04"))
+    st = t.set_index("점검")["상태"]
+    assert st.iloc[0].startswith("✅")          # 11/30~12/2 중 12/1 37 ≥ 36
+    assert st.iloc[1].startswith("⏳")          # $45 미달, 기한 전
+    assert st.iloc[2].startswith("✅")          # $25 아래 없음
+    t2 = core.evaluate_price_checks(close[:5], core.DEFAULT_PRICE_CHECKS, pd.Timestamp("2026-11-28"))
+    assert t2.set_index("점검")["상태"].iloc[0] == "📅 시작 전"
+    t3 = core.evaluate_price_checks(close, core.DEFAULT_PRICE_CHECKS, pd.Timestamp("2026-12-20"))
+    assert t3.set_index("점검")["상태"].iloc[1] == "❌ 기한 내 미달"
+    rows = pd.DataFrame({"day": pd.bdate_range("2026-11-20", periods=8).strftime("%Y-%m-%d"),
+                         "shares": [390, 395, 397, 397, 396, 394, 392, 390]})
+    tr = core.shares_trend(rows)
+    assert tr["falling"] and tr["latest"] == 390 and tr["from_peak"] < 0
