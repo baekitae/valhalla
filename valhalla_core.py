@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 # 앱(valhalla.py)이 이 값과 다르면 모듈을 다시 불러옵니다. 계산 모듈을 바꿀 때마다 올려 주세요.
-CORE_VERSION = "2026.11.28-1"
+CORE_VERSION = "2026.11.28-2"
 
 # ==========================================================================
 # 1. 테이블 스키마 & 정규화
@@ -3739,3 +3739,127 @@ def shares_trend(rows: pd.DataFrame) -> dict:
     out["from_peak"] = float(s.iloc[-1] / s.max() - 1) * 100
     out["falling"] = bool(len(s) > 5 and s.iloc[-1] < s.iloc[-6] and s.iloc[-1] < s.max())
     return out
+
+
+# ==========================================================================
+# 23. 분산 점검 (핵심/위성) · 새 돈 배분 · 공제 안에서 세금 없이 덜어내기
+#   핵심 = 장기로 모은 종목, 분산은 '새 돈'으로. 위성 = 3배 테마·SOXL v1 (계좌의 일부만).
+# ==========================================================================
+DIVERSIFY_KEY = "diversify"
+DIVERSIFY_DEFAULT = {"single": 0.20, "sector": 0.30, "leverage": 0.15, "bigtech": 0.50, "satellite": 0.20,
+                     "monthly_krw": 0}
+# 티커 → (업종, S&P500 업종 칸) — 모르는 티커는 '기타'
+SECTOR_OF = {
+    "NVDA": ("반도체", "IT"), "AVGO": ("반도체", "IT"), "MRVL": ("반도체", "IT"), "AMD": ("반도체", "IT"),
+    "MU": ("반도체", "IT"), "TSM": ("반도체", "IT"), "INTC": ("반도체", "IT"), "QCOM": ("반도체", "IT"),
+    "SOXL": ("반도체", "IT"), "SOXX": ("반도체", "IT"), "SMH": ("반도체", "IT"), "USD": ("반도체", "IT"),
+    "MSFT": ("소프트웨어", "IT"), "ORCL": ("소프트웨어", "IT"), "CRM": ("소프트웨어", "IT"), "PLTR": ("소프트웨어", "IT"),
+    "AAPL": ("IT 하드웨어", "IT"), "SMCI": ("IT 하드웨어", "IT"), "DELL": ("IT 하드웨어", "IT"),
+    "META": ("커뮤니케이션", "커뮤니케이션"), "GOOG": ("커뮤니케이션", "커뮤니케이션"), "GOOGL": ("커뮤니케이션", "커뮤니케이션"),
+    "NFLX": ("커뮤니케이션", "커뮤니케이션"),
+    "AMZN": ("경기소비재", "경기소비재"), "TSLA": ("경기소비재", "경기소비재"),
+    "KO": ("필수소비재", "필수소비재"), "PEP": ("필수소비재", "필수소비재"), "PG": ("필수소비재", "필수소비재"),
+    "COST": ("필수소비재", "필수소비재"), "XLP": ("필수소비재", "필수소비재"),
+    "VST": ("유틸리티", "유틸리티"), "CEG": ("유틸리티", "유틸리티"), "XLU": ("유틸리티", "유틸리티"),
+    "XLV": ("헬스케어", "헬스케어"), "CURE": ("헬스케어", "헬스케어"), "LLY": ("헬스케어", "헬스케어"), "UNH": ("헬스케어", "헬스케어"),
+    "XLF": ("금융", "금융"), "FAS": ("금융", "금융"), "JPM": ("금융", "금융"), "BRK-B": ("금융", "금융"),
+    "XLI": ("산업재", "산업재"), "XLE": ("에너지", "에너지"), "ERX": ("에너지", "에너지"),
+    "XLRE": ("부동산", "부동산"), "DRN": ("부동산", "부동산"), "XLB": ("소재", "소재"),
+    "QQQ": ("지수 ETF", "지수"), "VOO": ("지수 ETF", "지수"), "SPY": ("지수 ETF", "지수"), "VTI": ("지수 ETF", "지수"),
+    "JEPQ": ("배당·인컴 ETF", "지수"), "SCHD": ("배당·인컴 ETF", "지수"), "JEPI": ("배당·인컴 ETF", "지수"),
+    "TQQQ": ("지수 ETF", "지수"), "UPRO": ("지수 ETF", "지수"),
+}
+BIGTECH = {"AAPL", "MSFT", "NVDA", "AMZN", "GOOG", "GOOGL", "META", "TSLA"}
+LEVERAGED = {"SOXL", "TQQQ", "UPRO", "USD", "FAS", "CURE", "DRN", "LABU", "ERX", "NUGT", "DFEN", "DUSL", "WANT",
+             "UCYB", "CWEB", "BITX", "TECL", "FNGU", "BULZ", "NVDL", "TSLL"}
+# S&P500 업종 비중(대략, 새 돈 배분의 기준점) · 칸별 1배 ETF
+SP500_SECTOR = {"IT": 0.32, "금융": 0.13, "헬스케어": 0.10, "경기소비재": 0.10, "커뮤니케이션": 0.10, "산업재": 0.08,
+                "필수소비재": 0.055, "에너지": 0.03, "유틸리티": 0.025, "부동산": 0.02, "소재": 0.02}
+SECTOR_ETF = {"IT": "XLK", "금융": "XLF", "헬스케어": "XLV", "경기소비재": "XLY", "커뮤니케이션": "XLC", "산업재": "XLI",
+              "필수소비재": "XLP", "에너지": "XLE", "유틸리티": "XLU", "부동산": "XLRE", "소재": "XLB"}
+
+
+def div_sector(ticker: str) -> tuple[str, str]:
+    t = str(ticker).upper()
+    if t in SECTOR_OF:
+        return SECTOR_OF[t]
+    for theme, (base, levs) in THEME_ETFS.items():
+        if t == base or t in [x for x, _ in levs]:
+            return (theme, "기타")
+    return ("기타", "기타")
+
+
+def holdings_values(hold: pd.DataFrame, prices: dict[str, float]) -> pd.DataFrame:
+    """[ticker, shares, avg_price] + 현재가 → 평가액·원가·업종 표 (달러)."""
+    h = hold.copy()
+    h["ticker"] = h["ticker"].astype(str).str.upper()
+    h["price"] = h["ticker"].map(prices).astype(float)
+    h["value"] = h["shares"].astype(float) * h["price"]
+    h["cost"] = h["shares"].astype(float) * h["avg_price"].astype(float)
+    h["sector"] = h["ticker"].map(lambda t: div_sector(t)[0])
+    h["sp_sector"] = h["ticker"].map(lambda t: div_sector(t)[1])
+    h["bigtech"] = h["ticker"].isin(BIGTECH)
+    h["leveraged"] = h["ticker"].isin(LEVERAGED)
+    return h.dropna(subset=["value"])
+
+
+def diversification_check(hv: pd.DataFrame, cash_usd: float, limits: dict) -> pd.DataFrame:
+    """한도 점검표: 한 종목 / 한 업종 / 레버리지 / 빅테크. 비중은 계좌 총액(현금 포함) 기준."""
+    tot = float(hv["value"].sum()) + float(cash_usd or 0)
+    if tot <= 0:
+        return pd.DataFrame()
+    w = hv.groupby("ticker")["value"].sum() / tot
+    sw = hv[hv["sector"] != "지수 ETF"].groupby("sector")["value"].sum() / tot
+    rows = []
+
+    def add(name, lim, cur, who):
+        rows.append({"점검": name, "한도(%)": round(lim * 100), "지금(%)": round(cur * 100, 1),
+                     "상태": "⚠️ 넘음" if cur > lim + 1e-9 else "✅", "가장 큰 것": who})
+    add("한 종목", limits["single"], float(w.max()), f"{w.idxmax()} {w.max() * 100:.0f}%")
+    add("한 업종", limits["sector"], float(sw.max()) if len(sw) else 0.0,
+        f"{sw.idxmax()} {sw.max() * 100:.0f}%" if len(sw) else "—")
+    lev = float(hv.loc[hv["leveraged"], "value"].sum()) / tot
+    add("레버리지 ETF", limits["leverage"], lev, ", ".join(hv.loc[hv["leveraged"], "ticker"]) or "없음")
+    bt = float(hv.loc[hv["bigtech"], "value"].sum()) / tot
+    add("빅테크 8개 합계", limits["bigtech"], bt, ", ".join(hv.loc[hv["bigtech"]].sort_values("value", ascending=False)["ticker"].head(4)))
+    return pd.DataFrame(rows)
+
+
+def new_money_plan(hv: pd.DataFrame, cash_usd: float, new_usd: float, limits: dict) -> pd.DataFrame:
+    """새 돈 배분: S&P500 업종 비중보다 모자란 칸에 모자란 만큼 비례 배분. 한도를 넘은 업종(예: 반도체가 속한 IT)은 제외.
+    지수 ETF·배당 ETF는 업종 분산으로 보지 않음(이미 분산된 돈)."""
+    if new_usd <= 0:
+        return pd.DataFrame()
+    tot = float(hv["value"].sum()) + float(cash_usd or 0) + new_usd
+    sp = hv[hv["sp_sector"].isin(SP500_SECTOR)].groupby("sp_sector")["value"].sum() / tot
+    over = set()
+    sw = hv.groupby("sector")["value"].sum() / tot
+    for sec, v in sw.items():
+        if v > limits["sector"] and sec not in ("지수 ETF", "배당·인컴 ETF"):
+            over.add(hv.loc[hv["sector"] == sec, "sp_sector"].iloc[0])
+    gaps = {k: max(SP500_SECTOR[k] - float(sp.get(k, 0.0)), 0.0) for k in SP500_SECTOR if k not in over}
+    g = sum(gaps.values())
+    rows = []
+    for k, gap in sorted(gaps.items(), key=lambda x: -x[1]):
+        if gap <= 0:
+            continue
+        amt = new_usd * gap / g
+        if amt < new_usd * 0.03:
+            continue
+        rows.append({"업종": k, "S&P500 비중(%)": round(SP500_SECTOR[k] * 100, 1), "내 비중(%)": round(float(sp.get(k, 0)) * 100, 1),
+                     "넣을 금액($)": round(amt, 2), "ETF 후보": SECTOR_ETF[k]})
+    return pd.DataFrame(rows)
+
+
+def tax_free_trim(hv: pd.DataFrame, room_krw: float, fx: float, focus: list[str]) -> pd.DataFrame:
+    """남은 공제(room_krw) 안에서 이익 난 종목을 얼마나 팔면 세금 0원인지. 매도액 = 이익 ÷ 이익 비율."""
+    rows = []
+    for _, r in hv[hv["ticker"].isin(focus)].iterrows():
+        gain = (r["value"] - r["cost"]) * fx
+        if gain <= 0 or room_krw <= 0:
+            continue
+        ratio = gain / (r["value"] * fx)
+        sell_krw = min(room_krw / ratio, r["value"] * fx)
+        rows.append({"종목": r["ticker"], "이익 비율(%)": round(ratio * 100, 1), "팔 금액(원)": round(sell_krw),
+                     "팔 주식 수": round(sell_krw / fx / r["price"], 4), "실현 이익(원)": round(sell_krw * ratio)})
+    return pd.DataFrame(rows)

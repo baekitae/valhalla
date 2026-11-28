@@ -556,3 +556,20 @@ def test_price_checks_and_shares():
                          "shares": [390, 395, 397, 397, 396, 394, 392, 390]})
     tr = core.shares_trend(rows)
     assert tr["falling"] and tr["latest"] == 390 and tr["from_peak"] < 0
+
+
+def test_diversification():
+    import pandas as pd
+    import valhalla_core as core
+    hold = pd.DataFrame({"ticker": ["NVDA", "MRVL", "META", "KO", "SOXL", "VOO"], "shares": [10, 10, 2, 10, 10, 1],
+                         "avg_price": [60, 70, 400, 70, 150, 500]})
+    px = {"NVDA": 150, "MRVL": 130, "META": 600, "KO": 90, "SOXL": 35, "VOO": 600}
+    hv = core.holdings_values(hold, px)
+    lim = core.DIVERSIFY_DEFAULT
+    chk = core.diversification_check(hv, 0, lim).set_index("점검")
+    assert chk.loc["한 업종", "상태"].startswith("⚠️") and "반도체" in chk.loc["한 업종", "가장 큰 것"]
+    plan = core.new_money_plan(hv, 0, 1000, lim)
+    assert "IT" not in set(plan["업종"]) and abs(plan["넣을 금액($)"].sum() - 1000) < 60
+    trim = core.tax_free_trim(hv, 2_500_000, 1400, ["NVDA"]).iloc[0]
+    assert abs(trim["실현 이익(원)"] - 2_500_000) < 2 or trim["팔 금액(원)"] == round(1500 * 1400)
+    assert core.div_sector("CURE")[0] == "헬스케어" and core.div_sector("UCYB")[0] == "사이버보안"

@@ -29,7 +29,7 @@ import valhalla_core as core
 
 # Streamlit Cloud는 코드가 바뀌어도 이미 불러온 모듈을 메모리에 남겨 둘 수 있습니다.
 # 새 함수가 없으면(= 예전 버전) 계산 모듈을 다시 불러옵니다.
-REQUIRED_CORE_VERSION = "2026.11.28-1"
+REQUIRED_CORE_VERSION = "2026.11.28-2"
 if getattr(core, "CORE_VERSION", None) != REQUIRED_CORE_VERSION:
     core = importlib.reload(core)
 
@@ -1642,6 +1642,108 @@ def save_portfolio_settings(value: dict) -> None:
     load_portfolio.clear()
 
 
+def render_diversify(edited: pd.DataFrame, prices: dict, fx: float, settings: dict, lab: dict) -> None:
+    """분산 점검: 한도표 · 핵심/위성 · 새 돈 배분(업종 ETF) · 위성 후보(테마 ETF + 주도주) · 공제 안 세금 0원 덜어내기."""
+    section("분산 점검 · 핵심과 위성",
+            "핵심 = 장기로 모은 우량주·배당 ETF(그대로 보유, 분산은 새 돈으로). 위성 = 3배 테마·SOXL v1 전략(계좌의 일부만). "
+            "한도는 아래에서 바꿀 수 있어요.")
+    lim = {**core.DIVERSIFY_DEFAULT, **(settings.get(core.DIVERSIFY_KEY) or {})}
+    hold = edited.dropna(subset=["ticker"]).copy()
+    if hold.empty:
+        st.caption("보유 내역이 없어요.")
+        return
+    hv = core.holdings_values(hold, prices)
+    cash_usd = float(settings.get("cash_krw", 0) or 0) / fx
+    tot = float(hv["value"].sum()) + cash_usd
+    chk = core.diversification_check(hv, cash_usd, lim)
+    st.dataframe(chk, hide_index=True, width="stretch")
+
+    sat_tickers = set(core.LEVERAGED)
+    sat = float(hv.loc[hv["ticker"].isin(sat_tickers), "value"].sum()) / tot if tot else 0.0
+    c = st.columns(3)
+    c[0].metric("위성 (레버리지·테마 전략)", f"{sat * 100:.1f}%", f"한도 {lim['satellite'] * 100:.0f}%", delta_color="off",
+                delta_arrow="off", border=True)
+    c[1].metric("핵심 (장기 보유)", f"{(1 - sat - cash_usd / tot) * 100:.1f}%" if tot else "—", border=True)
+    c[2].metric("현금", f"{cash_usd / tot * 100:.1f}%" if tot else "—", fmt_krw(cash_usd * fx), delta_color="off",
+                delta_arrow="off", border=True)
+    sec = hv.groupby("sector")["value"].sum().sort_values(ascending=False) / tot * 100
+    st.bar_chart(sec.round(1), horizontal=True, height=min(60 + 26 * len(sec), 420), x_label="비중(%)")
+
+    st.markdown("**① 새 돈은 어디에? (세금 없음 · S&P500 업종 비중보다 모자란 곳부터)**")
+    new_krw = st.number_input("이번에 모을 돈 (원)", 0, 100_000_000, int(lim.get("monthly_krw") or 0), 50_000, key="dv_new")
+    plan_df = core.new_money_plan(hv, cash_usd, new_krw / fx, lim)
+    if plan_df.empty:
+        st.caption("금액을 넣으면 업종별 배분을 계산해요.")
+    else:
+        plan_df["넣을 금액(원)"] = (plan_df["넣을 금액($)"] * fx).round(-3)
+        st.dataframe(plan_df, hide_index=True, width="stretch",
+                     column_config={"넣을 금액(원)": st.column_config.NumberColumn(format="%d")})
+        st.caption("한도를 넘은 업종(지금은 반도체가 든 IT)은 새 돈에서 빼요. 지수·배당 ETF는 이미 분산된 돈이라 업종 비중 계산에서 빼요. "
+                   "ETF 후보 대신 그 업종의 좋아하는 종목을 사도 돼요.")
+
+    st.markdown("**② 위성 칸 후보 (주도·떠오르는 테마)**")
+    themes = [t for t in (lab.get("lead"), lab.get("rising")) if t]
+    rows = [{"테마": t, "상태": "주도" if t == lab.get("lead") else "떠오르는", "ETF": (core.THEME_ETFS.get(t, ("", []))[1] or [(core.THEME_ETFS.get(t, ("", []))[0], 1)])[0][0],
+             "1배 대표": core.THEME_ETFS.get(t, ("", []))[0]} for t in themes]
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    leaders = pd.DataFrame()
+    if get_titan_engine() is not None and themes:
+        try:
+            lv = titan_latest("leader_radar", "US")
+            if not lv.empty:
+                leaders = (lv[lv["theme"].isin(themes)].sort_values("score", ascending=False)
+                           .groupby("theme").head(2)[["theme", "ticker", "price", "score", "ret_3m", "aligned"]])
+        except Exception as exc:
+            LOGGER.warning("주도주 조회 실패: %s", exc)
+    if leaders.empty:
+        st.caption("종목 발굴(타이탄)에 이 테마의 주도주 기록이 없어요. 테마 ETF만 후보예요.")
+    else:
+        st.dataframe(leaders, hide_index=True, width="stretch",
+                     column_config={"theme": "테마", "ticker": "주도주", "price": st.column_config.NumberColumn("현재가", format="$%.2f"),
+                                    "score": st.column_config.ProgressColumn("주도주 점수", min_value=0, max_value=100, format="%.0f"),
+                                    "ret_3m": st.column_config.NumberColumn("3개월", format="%+.1f%%"),
+                                    "aligned": st.column_config.CheckboxColumn("정배열")})
+    st.caption(f"위성은 계좌의 {lim['satellite'] * 100:.0f}% 안에서만. 테마 ETF와 같은 유지 규칙(주도 테마는 5위 안이면 유지, "
+               "떠오르는 테마는 최소 4주)을 지켜야 잦은 매매·양도세를 피할 수 있어요.")
+
+    st.markdown("**③ 올해 남은 공제로 세금 0원 덜어내기 (12월)**")
+    plan = {**core.DEFAULT_PRINCIPLES, **load_settings(core.SETTINGS_KEY_PLAN, backend())}
+    realized = float(plan.get("realized_kiwoom_krw", 0) or 0) + float(plan.get("realized_toss_krw", 0) or 0)
+    loss = float((plan.get(core.SCENARIO_KEY) or {}).get("loss_krw", 0) or 0)
+    auto_room = max(core.TAX["deduction_krw"] - max(realized - loss, 0.0), 0.0)
+    c = st.columns(2)
+    room = c[0].number_input("남은 공제 (원)", 0, 100_000_000, int(auto_room), 100_000, key="dv_room",
+                             help=f"자동 계산: 공제 250만 − (올해 실현 이익 {realized:,.0f} − 12월 손절 {loss:,.0f}). "
+                                  "세금·사이클 페이지와 시나리오 설정의 값을 써요.")
+    over = set(chk.loc[chk["상태"].str.startswith("⚠️"), "가장 큰 것"].str.split(" ").str[0])
+    focus = sorted(set(hv.sort_values("value", ascending=False)["ticker"].head(3)) | over)
+    pick = c[1].multiselect("덜어낼 후보", sorted(hv["ticker"]), [t for t in focus if t in set(hv["ticker"])], key="dv_pick")
+    trim = core.tax_free_trim(hv, room, fx, pick)
+    if trim.empty:
+        st.caption("이익 난 후보가 없거나 남은 공제가 0원이에요.")
+    else:
+        st.dataframe(trim, hide_index=True, width="stretch",
+                     column_config={"팔 금액(원)": st.column_config.NumberColumn(format="%d"),
+                                    "실현 이익(원)": st.column_config.NumberColumn(format="%d")})
+        st.caption("종목마다 '이것 하나만 팔면' 기준이에요. 여러 종목을 나눠 팔면 실현 이익 합계가 남은 공제를 넘지 않게 나눠요. "
+                   "키움·토스 손익은 합산 과세라 12월 손절 계획과 같이 맞춰야 하고, 원가는 산 날 환율로 계산돼 실제와 다를 수 있어요. "
+                   "공제는 다음 해로 넘어가지 않아요.")
+
+    with st.expander("분산 한도 바꾸기", expanded=False):
+        f = st.columns(5)
+        new = {"single": f[0].number_input("한 종목(%)", 5, 100, int(lim["single"] * 100), 5, key="dv_l1") / 100,
+               "sector": f[1].number_input("한 업종(%)", 10, 100, int(lim["sector"] * 100), 5, key="dv_l2") / 100,
+               "leverage": f[2].number_input("레버리지(%)", 0, 100, int(lim["leverage"] * 100), 5, key="dv_l3") / 100,
+               "bigtech": f[3].number_input("빅테크(%)", 10, 100, int(lim["bigtech"] * 100), 5, key="dv_l4") / 100,
+               "satellite": f[4].number_input("위성(%)", 0, 100, int(lim["satellite"] * 100), 5, key="dv_l5") / 100,
+               "monthly_krw": new_krw}
+        if st.button("한도 저장", type="primary", key="dv_save") and backend() == "supabase":
+            save_portfolio_settings({**settings, core.DIVERSIFY_KEY: new})
+            flash("분산 한도를 저장했어요.")
+            st.rerun()
+
+
 def page_portfolio() -> None:
     page_header("MY PORTFOLIO", "내 포트폴리오", "토스 장기 계좌 · SOXL 핵심 + 주도 테마 + 떠오르는 테마 · 리밸런싱 제안")
     holdings, settings = load_portfolio(backend())
@@ -1717,6 +1819,12 @@ def page_portfolio() -> None:
         m[2].metric("종목 수", f"{len(view)}개", border=True)
         st.dataframe(view.rename(columns={"ticker": "티커", "shares": "주식 수", "avg_price": "평균 단가"}),
                      hide_index=True, width="stretch")
+
+    try:
+        render_diversify(edited, prices, fx, settings, lab)
+    except Exception as exc:
+        LOGGER.exception("분산 점검 실패")
+        st.warning(f"분산 점검을 그리지 못했어요: {exc}")
 
     section("리밸런싱 제안", "많이 오른 종목은 일부 팔아 현금으로 챙기고, 많이 떨어진 종목은 그 현금으로 다시 사는 방식이 기본이에요. "
                          "토스는 소수점 매매가 돼서 주식 수를 소수로 보여줘요.")
